@@ -17,15 +17,16 @@ We are trading development convenience for raw performance.
 This project is divided into four main phases:
 
 1.  **Phase 1: Accelerated Math (Complete)**
-    *   **Goal:** Prove that hand-written assembly code can beat a C++ compiler for matrix multiplication, a core operation in neural networks.
-    *   **Result:** Achieved a **2.52x speedup** compared to the GCC compiler's best optimization (-O3). This proves the core concept is viable.
+    *   **Goal:** Prove that hand-written assembly code can beat a C++ compiler for matrix multiplication.
+    *   **Result:** Achieved a **2.52x speedup** over GCC -O3.
 
 2.  **Phase 2: Video Output (Complete)**
     *   **Goal:** Display an image on a screen without using any operating system drivers.
     *   **Result:** Successfully initialized the Raspberry Pi's GPU and wrote pixels to the screen's framebuffer.
 
-3.  **Phase 3: AI Model Integration (In Progress)**
-    *   **Goal:** Convert a pre-trained YOLO model into a format that can be executed on our bare-metal engine.
+3.  **Phase 3: AI Model Integration (Complete)**
+    *   **Goal:** Build a bare-metal inference engine for a key neural network operation (Conv2d).
+    *   **Result:** The hand-written NEON Assembly kernel achieved a **1.75x speedup** over a naive C++ implementation.
 
 4.  **Phase 4: Camera Input (Pending)**
     *   **Goal:** Capture images from a camera directly, again, without OS-level drivers.
@@ -73,6 +74,12 @@ This will start the QEMU emulator, load our kernel, and display the output on th
 *   **Hardware:** Raspberry Pi Zero 2 W (ARM Cortex-A53)
 *   **Emulator:** QEMU (`raspi3b` machine)
 *   **Compiler:** `aarch64-linux-gnu-g++`
-*   **Key Technologies:**
-    *   **NEON:** ARM's 128-bit SIMD (Single Instruction, Multiple Data) architecture for accelerated computing.
-    *   **Mailbox Interface:** A low-level communication channel to interact with the Raspberry Pi's VideoCore GPU.
+
+### The "Zero-Layer" Stack
+
+The core of this project is a minimal software stack built from scratch:
+
+*   **Bootloader (`start.s`):** A few lines of assembly that initialize the primary core (Core 0) and set up the stack.
+*   **Kernel (`kernel.cpp`):** The main C++ orchestrator. It manages hardware communication (like the GPU Mailbox), loads model weights, and controls the main inference loop.
+*   **AI Core (`conv2d_neon.s`):** A highly-optimized assembly kernel that performs the heavy lifting for 2D convolutions using ARM's NEON SIMD instructions. It uses a "Direct Pointer Access" strategy to avoid unnecessary memory copies and processes four output channels in parallel.
+*   **GPU Communication (`mbox_call`):** A low-level communication channel to interact with the Raspberry Pi's VideoCore GPU for video initialization.
