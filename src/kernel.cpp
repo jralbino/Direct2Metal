@@ -183,6 +183,67 @@ void success_blink() {
 }
 
 /* ============================================================
+ * FRAMEBUFFER DRAWING PRIMITIVES
+ * ============================================================ */
+
+/* Set one pixel, bounds-checked.
+ * Uses the unsigned comparison trick so negative coords (bbox overflow)
+ * are caught by the same branch as out-of-range positives. */
+static inline void fb_pixel(unsigned int* fb, int fb_w, int fb_h,
+                             int x, int y, unsigned int color) {
+    if ((unsigned)x < (unsigned)fb_w && (unsigned)y < (unsigned)fb_h)
+        fb[y * fb_w + x] = color;
+}
+
+/* Fill a solid rectangle. */
+static void fill_rect(unsigned int* fb, int fb_w, int fb_h,
+                      int x0, int y0, int w, int h, unsigned int color) {
+    for (int y = y0; y < y0 + h; y++)
+        for (int x = x0; x < x0 + w; x++)
+            fb_pixel(fb, fb_w, fb_h, x, y, color);
+}
+
+/* Hollow rectangle, `t` pixels thick. */
+static void draw_rect(unsigned int* fb, int fb_w, int fb_h,
+                      int x0, int y0, int w, int h,
+                      unsigned int color, int t) {
+    for (int dx = 0; dx < w; dx++) {
+        for (int dt = 0; dt < t; dt++) {
+            fb_pixel(fb, fb_w, fb_h, x0 + dx, y0 + dt,           color); /* top    */
+            fb_pixel(fb, fb_w, fb_h, x0 + dx, y0 + h - 1 - dt,   color); /* bottom */
+        }
+    }
+    for (int dy = 0; dy < h; dy++) {
+        for (int dt = 0; dt < t; dt++) {
+            fb_pixel(fb, fb_w, fb_h, x0 + dt,           y0 + dy,  color); /* left   */
+            fb_pixel(fb, fb_w, fb_h, x0 + w - 1 - dt,   y0 + dy,  color); /* right  */
+        }
+    }
+}
+
+/* Blit test_image (CHW float32 [0,1]) to framebuffer, upscaled by `scale`.
+ * Pixel format: 0xAARRGGBB (RPi ARGB32). */
+static void draw_image(unsigned int* fb, int fb_w, int fb_h,
+                       const float* img_chw, int iw, int ih,
+                       int dst_x, int dst_y, int scale) {
+    for (int py = 0; py < ih * scale; py++) {
+        int sy = py / scale;
+        for (int px = 0; px < iw * scale; px++) {
+            int sx   = px / scale;
+            int ri   = (int)(img_chw[0 * iw * ih + sy * iw + sx] * 255.0f);
+            int gi   = (int)(img_chw[1 * iw * ih + sy * iw + sx] * 255.0f);
+            int bi   = (int)(img_chw[2 * iw * ih + sy * iw + sx] * 255.0f);
+            if (ri > 255) ri = 255; else if (ri < 0) ri = 0;
+            if (gi > 255) gi = 255; else if (gi < 0) gi = 0;
+            if (bi > 255) bi = 255; else if (bi < 0) bi = 0;
+            unsigned int pix = (0xFFu << 24) | ((unsigned)ri << 16)
+                             | ((unsigned)gi <<  8) | (unsigned)bi;
+            fb_pixel(fb, fb_w, fb_h, dst_x + px, dst_y + py, pix);
+        }
+    }
+}
+
+/* ============================================================
  * MAILBOX CALL
  * ============================================================ */
 
@@ -413,16 +474,57 @@ extern "C" void kernel_main() {
 
         if (ptr == 0) panic_blink();
 
-        unsigned int* lfb    = (unsigned int*)(unsigned long)ptr;
-        unsigned int  pixels = size / 4;
+        unsigned int* fb  = (unsigned int*)(unsigned long)ptr;
+        int fb_w = (int)w;
+        int fb_h = (int)h;
 
-        uart_puts("Painting screen white...\r\n");
-        for (unsigned int i = 0; i < pixels; i++) {
-            lfb[i] = 0xFFFFFFFF;
+        /* ── 1. Dark background ──────────────────────────────── */
+        fill_rect(fb, fb_w, fb_h, 0, 0, fb_w, fb_h, 0xFF1A1A2E);
+
+        /* ── 2. Test image — 8× upscale, centred ─────────────── */
+        const int SCALE  = 8;
+        const int DISP_W = INPUT_W * SCALE;   /* 512 px */
+        const int DISP_H = INPUT_H * SCALE;   /* 512 px */
+        int img_x = (fb_w - DISP_W) / 2;     /* 704 @ 1920 */
+        int img_y = (fb_h - DISP_H) / 2;     /* 284 @ 1080 */
+
+        uart_puts("Drawing test image...\r\n");
+        draw_image(fb, fb_w, fb_h,
+                   test_image, INPUT_W, INPUT_H,
+                   img_x, img_y, SCALE);
+
+        /* ── 3. White border around the image ───────────────── */
+        draw_rect(fb, fb_w, fb_h,
+                  img_x - 2, img_y - 2, DISP_W + 4, DISP_H + 4,
+                  0xFFFFFFFF, 2);
+
+        /* ── 4. Bounding boxes ────────────────────────────────
+         *  Use a lower threshold (0.15) so we see boxes even
+         *  with untrained random weights (conf ≈ 0.23).
+         *  head_out[] was filled by run_benchmark_inference().  */
+        BBox vboxes[16];
+        int  vn = yolo_decode(head_out, GRID_H, GRID_W,
+                              0.15f, vboxes, 16);
+
+        uart_puts("Boxes: "); uart_int(vn); uart_puts("\r\n");
+
+        for (int i = 0; i < vn; i++) {
+            /* Normalised [0,1] → display pixels */
+            int bx = img_x + (int)((vboxes[i].x - vboxes[i].w * 0.5f) * DISP_W);
+            int by = img_y + (int)((vboxes[i].y - vboxes[i].h * 0.5f) * DISP_H);
+            int bw = (int)(vboxes[i].w * DISP_W);
+            int bh = (int)(vboxes[i].h * DISP_H);
+            draw_rect(fb, fb_w, fb_h, bx, by, bw, bh, 0xFFFF4444, 3);
+
+            uart_puts("  ["); uart_int(i); uart_puts("] conf=");
+            uart_float(vboxes[i].conf);
+            uart_puts(" ("); uart_int(bx); uart_puts(","); uart_int(by);
+            uart_puts(") "); uart_int(bw); uart_puts("x"); uart_int(bh);
+            uart_puts("\r\n");
         }
 
         cache_flush_range((void*)(unsigned long)ptr, size);
-        uart_puts("Done.\r\n");
+        uart_puts("Frame rendered.\r\n");
         success_blink();
 
     } else {
