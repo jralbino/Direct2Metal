@@ -280,6 +280,38 @@ static float feat_c[L3_OUT_CH * L3_OUT_H * L3_OUT_W];
 static float pool_out[L3_OUT_CH * POOL_OUT_H * POOL_OUT_W];
 static float head_out[HEAD_OUT_CH * GRID_H * GRID_W];
 
+/* Silent inference — same pipeline as the benchmark but no UART output.
+ * Called from the render loop; updates head_out[] in-place.
+ * Ready for camera input: replace test_image with the live frame pointer. */
+static void run_inference_frame() {
+    const float* w = weights_start;
+
+    parallel_conv2d(test_image, INPUT_H, INPUT_W, INPUT_C,
+                    w, L1_OUT_CH, L1_KER_SZ, L1_STRIDE, L1_PAD, feat_a);
+    w += (uint32_t)L1_OUT_CH * L1_IN_CH * L1_KER_SZ * L1_KER_SZ;
+    batchnorm_inplace(feat_a, L1_OUT_H * L1_OUT_W, L1_OUT_CH, w, w + L1_OUT_CH);
+    w += 2 * L1_OUT_CH;
+    leaky_relu_inplace(feat_a, L1_OUT_CH * L1_OUT_H * L1_OUT_W);
+
+    parallel_conv2d(feat_a, L1_OUT_H, L1_OUT_W, L1_OUT_CH,
+                    w, L2_OUT_CH, L2_KER_SZ, L2_STRIDE, L2_PAD, feat_b);
+    w += (uint32_t)L2_OUT_CH * L2_IN_CH * L2_KER_SZ * L2_KER_SZ;
+    batchnorm_inplace(feat_b, L2_OUT_H * L2_OUT_W, L2_OUT_CH, w, w + L2_OUT_CH);
+    w += 2 * L2_OUT_CH;
+    leaky_relu_inplace(feat_b, L2_OUT_CH * L2_OUT_H * L2_OUT_W);
+
+    parallel_conv2d(feat_b, L2_OUT_H, L2_OUT_W, L2_OUT_CH,
+                    w, L3_OUT_CH, L3_KER_SZ, L3_STRIDE, L3_PAD, feat_c);
+    w += (uint32_t)L3_OUT_CH * L3_IN_CH * L3_KER_SZ * L3_KER_SZ;
+    batchnorm_inplace(feat_c, L3_OUT_H * L3_OUT_W, L3_OUT_CH, w, w + L3_OUT_CH);
+    w += 2 * L3_OUT_CH;
+    leaky_relu_inplace(feat_c, L3_OUT_CH * L3_OUT_H * L3_OUT_W);
+
+    maxpool2x2(feat_c, pool_out, L3_OUT_H, L3_OUT_W, L3_OUT_CH);
+    conv1x1(pool_out, GRID_H, GRID_W, HEAD_IN_CH,
+            w, w + HEAD_IN_CH * HEAD_OUT_CH, HEAD_OUT_CH, head_out);
+}
+
 void run_benchmark_inference() {
     unsigned long t_start, t_end, t_freq;
     t_freq = get_timer_freq();
@@ -478,54 +510,85 @@ extern "C" void kernel_main() {
         int fb_w = (int)w;
         int fb_h = (int)h;
 
-        /* ── 1. Dark background ──────────────────────────────── */
-        fill_rect(fb, fb_w, fb_h, 0, 0, fb_w, fb_h, 0xFF1A1A2E);
-
-        /* ── 2. Test image — 8× upscale, centred ─────────────── */
         const int SCALE  = 8;
         const int DISP_W = INPUT_W * SCALE;   /* 512 px */
         const int DISP_H = INPUT_H * SCALE;   /* 512 px */
-        int img_x = (fb_w - DISP_W) / 2;     /* 704 @ 1920 */
-        int img_y = (fb_h - DISP_H) / 2;     /* 284 @ 1080 */
+        int img_x = (fb_w - DISP_W) / 2;
+        int img_y = (fb_h - DISP_H) / 2;
 
-        uart_puts("Drawing test image...\r\n");
-        draw_image(fb, fb_w, fb_h,
-                   test_image, INPUT_W, INPUT_H,
-                   img_x, img_y, SCALE);
+        /* One-time full background flush (static regions never change). */
+        fill_rect(fb, fb_w, fb_h, 0, 0, fb_w, fb_h, 0xFF1A1A2E);
+        cache_flush_range((volatile void*)(unsigned long)ptr, size);
 
-        /* ── 3. White border around the image ───────────────── */
-        draw_rect(fb, fb_w, fb_h,
-                  img_x - 2, img_y - 2, DISP_W + 4, DISP_H + 4,
-                  0xFFFFFFFF, 2);
+        uart_puts("Entering render loop...\r\n");
 
-        /* ── 4. Bounding boxes ────────────────────────────────
-         *  Use a lower threshold (0.15) so we see boxes even
-         *  with untrained random weights (conf ≈ 0.23).
-         *  head_out[] was filled by run_benchmark_inference().  */
-        BBox vboxes[16];
-        int  vn = yolo_decode(head_out, GRID_H, GRID_W,
-                              0.15f, vboxes, 16);
+        /* Precompute the horizontal strip that changes each frame.
+         * Extends 24 px above/below the image to cover bbox overflow. */
+        int strip_y0 = (img_y - 24 > 0)      ? img_y - 24      : 0;
+        int strip_y1 = (img_y + DISP_H + 24 < fb_h) ? img_y + DISP_H + 24 : fb_h;
+        unsigned long strip_off  = (unsigned long)strip_y0 * fb_w * 4;
+        unsigned long strip_size = (unsigned long)(strip_y1 - strip_y0) * fb_w * 4;
 
-        uart_puts("Boxes: "); uart_int(vn); uart_puts("\r\n");
+        unsigned long frame_count = 0;
+        unsigned long t_fps = get_timer_count();
+        unsigned long t_freq_hz = get_timer_freq();
 
-        for (int i = 0; i < vn; i++) {
-            /* Normalised [0,1] → display pixels */
-            int bx = img_x + (int)((vboxes[i].x - vboxes[i].w * 0.5f) * DISP_W);
-            int by = img_y + (int)((vboxes[i].y - vboxes[i].h * 0.5f) * DISP_H);
-            int bw = (int)(vboxes[i].w * DISP_W);
-            int bh = (int)(vboxes[i].h * DISP_H);
-            draw_rect(fb, fb_w, fb_h, bx, by, bw, bh, 0xFFFF4444, 3);
+        /* ── RENDER LOOP ──────────────────────────────────────────
+         * Each iteration:
+         *   1. Run inference (silent) — updates head_out[]
+         *      Replace test_image with live_frame[] for camera input.
+         *   2. Clear the image strip to background colour.
+         *   3. Blit the current frame, border, and detection boxes.
+         *   4. Flush only the dirty strip to GPU memory.
+         * ─────────────────────────────────────────────────────── */
+        while (1) {
 
-            uart_puts("  ["); uart_int(i); uart_puts("] conf=");
-            uart_float(vboxes[i].conf);
-            uart_puts(" ("); uart_int(bx); uart_puts(","); uart_int(by);
-            uart_puts(") "); uart_int(bw); uart_puts("x"); uart_int(bh);
-            uart_puts("\r\n");
+            /* 1. Inference */
+            run_inference_frame();
+
+            /* 2. Clear the strip */
+            fill_rect(fb, fb_w, fb_h, 0, strip_y0, fb_w, strip_y1 - strip_y0,
+                      0xFF1A1A2E);
+
+            /* 3a. Blit test image */
+            draw_image(fb, fb_w, fb_h,
+                       test_image, INPUT_W, INPUT_H,
+                       img_x, img_y, SCALE);
+
+            /* 3b. White border */
+            draw_rect(fb, fb_w, fb_h,
+                      img_x - 2, img_y - 2, DISP_W + 4, DISP_H + 4,
+                      0xFFFFFFFF, 2);
+
+            /* 3c. Detection boxes — threshold 0.15 shows results
+             *     even with untrained weights (conf ≈ 0.23) */
+            BBox vboxes[16];
+            int  vn = yolo_decode(head_out, GRID_H, GRID_W,
+                                  0.15f, vboxes, 16);
+            for (int i = 0; i < vn; i++) {
+                int bx = img_x + (int)((vboxes[i].x - vboxes[i].w * 0.5f) * DISP_W);
+                int by = img_y + (int)((vboxes[i].y - vboxes[i].h * 0.5f) * DISP_H);
+                int bw = (int)(vboxes[i].w * DISP_W);
+                int bh = (int)(vboxes[i].h * DISP_H);
+                draw_rect(fb, fb_w, fb_h, bx, by, bw, bh, 0xFFFF4444, 3);
+            }
+
+            /* 4. Flush dirty strip only (~4 MB vs ~8 MB full frame) */
+            cache_flush_range(
+                (volatile void*)((unsigned long)ptr + strip_off),
+                strip_size);
+
+            frame_count++;
+
+            /* Print FPS once per second via UART */
+            unsigned long t_now = get_timer_count();
+            if (t_now - t_fps >= t_freq_hz) {
+                uart_puts("FPS: "); uart_dec((unsigned int)frame_count);
+                uart_puts("  boxes: "); uart_int(vn); uart_puts("\r\n");
+                frame_count = 0;
+                t_fps = t_now;
+            }
         }
-
-        cache_flush_range((void*)(unsigned long)ptr, size);
-        uart_puts("Frame rendered.\r\n");
-        success_blink();
 
     } else {
         uart_puts("FAIL: GPU rejected framebuffer config.\r\n");
