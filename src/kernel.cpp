@@ -221,24 +221,20 @@ static void draw_rect(unsigned int* fb, int fb_w, int fb_h,
     }
 }
 
-/* Blit test_image (CHW float32 [0,1]) to framebuffer, upscaled by `scale`.
- * Pixel format: 0xAARRGGBB (RPi ARGB32). */
-static void draw_image(unsigned int* fb, int fb_w, int fb_h,
-                       const float* img_chw, int iw, int ih,
-                       int dst_x, int dst_y, int scale) {
-    for (int py = 0; py < ih * scale; py++) {
-        int sy = py / scale;
-        for (int px = 0; px < iw * scale; px++) {
-            int sx   = px / scale;
-            int ri   = (int)(img_chw[0 * iw * ih + sy * iw + sx] * 255.0f);
-            int gi   = (int)(img_chw[1 * iw * ih + sy * iw + sx] * 255.0f);
-            int bi   = (int)(img_chw[2 * iw * ih + sy * iw + sx] * 255.0f);
-            if (ri > 255) ri = 255; else if (ri < 0) ri = 0;
-            if (gi > 255) gi = 255; else if (gi < 0) gi = 0;
-            if (bi > 255) bi = 255; else if (bi < 0) bi = 0;
-            unsigned int pix = (0xFFu << 24) | ((unsigned)ri << 16)
-                             | ((unsigned)gi <<  8) | (unsigned)bi;
-            fb_pixel(fb, fb_w, fb_h, dst_x + px, dst_y + py, pix);
+/* Fast blit: precomputed ARGB array [iw*ih] → framebuffer, integer scale.
+ * No float ops, no division in the inner loop. */
+static void blit_scaled(unsigned int* fb, int fb_w,
+                        const unsigned int* argb, int iw, int ih,
+                        int dst_x, int dst_y, int scale) {
+    for (int sy = 0; sy < ih; sy++) {
+        for (int sx = 0; sx < iw; sx++) {
+            unsigned int pix = argb[sy * iw + sx];
+            for (int dy = 0; dy < scale; dy++) {
+                unsigned int* row = fb + (dst_y + sy * scale + dy) * fb_w
+                                       + dst_x + sx * scale;
+                for (int dx = 0; dx < scale; dx++)
+                    row[dx] = pix;
+            }
         }
     }
 }
@@ -516,18 +512,31 @@ extern "C" void kernel_main() {
         int img_x = (fb_w - DISP_W) / 2;
         int img_y = (fb_h - DISP_H) / 2;
 
-        /* One-time full background flush (static regions never change). */
+        /* One-time: fill full background and flush to GPU DRAM. */
         fill_rect(fb, fb_w, fb_h, 0, 0, fb_w, fb_h, 0xFF1A1A2E);
         cache_flush_range((volatile void*)(unsigned long)ptr, size);
 
-        uart_puts("Entering render loop...\r\n");
+        /* Precompute test_image → packed ARGB (done once, not per frame).
+         * Saves INPUT_W*INPUT_H*3 float multiplies per frame in the loop. */
+        static unsigned int img_argb[INPUT_W * INPUT_H];
+        for (int sy = 0; sy < INPUT_H; sy++) {
+            for (int sx = 0; sx < INPUT_W; sx++) {
+                int ri = (int)(test_image[0*INPUT_W*INPUT_H + sy*INPUT_W + sx] * 255.0f);
+                int gi = (int)(test_image[1*INPUT_W*INPUT_H + sy*INPUT_W + sx] * 255.0f);
+                int bi = (int)(test_image[2*INPUT_W*INPUT_H + sy*INPUT_W + sx] * 255.0f);
+                if (ri > 255) ri = 255; else if (ri < 0) ri = 0;
+                if (gi > 255) gi = 255; else if (gi < 0) gi = 0;
+                if (bi > 255) bi = 255; else if (bi < 0) bi = 0;
+                img_argb[sy * INPUT_W + sx] = (0xFFu << 24) | ((unsigned)ri << 16)
+                                            | ((unsigned)gi <<  8) | (unsigned)bi;
+            }
+        }
 
-        /* Precompute the horizontal strip that changes each frame.
-         * Extends 24 px above/below the image to cover bbox overflow. */
-        int strip_y0 = (img_y - 24 > 0)      ? img_y - 24      : 0;
-        int strip_y1 = (img_y + DISP_H + 24 < fb_h) ? img_y + DISP_H + 24 : fb_h;
-        unsigned long strip_off  = (unsigned long)strip_y0 * fb_w * 4;
-        unsigned long strip_size = (unsigned long)(strip_y1 - strip_y0) * fb_w * 4;
+        /* Strip bounds for clear (image + 24 px margin for bbox overflow). */
+        int strip_y0 = (img_y - 24 > 0)           ? img_y - 24           : 0;
+        int strip_y1 = (img_y + DISP_H + 24 < fb_h)? img_y + DISP_H + 24 : fb_h;
+
+        uart_puts("Entering render loop...\r\n");
 
         unsigned long frame_count = 0;
         unsigned long t_fps = get_timer_count();
@@ -536,24 +545,25 @@ extern "C" void kernel_main() {
         /* ── RENDER LOOP ──────────────────────────────────────────
          * Each iteration:
          *   1. Run inference (silent) — updates head_out[]
-         *      Replace test_image with live_frame[] for camera input.
+         *      Swap test_image for live_frame[] when camera is available.
          *   2. Clear the image strip to background colour.
-         *   3. Blit the current frame, border, and detection boxes.
-         *   4. Flush only the dirty strip to GPU memory.
+         *   3. Blit precomputed ARGB (fast integer path), border, boxes.
+         *   4. Flush the FULL framebuffer to GPU DRAM.
+         *      Full flush (not strip-only) guarantees coherency for every
+         *      scanline the GPU DMA reads.
          * ─────────────────────────────────────────────────────── */
         while (1) {
 
             /* 1. Inference */
             run_inference_frame();
 
-            /* 2. Clear the strip */
+            /* 2. Clear image strip */
             fill_rect(fb, fb_w, fb_h, 0, strip_y0, fb_w, strip_y1 - strip_y0,
                       0xFF1A1A2E);
 
-            /* 3a. Blit test image */
-            draw_image(fb, fb_w, fb_h,
-                       test_image, INPUT_W, INPUT_H,
-                       img_x, img_y, SCALE);
+            /* 3a. Fast integer blit (precomputed ARGB, no float ops) */
+            blit_scaled(fb, fb_w, img_argb, INPUT_W, INPUT_H,
+                        img_x, img_y, SCALE);
 
             /* 3b. White border */
             draw_rect(fb, fb_w, fb_h,
@@ -573,10 +583,8 @@ extern "C" void kernel_main() {
                 draw_rect(fb, fb_w, fb_h, bx, by, bw, bh, 0xFFFF4444, 3);
             }
 
-            /* 4. Flush dirty strip only (~4 MB vs ~8 MB full frame) */
-            cache_flush_range(
-                (volatile void*)((unsigned long)ptr + strip_off),
-                strip_size);
+            /* 4. Full framebuffer flush — every scanline coherent for GPU DMA */
+            cache_flush_range((volatile void*)(unsigned long)ptr, size);
 
             frame_count++;
 
