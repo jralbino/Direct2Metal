@@ -1,44 +1,41 @@
-# File: Makefile
-TOOLCHAIN = aarch64-linux-gnu
-CC = $(TOOLCHAIN)-gcc
-CXX = $(TOOLCHAIN)-g++
-LD = $(TOOLCHAIN)-ld
-OBJCOPY = $(TOOLCHAIN)-objcopy
+# --- TOOLCHAIN ---
+CC = aarch64-linux-gnu-gcc
+CXX = aarch64-linux-gnu-g++
+LD = aarch64-linux-gnu-ld
+OBJCOPY = aarch64-linux-gnu-objcopy
 
-# Flags: -Isrc para encontrar los headers .h
-CXXFLAGS = -O3 -Wall -nostdlib -nostartfiles -ffreestanding -fno-exceptions -fno-rtti -Isrc
+# --- FLAGS ---
+# Incluimos -Isrc para que encuentre los .h en src/
+CFLAGS = -O3 -Wall -nostdlib -nostartfiles -ffreestanding -Isrc
+CXXFLAGS = -O3 -Wall -nostdlib -nostartfiles -ffreestanding -fno-exceptions -fno-rtti -Isrc -mno-outline-atomics
 
+# --- SOURCES ---
+# Lista explícita de tus archivos fuente
+ASM_SRCS = src/start.s src/matmul_neon.s src/data.s src/conv2d_neon.s
+CPP_SRCS = src/kernel.cpp src/ops.cpp src/conv2d.cpp src/mmu.cpp src/multicore.cpp
+
+# --- OBJECTS ---
+# Convertimos src/xxx.s -> xxx.o
+OBJS = $(ASM_SRCS:src/%.s=%.o) $(CPP_SRCS:src/%.cpp=%.o)
+
+# --- TARGETS ---
 all: kernel8.img
 
-# --- LINKING ---
-# AQUI AGREGAMOS conv2d_neon.o a la lista
-kernel8.img: start.o matmul_neon.o data.o conv2d_neon.o kernel.o
-	$(LD) -T src/linker.ld -o kernel8.elf start.o matmul_neon.o data.o conv2d_neon.o kernel.o
-	$(OBJCOPY) -O binary kernel8.elf kernel8.img
+# Regla para Ensamblador (.s -> .o)
+%.o: src/%.s
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# --- COMPILATION RULES ---
+# Regla para C++ (.cpp -> .o)
+%.o: src/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-start.o: src/start.s
-	$(CC) -c src/start.s -o start.o
+# Regla para Enlazar (Linking)
+kernel8.elf: src/linker.ld $(OBJS)
+	$(LD) -T src/linker.ld -o $@ $(OBJS)
 
-# Regla para el viejo benchmark (opcional, pero lo dejamos)
-matmul_neon.o: src/matmul_neon.s
-	$(CC) -c src/matmul_neon.s -o matmul_neon.o
-
-# Regla para los datos binarios (pesos)
-data.o: src/data.s
-	$(CC) -c src/data.s -o data.o
-
-# Regla para la NUEVA Convolucion NEON
-conv2d_neon.o: src/conv2d_neon.s
-	$(CC) -c src/conv2d_neon.s -o conv2d_neon.o
-
-kernel.o: src/kernel.cpp
-	$(CXX) $(CXXFLAGS) -c src/kernel.cpp -o kernel.o
-
-# --- RUN COMMAND ---
-run: kernel8.img
-	qemu-system-aarch64 -M raspi3b -serial stdio -kernel kernel8.img
+# Regla final (ELF -> IMG)
+kernel8.img: kernel8.elf
+	$(OBJCOPY) -O binary $< $@
 
 clean:
 	rm -f *.o *.elf *.img
