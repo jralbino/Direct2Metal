@@ -1,0 +1,20 @@
+# --- RPI ZERO 2 W HARDWARE RECOVERY ---
+arm_64bit=1
+kernel=kernel8.img
+enable_uart=1
+dtoverlay=disable-bt
+
+# BAJO CONSUMO (Para evitar el rayo/barra de voltaje)
+arm_freq=600
+core_freq=250
+sdram_freq=400
+over_voltage=-2
+
+# VIDEO VESA ESTÁNDAR (1024x768 @ 60Hz)
+hdmi_force_hotplug=1
+hdmi_group=2
+hdmi_mode=4
+hdmi_drive=2
+config_hdmi_boost=7
+disable_overscan=1
+gpu_mem=64

@@ -1,19 +1,32 @@
-/* File: src/multicore.cpp — 4-core parallel conv2d (bare-metal, no OS).
- *
- * See multicore.h for the synchronisation protocol.
- */
+/* File: src/multicore.cpp — 4-core parallel inference engine (bare-metal, no OS). */
 #include "multicore.h"
+#include "mmu.h"
 #include <stdint.h>
 #include <arm_neon.h>
+
+/* ------------------------------------------------------------------ */
+/* External functions                                                   */
+/* ------------------------------------------------------------------ */
+
+extern "C" void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in,
+                                         const float* w, const float* b,
+                                         int C_out_start, int C_out_end, int C_out_total,
+                                         float* out);
 
 /* ------------------------------------------------------------------ */
 /* Shared synchronisation state                                         */
 /* ------------------------------------------------------------------ */
 
-volatile ParallelConvTask parallel_task;
-volatile int              task_epoch   = 0;
-volatile int              done_count   = 0;
-volatile int              cores_ready  = 0;  /* how many workers reached the loop */
+volatile ParallelTask parallel_task;
+volatile int          task_epoch  = 0;
+volatile int          done_count  = 0;
+volatile int          cores_ready = 0;   /* secondary cores that reached worker loop */
+
+/* ------------------------------------------------------------------ */
+/* Cached multicore availability (probed on first call)                */
+/* ------------------------------------------------------------------ */
+
+static int multicore_available = -1;   /* -1 = not probed yet */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                              */
@@ -29,7 +42,8 @@ static inline int get_core_id() {
 /* conv2d_partial — NEON 4-ch kernel for a slice of output-ch groups.
  *
  * Processes groups [grp_start, grp_end) of the repacked weight tensor.
- * Equivalent to the inner loop of conv2d_neon_4ch().
+ * Supports arbitrary kernel size K (not just K=3).
+ * Weight layout: [C_out/4][C_in*K*K][4] (repacked by export_model.py).
  * ------------------------------------------------------------------ */
 static void conv2d_partial(
         const float* in,  int H_in, int W_in, int C_in,
@@ -44,7 +58,7 @@ static void conv2d_partial(
     int CinKK  = C_in  * K * K;
 
     for (int g = grp_start; g < grp_end; g++) {
-        int         co = g * 4;
+        int          co = g * 4;
         const float* wg = w_rep + (long)g * CinKK * 4;
 
         float* o0 = out + (co + 0) * HW_out;
@@ -74,11 +88,11 @@ static void conv2d_partial(
                     }
                 }
 
-                int pos  = oy * W_out + ox;
-                o0[pos]  = vgetq_lane_f32(acc, 0);
-                o1[pos]  = vgetq_lane_f32(acc, 1);
-                o2[pos]  = vgetq_lane_f32(acc, 2);
-                o3[pos]  = vgetq_lane_f32(acc, 3);
+                int pos = oy * W_out + ox;
+                o0[pos] = vgetq_lane_f32(acc, 0);
+                o1[pos] = vgetq_lane_f32(acc, 1);
+                o2[pos] = vgetq_lane_f32(acc, 2);
+                o3[pos] = vgetq_lane_f32(acc, 3);
             }
         }
     }
@@ -90,42 +104,67 @@ static void conv2d_partial(
 
 extern "C" void secondary_main()
 {
-    int core_id  = get_core_id();   /* 1, 2, or 3 */
+    int core_id = get_core_id();   /* 1, 2, or 3 */
 
-    /* Announce that this core reached the worker loop. */
+    /* Enable D-cache + I-cache on this core.
+     * mmu.cpp's secondary branch waits for Core 0 to fill the translation
+     * table (mmu_table_ready flag), then configures this core's own
+     * MAIR_EL1 / TCR_EL1 / TTBR0_EL1 and sets SCTLR_EL1.M+C+I.
+     * Without this, secondary cores hit LPDDR2 uncached on every tensor
+     * access, making them ~10× slower than Core 0 and ADDING latency. */
+    init_mmu();
+
+    /* Announce that this core reached the worker loop.
+     * Core 0 waits for cores_ready == 3 on first parallel_conv2d call. */
     __atomic_fetch_add((int*)&cores_ready, 1, __ATOMIC_RELEASE);
     asm volatile("sev");
 
     int my_epoch = 0;
 
     while (1) {
-        /* Wait until core 0 increments task_epoch. */
+        /* Wait until core 0 increments task_epoch (wfe saves power + yields in QEMU). */
         while (__atomic_load_n((int*)&task_epoch, __ATOMIC_ACQUIRE) == my_epoch) {
             asm volatile("wfe");
         }
         my_epoch = task_epoch;
 
-        /* Snapshot task parameters (all stores before RELEASE on core 0
-         * are visible after our ACQUIRE on task_epoch). */
-        const float* in     = (const float*)parallel_task.in;
-        int          H_in   = parallel_task.H_in;
-        int          W_in   = parallel_task.W_in;
-        int          C_in   = parallel_task.C_in;
-        const float* w_rep  = (const float*)parallel_task.w_rep;
-        int          K      = parallel_task.K;
-        int          stride = parallel_task.stride;
-        int          pad    = parallel_task.pad;
-        float*       out    = (float*)parallel_task.out;
-        int          n_grp  = parallel_task.n_grp;
+        /* Read task type and parameters (all visible after ACQUIRE on task_epoch). */
+        int type = parallel_task.type;
 
-        /* This core's slice of output-channel groups. */
-        int slice     = n_grp / 4;           /* groups per core */
-        int grp_start = core_id * slice;
-        int grp_end   = grp_start + slice;
+        if (type == TASK_CONV2D) {
+            const float* in    = (const float*)parallel_task.in;
+            int          H_in  = parallel_task.H;
+            int          W_in  = parallel_task.W;
+            int          C_in  = parallel_task.C_in;
+            const float* w_rep = (const float*)parallel_task.w_rep;
+            int          K     = parallel_task.K;
+            int          stride= parallel_task.stride;
+            int          pad   = parallel_task.pad;
+            float*       out   = (float*)parallel_task.out;
+            int          n_grp = parallel_task.n_grp;
 
-        conv2d_partial(in, H_in, W_in, C_in,
-                       w_rep, K, stride, pad,
-                       out, grp_start, grp_end);
+            int slice     = n_grp / 4;
+            int grp_start = core_id * slice;
+            int grp_end   = grp_start + slice;
+
+            conv2d_partial(in, H_in, W_in, C_in, w_rep, K, stride, pad, out, grp_start, grp_end);
+        }
+        else if (type == TASK_CONV1X1) {
+            const float* in   = (const float*)parallel_task.in;
+            int          H    = parallel_task.H;
+            int          W    = parallel_task.W;
+            int          C_in = parallel_task.C_in;
+            const float* w    = (const float*)parallel_task.w1x1;
+            const float* b    = (const float*)parallel_task.bias;
+            float*       out  = (float*)parallel_task.out;
+            int          C_out= parallel_task.C_out;
+
+            int chunk = C_out / 4;
+            int start = core_id * chunk;
+            int end   = (core_id == 3) ? C_out : (start + chunk);
+
+            ops_neon_conv1x1_kernel(in, H, W, C_in, w, b, start, end, C_out, out);
+        }
 
         /* Signal completion (RELEASE so core 0's ACQUIRE sees our writes). */
         __atomic_fetch_add((int*)&done_count, 1, __ATOMIC_RELEASE);
@@ -134,75 +173,137 @@ extern "C" void secondary_main()
 }
 
 /* ------------------------------------------------------------------ */
-/* parallel_conv2d — called by core 0 to dispatch work to all 4 cores. */
+/* probe_multicore — one-time check if secondary cores are alive.      */
 /* ------------------------------------------------------------------ */
 
-/* Cached result of the one-time multicore availability probe.
- *  -1 = not yet probed,  0 = unavailable (QEMU / single-core),  1 = available */
-static int multicore_available = -1;
+static void probe_multicore() {
+    if (multicore_available != -1) return;
+
+    /* On real hardware secondary cores reach secondary_main within a few µs.
+     * On QEMU raspi3b they are never started → cores_ready stays 0.
+     * Spin ~500K iterations (~500µs @ 1GHz), then decide. */
+    int spin = 500000;
+    while (__atomic_load_n((int*)&cores_ready, __ATOMIC_ACQUIRE) < 3 && --spin > 0) {
+        asm volatile("nop");
+    }
+    multicore_available = (cores_ready >= 3) ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* dispatch_task — common publish + wait pattern for core 0.           */
+/* ------------------------------------------------------------------ */
+
+static void dispatch_task_and_wait() {
+    /* Reset completion counter BEFORE publishing the task. */
+    __atomic_store_n((int*)&done_count, 0, __ATOMIC_RELAXED);
+
+    /* Publish task: dsb ish ensures all task-field stores are visible,
+     * then RELEASE-increment wakes workers. */
+    asm volatile("dsb ish" : : : "memory");
+    __atomic_fetch_add((int*)&task_epoch, 1, __ATOMIC_RELEASE);
+    asm volatile("sev");
+}
+
+static void wait_for_workers() {
+    while (__atomic_load_n((int*)&done_count, __ATOMIC_ACQUIRE) < 3) {
+        asm volatile("wfe");
+    }
+    asm volatile("dsb ish" : : : "memory");
+}
+
+/* ------------------------------------------------------------------ */
+/* parallel_conv2d — dispatch conv2d across all 4 cores.               */
+/* C_out must be divisible by 4. Supports arbitrary kernel size K.     */
+/* ------------------------------------------------------------------ */
 
 void parallel_conv2d(const float* in, int H_in, int W_in, int C_in,
                      const float* w_rep, int C_out, int K,
                      int stride, int pad, float* out)
 {
-    int n_grp = C_out / 4;   /* C_out must be divisible by 4 */
+    int n_grp = C_out / 4;
     int H_out = (H_in + 2 * pad - K) / stride + 1;
     int W_out = (W_in + 2 * pad - K) / stride + 1;
 
-    /* First call: probe whether secondary cores are alive.
-     * On real hardware they reach secondary_main() within a few µs.
-     * On QEMU raspi3b they are never started → cores_ready stays 0.
-     * Spin for ~500K iterations (~500µs @ 1 GHz) then decide. */
-    if (multicore_available == -1) {
-        int spin = 500000;
-        while (__atomic_load_n((int*)&cores_ready, __ATOMIC_ACQUIRE) < 3
-               && --spin > 0) {
-            asm volatile("nop");
-        }
-        multicore_available = (cores_ready >= 3) ? 1 : 0;
-    }
+    probe_multicore();
 
-    /* Fallback: QEMU or single-core environment — run on core 0 only. */
+    /* Fallback: QEMU or single-core environment. */
     if (!multicore_available) {
         for (int i = 0; i < C_out * H_out * W_out; i++) out[i] = 0.0f;
-        conv2d_partial(in, H_in, W_in, C_in,
-                       w_rep, K, stride, pad, out, 0, n_grp);
+        conv2d_partial(in, H_in, W_in, C_in, w_rep, K, stride, pad, out, 0, n_grp);
         return;
     }
 
-    /* Zero the full output buffer (single-threaded, before workers write). */
+    /* Zero output buffer (sequential, before workers write). */
     for (int i = 0; i < C_out * H_out * W_out; i++) out[i] = 0.0f;
 
-    /* Fill task descriptor. */
+    /* Fill task. */
+    parallel_task.type   = TASK_CONV2D;
     parallel_task.in     = in;
-    parallel_task.H_in   = H_in;
-    parallel_task.W_in   = W_in;
+    parallel_task.H      = H_in;
+    parallel_task.W      = W_in;
     parallel_task.C_in   = C_in;
-    parallel_task.w_rep  = w_rep;
     parallel_task.C_out  = C_out;
+    parallel_task.w_rep  = w_rep;
     parallel_task.K      = K;
     parallel_task.stride = stride;
     parallel_task.pad    = pad;
     parallel_task.out    = out;
     parallel_task.n_grp  = n_grp;
 
-    /* Reset completion counter BEFORE publishing the task. */
-    __atomic_store_n((int*)&done_count, 0, __ATOMIC_RELAXED);
+    dispatch_task_and_wait();
 
-    /* Publish task: RELEASE ensures all stores above are visible. */
-    asm volatile("dsb ish" : : : "memory");
-    __atomic_fetch_add((int*)&task_epoch, 1, __ATOMIC_RELEASE);
-    asm volatile("sev");   /* wake cores 1-3 from WFE */
-
-    /* Core 0 processes groups 0 .. (n_grp/4 - 1). */
+    /* Core 0 processes groups 0 .. n_grp/4-1. */
     int slice = n_grp / 4;
-    conv2d_partial(in, H_in, W_in, C_in,
-                   w_rep, K, stride, pad,
-                   out, 0, slice);
+    conv2d_partial(in, H_in, W_in, C_in, w_rep, K, stride, pad, out, 0, slice);
 
-    /* Wait for all workers to finish (ACQUIRE syncs their writes). */
-    while (__atomic_load_n((int*)&done_count, __ATOMIC_ACQUIRE) < 3) {
-        asm volatile("wfe");
+    wait_for_workers();
+}
+
+/* ------------------------------------------------------------------ */
+/* parallel_conv1x1 — dispatch 1x1 conv (matrix multiply) across 4    */
+/* cores. C_out must be divisible by 4.                                */
+/* ------------------------------------------------------------------ */
+
+void parallel_conv1x1(const float* in, int H, int W, int C_in,
+                      const float* w, const float* b, int C_out, float* out)
+{
+    probe_multicore();
+
+    /* Fallback: single-core. */
+    if (!multicore_available) {
+        ops_neon_conv1x1_kernel(in, H, W, C_in, w, b, 0, C_out, C_out, out);
+        return;
     }
-    asm volatile("dsb ish" : : : "memory");
+
+    /* Fill task. */
+    parallel_task.type  = TASK_CONV1X1;
+    parallel_task.in    = in;
+    parallel_task.H     = H;
+    parallel_task.W     = W;
+    parallel_task.C_in  = C_in;
+    parallel_task.C_out = C_out;
+    parallel_task.w1x1  = w;
+    parallel_task.bias  = b;
+    parallel_task.out   = out;
+
+    dispatch_task_and_wait();
+
+    /* Core 0 processes its slice. */
+    int chunk = C_out / 4;
+    ops_neon_conv1x1_kernel(in, H, W, C_in, w, b, 0, chunk, C_out, out);
+
+    wait_for_workers();
+}
+
+/* ------------------------------------------------------------------ */
+/* flush_to_ram — used by mailbox.cpp for GPU D-cache coherency.       */
+/* ------------------------------------------------------------------ */
+
+extern "C" void flush_to_ram(volatile void* addr, unsigned long size) {
+    unsigned long start = (unsigned long)addr & ~0x3FUL;
+    unsigned long end   = (unsigned long)addr + size;
+    for (unsigned long curr = start; curr < end; curr += 64) {
+        asm volatile("dc civac, %0" :: "r"(curr) : "memory");
+    }
+    asm volatile("dsb sy\n\tisb" ::: "memory");
 }

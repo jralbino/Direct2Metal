@@ -7,12 +7,17 @@ OBJCOPY = aarch64-linux-gnu-objcopy
 # --- FLAGS ---
 # Incluimos -Isrc para que encuentre los .h en src/
 CFLAGS = -O3 -Wall -nostdlib -nostartfiles -ffreestanding -Isrc
-CXXFLAGS = -O3 -Wall -nostdlib -nostartfiles -ffreestanding -fno-exceptions -fno-rtti -Isrc -mno-outline-atomics
-
+# Banderas optimizadas para AArch64 (Raspberry Pi Zero 2 W / Cortex-A53)
+CXXFLAGS = -Wall -O3 -nostdlib -nostartfiles -ffreestanding \
+           -mcpu=cortex-a53 -mtune=cortex-a53 \
+           -funsafe-math-optimizations -ffast-math \
+           -ftree-vectorize \
+           -mno-outline-atomics \
+           -Wno-array-bounds
 # --- SOURCES ---
 # Lista explícita de tus archivos fuente
 ASM_SRCS = src/start.s src/matmul_neon.s src/data.s src/conv2d_neon.s
-CPP_SRCS = src/kernel.cpp src/ops.cpp src/conv2d.cpp src/mmu.cpp src/multicore.cpp
+CPP_SRCS = src/kernel.cpp src/ops.cpp src/conv2d.cpp src/mmu.cpp src/multicore.cpp src/mailbox.cpp src/video.cpp
 
 # --- OBJECTS ---
 # Convertimos src/xxx.s -> xxx.o
