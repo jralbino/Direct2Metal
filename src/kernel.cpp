@@ -1,6 +1,7 @@
-/* File: src/kernel.cpp - FINAL CLEAN VERSION */
+/* File: src/kernel.cpp - FULLY VECTORIZED & LINKER FIXED */
 #include <stdint.h>
 #include <cstddef>
+#include <arm_neon.h>
 #include "ops.h"
 #include "mmu.h"
 #include "multicore.h"
@@ -9,7 +10,7 @@
 #define NULL 0
 #endif
 
-// --- VIDEO HEADERS ---
+// --- VIDEO HEADERS (Enlace C++ Normal) ---
 extern void video_init();
 extern void draw_pixel(int x, int y, uint32_t color);
 extern void draw_rect(int x, int y, int w, int h, uint32_t color, int thickness);
@@ -17,7 +18,7 @@ extern void draw_fill(uint32_t color);
 extern void draw_tensor_image(const float* img, int x_off, int y_off, int img_w, int img_h);
 extern void video_flush();
 
-// --- UART HEADERS ---
+// --- UART & SYSTEM (Enlace C++ Normal) ---
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
 volatile uint32_t* const UART0_CR = (uint32_t*)0x3F201030;
@@ -31,6 +32,7 @@ void uart_init() {
     *((volatile uint32_t*)0x3F20102C) = 0x70;
     *UART0_CR = 0x301;
 }
+
 void uart_putc(unsigned char c) { while (*UART0_FR & (1 << 5)); *UART0_DR = c; }
 void uart_puts(const char* s) { while (*s) { if (*s == '\n') uart_putc('\r'); uart_putc(*s++); } }
 extern "C" void uart_puts_c(const char* s) { uart_puts(s); } 
@@ -75,12 +77,32 @@ static float mini_exp(float x) {
 }
 static float fast_sigmoid(float x) { return 1.0f / (1.0f + mini_exp(-x)); }
 
+// [NEON] Suma de Bias vectorizada
 static void add_bias_inplace(float* tensor, const float* bias, int hw, int c) {
     for (int ch = 0; ch < c; ch++) {
-        float b = bias[ch];
+        float32x4_t b_vec = vdupq_n_f32(bias[ch]);
         float* plane = tensor + ch * hw;
-        for (int i = 0; i < hw; i++) plane[i] += b;
+        int i = 0;
+        for (; i <= hw - 4; i += 4) {
+            float32x4_t val = vld1q_f32(plane + i);
+            vst1q_f32(plane + i, vaddq_f32(val, b_vec));
+        }
+        for (; i < hw; i++) plane[i] += bias[ch];
     }
+}
+
+// [NEON] Copia de tensores
+static void copy_tensor(const float* src, float* dst, int n) { 
+    int i = 0;
+    for (; i <= n - 4; i += 4) {
+        vst1q_f32(dst + i, vld1q_f32(src + i));
+    }
+    for (; i < n; i++) dst[i] = src[i];
+}
+
+static void concat_tensor(const float* src1, int c1, const float* src2, int c2, float* dst, int hw) {
+    copy_tensor(src1, dst, c1 * hw); 
+    copy_tensor(src2, dst + c1 * hw, c2 * hw);
 }
 
 struct WeightStream {
@@ -96,11 +118,6 @@ struct WeightStream {
     }
 };
 
-static void copy_tensor(const float* src, float* dst, int n) { for (int i = 0; i < n; i++) dst[i] = src[i]; }
-static void concat_tensor(const float* src1, int c1, const float* src2, int c2, float* dst, int hw) {
-    copy_tensor(src1, dst, c1 * hw); copy_tensor(src2, dst + c1 * hw, c2 * hw);
-}
-
 // --- NMS ENGINE ---
 #define MAX_PREDS 100
 struct Box { float x, y, w, h, conf; int cls; };
@@ -112,16 +129,12 @@ static float calculate_iou(const Box& a, const Box& b) {
     float y1_int = (a.y - a.h/2) > (b.y - b.h/2) ? (a.y - a.h/2) : (b.y - b.h/2);
     float x2_int = (a.x + a.w/2) < (b.x + b.w/2) ? (a.x + a.w/2) : (b.x + b.w/2);
     float y2_int = (a.y + a.h/2) < (b.y + b.h/2) ? (a.y + a.h/2) : (b.y + b.h/2);
-
     float w_int = x2_int - x1_int;
     float h_int = y2_int - y1_int;
-
     if (w_int <= 0 || h_int <= 0) return 0.0f;
-
     float area_int = w_int * h_int;
     float area_a = a.w * a.h;
     float area_b = b.w * b.h;
-
     return area_int / (area_a + area_b - area_int);
 }
 
@@ -132,22 +145,18 @@ static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, 
             for (int cx = 0; cx < grid_w; cx++) {
                 int idx = cy * grid_w + cx;
                 float obj_conf = fast_sigmoid(tensor[(base_ch + 4) * (grid_h * grid_w) + idx]);
-                
                 float max_cls_prob = 0.0f;
                 int best_cls = -1;
                 for (int c = 0; c < 80; c++) {
                     float cls_prob = fast_sigmoid(tensor[(base_ch + 5 + c) * (grid_h * grid_w) + idx]);
                     if (cls_prob > max_cls_prob) { max_cls_prob = cls_prob; best_cls = c; }
                 }
-                
                 float score = obj_conf * max_cls_prob;
-                
-                if (score > 0.5f && num_preds < MAX_PREDS) {
+                if (score > 0.45f && num_preds < MAX_PREDS) {
                     float tx = tensor[(base_ch + 0) * (grid_h * grid_w) + idx];
                     float ty = tensor[(base_ch + 1) * (grid_h * grid_w) + idx];
                     float tw = tensor[(base_ch + 2) * (grid_h * grid_w) + idx];
                     float th = tensor[(base_ch + 3) * (grid_h * grid_w) + idx];
-                    
                     preds[num_preds].x = (fast_sigmoid(tx) * 2.0f - 0.5f + cx) * stride;
                     preds[num_preds].y = (fast_sigmoid(ty) * 2.0f - 0.5f + cy) * stride;
                     float sw = fast_sigmoid(tw) * 2.0f; 
@@ -187,10 +196,17 @@ void c3_real_inference(float* in, float* out, float* temp, int h, int w, int c_i
         parallel_conv2d(b_out, h, w, c_hidden, w_b2, c_hidden, 3, 1, 1, bot_res);
         add_bias_inplace(bot_res, b_b2, hw, c_hidden); silu_inplace(bot_res, hw_hidden);
         
+        // [NEON] Lazo Shortcut Vectorizado
         if (shortcut) {
-            for (int k = 0; k < hw_hidden; k++) b_in[k] += bot_res[k];
+            int k = 0;
+            for (; k <= hw_hidden - 4; k += 4) {
+                float32x4_t a = vld1q_f32(b_in + k);
+                float32x4_t b = vld1q_f32(bot_res + k);
+                vst1q_f32(b_in + k, vaddq_f32(a, b));
+            }
+            for (; k < hw_hidden; k++) b_in[k] += bot_res[k];
         } else {
-            for (int k = 0; k < hw_hidden; k++) b_in[k] = bot_res[k];
+            copy_tensor(bot_res, b_in, hw_hidden);
         }
     }
     parallel_conv1x1(temp, h, w, c_out, w_cv3, b_cv3, c_out, out); silu_inplace(out, hw * c_out);
@@ -218,56 +234,43 @@ void run_yolo_complete() {
     WeightStream ws(weights_start);
     num_preds = 0; 
     
-    // --- CONVERSIÓN BGR a RGB Y NORMALIZACIÓN ---
     uart_puts("[CHK 2] Iniciando conversion RGB...\n");
     int hw = 320 * 320;
     float scale = (test_image[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
     for(int i = 0; i < hw; i++) {
-        buf_B[0 * hw + i] = test_image[2 * hw + i] * scale; 
+        buf_B[0 * hw + i] = test_image[0 * hw + i] * scale; 
         buf_B[1 * hw + i] = test_image[1 * hw + i] * scale; 
-        buf_B[2 * hw + i] = test_image[0 * hw + i] * scale; 
+        buf_B[2 * hw + i] = test_image[2 * hw + i] * scale; 
     }
-    uart_puts("[CHK 3] Conversion RGB terminada en buf_B.\n");
+    uart_puts("[CHK 3] Conversion terminada.\n");
     
     // BACKBONE
     uart_puts("[CHK 4] Leyendo pesos L0...\n");
     const float* w0 = ws.next(16*3*6*6, "L0_W"); const float* b0 = ws.next(16, "L0_B");
     
-    uart_puts("[CHK 5] Ejecutando Convolucion L0 (parallel_conv2d)...\n");
+    uart_puts("[CHK 5] Ejecutando Convolucion L0...\n");
     parallel_conv2d(buf_B, 320, 320, 3, w0, 16, 6, 2, 2, buf_A); 
-    
-    uart_puts("[CHK 6] Sumando bias y SiLU L0...\n");
     add_bias_inplace(buf_A, b0, 160*160, 16); silu_inplace(buf_A, 16*160*160);
 
-    uart_puts("[CHK 7] Leyendo pesos L1...\n");
     const float* w1 = ws.next(32*16*3*3, "L1_W"); const float* b1 = ws.next(32, "L1_B");
-    
-    uart_puts("[CHK 8] Ejecutando Convolucion L1...\n");
     parallel_conv2d(buf_A, 160, 160, 16, w1, 32, 3, 2, 1, buf_B); add_bias_inplace(buf_B, b1, 80*80, 32); silu_inplace(buf_B, 32*80*80);
     
-    uart_puts("[CHK 9] Ejecutando C3 Block L2 (parallel_conv1x1 NEON + SiLU vectorizado)...\n");
     c3_real_inference(buf_B, buf_A, scratch, 80, 80, 32, 32, 1, true, ws, "L2");
-
-    uart_puts("[CHK 10] BLOQUE L2 SUPERADO. Memoria estable.\n");
 
     const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
     parallel_conv2d(buf_A, 80, 80, 32, w3, 64, 3, 2, 1, buf_B); add_bias_inplace(buf_B, b3, 40*40, 64); silu_inplace(buf_B, 64*40*40);
     c3_real_inference(buf_B, buf_A, scratch, 40, 40, 64, 64, 2, true, ws, "L4"); copy_tensor(buf_A, save_L4, 64*40*40);
 
-    uart_puts("[CHK 11] BLOQUE L4 SUPERADO.\n");
-
     const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
     parallel_conv2d(buf_A, 40, 40, 64, w5, 128, 3, 2, 1, buf_B); add_bias_inplace(buf_B, b5, 20*20, 128); silu_inplace(buf_B, 128*20*20);
     c3_real_inference(buf_B, buf_A, scratch, 20, 20, 128, 128, 3, true, ws, "L6"); copy_tensor(buf_A, save_L6, 128*20*20);
-
-    uart_puts("[CHK 12] BLOQUE L6 SUPERADO.\n");
 
     const float* w7 = ws.next(256*128*3*3, "L7_W"); const float* b7 = ws.next(256, "L7_B");
     parallel_conv2d(buf_A, 20, 20, 128, w7, 256, 3, 2, 1, buf_B); add_bias_inplace(buf_B, b7, 10*10, 256); silu_inplace(buf_B, 256*10*10);
     c3_real_inference(buf_B, buf_A, scratch, 10, 10, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, 10, 10, 256, ws);
 
-    uart_puts("[CHK 13] BACKBONE COMPLETADO (SPPF).\n");
+    uart_puts("[CHK 13] BACKBONE COMPLETADO.\n");
 
     // NECK
     const float* w10 = ws.next(128*256, "L10_W"); const float* b10 = ws.next(128, "L10_B");
@@ -299,10 +302,7 @@ void run_yolo_complete() {
     concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, 10*10);
     c3_real_inference(scratch, buf_B, buf_A, 10, 10, 256, 256, 1, false, ws, "L23"); 
 
-    uart_puts("[CHK 14] NECK COMPLETADO.\n");
-
     // DETECCIÓN 
-    uart_puts("[CHK 15] Iniciando capas de Deteccion (Heads)...\n");
     const float* w_det_p3 = ws.next(255*64, "Det_P3_W"); const float* b_det_p3 = ws.next(255, "Det_P3_B");
     const float* w_det_p4 = ws.next(255*128, "Det_P4_W"); const float* b_det_p4 = ws.next(255, "Det_P4_B");
     const float* w_det_p5 = ws.next(255*256, "Det_P5_W"); const float* b_det_p5 = ws.next(255, "Det_P5_B");
@@ -321,24 +321,18 @@ void run_yolo_complete() {
 
     unsigned long t_end = get_timer_count();
     
-    uart_puts("[CHK 16] Entrando a NMS... ");
-    uart_puts("Predicciones crudas: "); uart_dec(num_preds); uart_puts("\n");
-
-    // 1. SANITIZACIÓN DE DATOS (Protección contra NaN/Infinitos)
     if (num_preds > MAX_PREDS) num_preds = MAX_PREDS; 
     
-    // 2. Ordenamiento (Bubble Sort)
+    // NMS (Bubble Sort)
     for (int i = 0; i < num_preds - 1; i++) {
         for (int j = 0; j < num_preds - i - 1; j++) {
             if (preds[j].conf < preds[j+1].conf) {
-                Box temp = preds[j];
-                preds[j] = preds[j+1];
-                preds[j+1] = temp;
+                Box temp = preds[j]; preds[j] = preds[j+1]; preds[j+1] = temp;
             }
         }
     }
 
-    // 3. Filtro IoU (NMS)
+    // Filtro IoU
     float nms_thresh = 0.45f; 
     for (int i = 0; i < num_preds; i++) {
         if (preds[i].conf == 0.0f) continue; 
@@ -351,19 +345,17 @@ void run_yolo_complete() {
         }
     }
 
-    uart_puts("[CHK 17] NMS Terminado. Dibujando...\n");
-
     draw_fill(0xFF222222); 
     draw_tensor_image(test_image, 160, 80, 320, 320);
 
     uart_puts("\n>>> OBJETOS DETECTADOS <<<\n");
     int valid_boxes = 0;
     for (int i = 0; i < num_preds; i++) {
-        if (preds[i].conf > 0.5f) {
+        if (preds[i].conf > 0.4f) { 
             valid_boxes++;
             
             uart_puts("Clase: "); uart_dec(preds[i].cls);
-            uart_puts(" | Confianza (x1000): "); uart_dec((int)(preds[i].conf * 1000));
+            uart_puts(" | Conf: "); uart_dec((int)(preds[i].conf * 100));
             uart_puts(" | Pos: ["); uart_dec((int)preds[i].x); uart_puts(","); uart_dec((int)preds[i].y); uart_puts("]\n");
 
             int box_w = (int)preds[i].w;
@@ -379,14 +371,14 @@ void run_yolo_complete() {
             if (left + box_w > 640) box_w = 640 - left;
             if (top + box_h > 480) box_h = 480 - top;
 
-            if (box_w > 0 && box_h > 0) {
+            if (box_w > 2 && box_h > 2) {
                 uint32_t color = (preds[i].cls == 0) ? 0xFF0000FF : 0xFF00FFFF; 
                 draw_rect(left, top, box_w, box_h, color, 3); 
             }
         }
     }
     
-    if(valid_boxes == 0) uart_puts("Ningun objeto valido para dibujar.\n");
+    if(valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
 
     uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF; 
     draw_rect(20, 20, 40, 40, heartbeat_color, 40); 
@@ -401,8 +393,7 @@ extern "C" void kernel_main() {
     uart_init();
     uart_puts("\r\n=== Direct2Metal: MOTOR IA EN TIEMPO REAL ===\r\n");
 
-    /* BSS is now clean.  Signal secondary cores (1-3) to leave their
-     * bss_ready spin loop and enter secondary_main(). */
+    extern volatile int bss_ready;
     __atomic_store_n((int*)&bss_ready, 1, __ATOMIC_RELEASE);
     asm volatile("dsb sy" : : : "memory");
     asm volatile("sev");

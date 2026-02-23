@@ -90,44 +90,58 @@ void conv2d_neon_4ch_group(const float* in, int H_in, int W_in, int C_in, const 
 }
 
 // --- SUPER FAST NEON 1x1 (4x4 Register Blocking) ---
+// --- SUPER FAST NEON 1x1 (4x4 Register Blocking + L1 Cache Tiling) ---
 void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const float* w, const float* b, int C_out_start, int C_out_end, int C_out_total, float* out) {
     int HW = H * W;
-    int co = C_out_start;
-    for (; co <= C_out_end - 4; co += 4) {
-        float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
-        float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
-        float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
-        float32x4_t bias3 = vdupq_n_f32(b ? b[co+3] : 0.0f);
-
-        const float* w0 = w + (co+0) * C_in; const float* w1 = w + (co+1) * C_in;
-        const float* w2 = w + (co+2) * C_in; const float* w3 = w + (co+3) * C_in;
+    
+    // Tiling Lineal para evitar Thrashing (Procesar 512 pixeles a la vez en todos los canales)
+    #define TILE_P 512
+    
+    for (int p_step = 0; p_step < HW; p_step += TILE_P) {
+        int p_max = (p_step + TILE_P < HW) ? p_step + TILE_P : HW;
         
-        float* out0 = out + (co+0) * HW; float* out1 = out + (co+1) * HW;
-        float* out2 = out + (co+2) * HW; float* out3 = out + (co+3) * HW;
+        int co = C_out_start;
+        for (; co <= C_out_end - 4; co += 4) {
+            float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
+            float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
+            float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
+            float32x4_t bias3 = vdupq_n_f32(b ? b[co+3] : 0.0f);
 
-        for (int p = 0; p <= HW - 4; p += 4) {
-            float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
-            for (int ci = 0; ci < C_in; ci++) {
-                float32x4_t v_in = vld1q_f32(in + ci * HW + p);
-                acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci])); acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));
-                acc2 = vmlaq_f32(acc2, v_in, vdupq_n_f32(w2[ci])); acc3 = vmlaq_f32(acc3, v_in, vdupq_n_f32(w3[ci]));
+            const float* w0 = w + (co+0) * C_in; const float* w1 = w + (co+1) * C_in;
+            const float* w2 = w + (co+2) * C_in; const float* w3 = w + (co+3) * C_in;
+            
+            float* out0 = out + (co+0) * HW; float* out1 = out + (co+1) * HW;
+            float* out2 = out + (co+2) * HW; float* out3 = out + (co+3) * HW;
+
+            int p = p_step;
+            for (; p <= p_max - 4; p += 4) {
+                float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
+                for (int ci = 0; ci < C_in; ci++) {
+                    float32x4_t v_in = vld1q_f32(in + ci * HW + p);
+                    acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci])); 
+                    acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));
+                    acc2 = vmlaq_f32(acc2, v_in, vdupq_n_f32(w2[ci])); 
+                    acc3 = vmlaq_f32(acc3, v_in, vdupq_n_f32(w3[ci]));
+                }
+                vst1q_f32(out0 + p, acc0); vst1q_f32(out1 + p, acc1);
+                vst1q_f32(out2 + p, acc2); vst1q_f32(out3 + p, acc3);
             }
-            vst1q_f32(out0 + p, acc0); vst1q_f32(out1 + p, acc1);
-            vst1q_f32(out2 + p, acc2); vst1q_f32(out3 + p, acc3);
-        }
-        for (int p = (HW & ~3); p < HW; p++) {
-            float sum0 = b?b[co]:0, sum1 = b?b[co+1]:0, sum2 = b?b[co+2]:0, sum3 = b?b[co+3]:0;
-            for(int ci=0; ci<C_in; ci++) {
-                float val = in[ci*HW+p];
-                sum0 += val * w0[ci]; sum1 += val * w1[ci]; sum2 += val * w2[ci]; sum3 += val * w3[ci];
+            for (; p < p_max; p++) {
+                float sum0 = b?b[co]:0, sum1 = b?b[co+1]:0, sum2 = b?b[co+2]:0, sum3 = b?b[co+3]:0;
+                for(int ci=0; ci<C_in; ci++) {
+                    float val = in[ci*HW+p];
+                    sum0 += val * w0[ci]; sum1 += val * w1[ci]; sum2 += val * w2[ci]; sum3 += val * w3[ci];
+                }
+                out0[p]=sum0; out1[p]=sum1; out2[p]=sum2; out3[p]=sum3;
             }
-            out0[p]=sum0; out1[p]=sum1; out2[p]=sum2; out3[p]=sum3;
         }
-    }
-    for (; co < C_out_end; co++) {
-        const float* wr = w + co * C_in; float* och = out + co * HW; float bias = b ? b[co] : 0.0f;
-        for (int p = 0; p < HW; p++) {
-            float acc = bias; for (int ci = 0; ci < C_in; ci++) acc += wr[ci] * in[ci*HW+p]; och[p] = acc;
+        for (; co < C_out_end; co++) {
+            const float* wr = w + co * C_in; float* och = out + co * HW; float bias = b ? b[co] : 0.0f;
+            for (int p = p_step; p < p_max; p++) {
+                float acc = bias; 
+                for (int ci = 0; ci < C_in; ci++) acc += wr[ci] * in[ci*HW+p]; 
+                och[p] = acc;
+            }
         }
     }
 }
