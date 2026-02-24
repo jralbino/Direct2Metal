@@ -364,3 +364,26 @@ All cycles measured on real RPi Zero 2 W hardware (ARM Generic Timer, 19.2 MHz) 
 | YOLOv5-01 | YOLOv5n 320×320 | Scalar C++ + D-cache | 1,906 ms / 0.52 FPS |
 | YOLOv5-02 | YOLOv5n 320×320 | 4-core NEON, secondary cores **uncached** | 4,199 ms / 0.24 FPS (bug) |
 | YOLOv5-03 | YOLOv5n 320×320 | 4-core NEON, **all cores cached** (Phase 7) | pending measurement |
+
+## 🚀 Milestone: FP32 Compute Wall Reached (599 ms)
+**Date:** February 2026
+
+We successfully shattered the 1-second barrier for YOLOv5n in pure Bare-Metal C++ (FP32) on the Raspberry Pi Zero 2 W. The inference time dropped from the initial **1906 ms** scalar baseline to an incredibly stable **599 ms (~1.6 FPS)**.
+
+We are now officially faster than the heavily optimized Python/ONNX OS baseline (~1300 ms) running on the same hardware, proving the raw power of zero-overhead computing.
+
+### 🛠️ Key Architectural Optimizations Applied:
+1. **Bare-Metal Multicore Wakeup:** Implemented firmware spin-table triggers (`0xE0`, `0xE8`, `0xF0`) to safely wake Cores 1, 2, and 3, bypassing Broadcom's boot stubs.
+2. **L1 Cache Micro-Tiling:** Adjusted spatial tiling to 8x4 (32 pixels). This strictly bounds memory requests to the Cortex-A53's 32 KB L1 Cache, eliminating L2/DRAM thrashing.
+3. **Operator Fusion:** Integrated Bias addition and SiLU activation directly into the NEON convolution registers (`vmlaq_f32`, `neon_silu`). This completely eliminated redundant LPDDR2 memory read/writes between layers.
+4. **Branchless Loop Unrolling (K=3 & K=6):** Eliminated spatial padding `if`-statement checks in safe zones (90% of the image) and fully unrolled the NEON MAC operations. The L0 Stem K=6 layer execution time dropped by 60% alone.
+5. **Agnostic NMS:** Modified the Non-Maximum Suppression algorithm to suppress bounding box duplicates regardless of class, fixing the "double box" floating-point divergence glitch.
+
+### 📊 Benchmark Evolution (Total Time):
+* `Buggy Cache:` ~4199 ms
+* `Scalar C++ Baseline:` ~1906 ms
+* `Python ONNX (OS):` ~1300 ms
+* `Fused Operators:` ~1066 ms
+* `Branchless + Unrolled:` **599 ms** 🏆
+
+**Next Step (Phase 7):** Moving from FP32 to INT8 Post-Training Quantization (PTQ) to break the Compute Wall and target 200-250 ms.
