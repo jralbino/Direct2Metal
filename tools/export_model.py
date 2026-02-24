@@ -20,8 +20,7 @@ def write_tensor(f, arr):
     f.write(flat.tobytes())                
 
 def main():
-    print("=== Exporting YOLOv5n Weights (FIXED PLANAR 1x1) ===")
-    
+    print("=== Exporting YOLOv5n Weights (FP32 Optimized) ===")
     model = torch.hub.load('ultralytics/yolov5', 'yolov5n', pretrained=True)
     model.cpu()
     model.eval()
@@ -35,14 +34,11 @@ def main():
                 w = m.weight.detach().cpu().numpy()
                 C_out, C_in, K_h, K_w = w.shape
                 
-                # EL FIX ESTÁ AQUÍ: K_h > 1
-                # Solo empaquetamos las convoluciones espaciales (3x3 y 6x6).
-                # Las convoluciones 1x1 DEBEN quedar planas para ops.cpp.
+                # Regla de Oro: Solo empaquetar 3x3 y 6x6. Dejar 1x1 planos.
                 if K_h > 1 and C_out % 4 == 0:
                     repacked = repack_for_neon(w)
                     write_tensor(f, repacked)
                 else:
-                    # 1x1 convs y fallbacks pasan directos y planos
                     write_tensor(f, w)
                 
                 if m.bias is not None:

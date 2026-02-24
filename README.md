@@ -387,3 +387,31 @@ We are now officially faster than the heavily optimized Python/ONNX OS baseline 
 * `Branchless + Unrolled:` **599 ms** 🏆
 
 **Next Step (Phase 7):** Moving from FP32 to INT8 Post-Training Quantization (PTQ) to break the Compute Wall and target 200-250 ms.
+
+# 🏆 Final Results: Breaking the Second Barrier
+
+**Status:** 🚀 RECORD BROKEN
+**Target Hardware:** Raspberry Pi Zero 2 W (Cortex-A53 @ 1GHz)
+**Environment:** Bare-Metal (No OS, No Linux kernel)
+**Model:** YOLOv5n (416x416 input resized to 320x320 internal)
+
+We have successfully optimized the inference engine to run stable at **599 ms (~1.7 FPS)**, achieving a **3.2x speedup** over the initial C++ implementation and significantly outperforming standard OS-based runtimes.
+
+| Milestone | Implementation | Time (ms) | Notes |
+| :--- | :--- | :--- | :--- |
+| **Baseline 1** | Python / ONNX Runtime (Linux) | ~1300 ms | Heavy OS overhead |
+| **Baseline 2** | Bare-Metal C++ (Scalar) | 1906 ms | Single core, unoptimized |
+| **Optimization 1** | Multicore (4 Cores) | ~1200 ms | Naive parallelization |
+| **Optimization 2** | L1 Micro-Tiling + Fused Ops | 1060 ms | Bias+SiLU fusion, Cache aware |
+| **Final Release** | **Branchless FP32 Unrolled** | **599 ms** | **Zero-branching 3x3/6x6 kernels** |
+
+### 🔧 Winning Architecture: "Branchless FP32"
+After testing INT8 Quantization (which resulted in 813ms due to NEON register conversion overhead on the A53), we determined that raw FP32 compute with **Extreme Loop Unrolling** was the optimal path for this specific silicon.
+
+**Key Technical Achievements:**
+* **Custom Bootloader:** Direct spin-table wakeup for Cores 1, 2, and 3 (`0xE0..0xF0`).
+* **Zero-Copy Pipeline:** Operator Fusion allows data to flow from Convolution -> Bias -> Activation -> Next Layer without redundant RAM access.
+* **Branchless Conv Kernels:** Removed boundary checks (`if` statements) from the hot loops of 3x3 and 6x6 convolutions, relying on padding-aware addressing.
+* **Agnostic NMS:** Optimized Non-Maximum Suppression (23 ms) that filters bounding boxes purely on geometry overlap, fixing floating-point divergence "ghost boxes".
+
+---
