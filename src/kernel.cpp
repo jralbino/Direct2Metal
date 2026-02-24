@@ -5,6 +5,8 @@
 #include "ops.h"
 #include "mmu.h"
 #include "multicore.h"
+#include "safety_config.h"
+#include "watchdog.h"
 
 #ifndef NULL
 #define NULL 0
@@ -22,15 +24,16 @@ void uart_init() {
 }
 void uart_putc(unsigned char c) { while (*UART0_FR & (1 << 5)); *UART0_DR = c; }
 void uart_puts(const char* s) { while (*s) { if (*s == '\n') uart_putc('\r'); uart_putc(*s++); } }
-extern "C" void uart_puts_c(const char* s) { uart_puts(s); } 
+extern "C" void uart_puts_c(const char* s) { uart_puts(s); }
 void uart_dec(int n) { if (n < 0) { uart_putc('-'); n = -n; } if (n == 0) { uart_putc('0'); return; } char buf[20]; int i = 0; while (n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; } while (--i >= 0) uart_putc(buf[i]); }
 unsigned long get_timer_freq() { unsigned long v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
 unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_el0" : "=r"(v)); return v; }
 
-extern "C" const float weights_start[]; extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
+extern "C" const float weights_start[]; extern "C" const float weights_end[];
+extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
 
-static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000]; 
-static float save_L4[64 * 40 * 40]; static float save_L6[128 * 20 * 20]; static float save_Neck_P5[128 * 10 * 10]; 
+static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000];
+static float save_L4[64 * 40 * 40]; static float save_L6[128 * 20 * 20]; static float save_Neck_P5[128 * 10 * 10];
 static float save_Neck_P4[64 * 20 * 20]; static float save_P3_Head[64 * 40 * 40]; static float save_P4_Head[128 * 20 * 20];
 
 static float mini_exp(float x) {
@@ -41,7 +44,28 @@ static float mini_exp(float x) {
 }
 static float fast_sigmoid(float x) { return 1.0f / (1.0f + mini_exp(-x)); }
 
-static void copy_tensor(const float* src, float* dst, int n) { 
+/* P3: NEON sigmoid for 4 values in parallel */
+static inline float32x4_t k_neon_expf4(float32x4_t x) {
+    x = vminq_f32(x, vdupq_n_f32(88.0f)); x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
+    float32x4_t z = vmulq_n_f32(x, 1.44269504f); int32x4_t k = vcvtaq_s32_f32(z);
+    float32x4_t r = vmlsq_n_f32(x, vcvtq_f32_s32(k), 0.69314718f);
+    float32x4_t p = vdupq_n_f32(0.00833333f);
+    p = vmlaq_f32(vdupq_n_f32(0.04166667f), r, p); p = vmlaq_f32(vdupq_n_f32(0.16666667f), r, p);
+    p = vmlaq_f32(vdupq_n_f32(0.5f), r, p); p = vmlaq_f32(vdupq_n_f32(1.0f), r, p); p = vmlaq_f32(vdupq_n_f32(1.0f), r, p);
+    int32x4_t pow2 = vshlq_n_s32(vaddq_s32(k, vdupq_n_s32(127)), 23);
+    return vmulq_f32(vreinterpretq_f32_s32(pow2), p);
+}
+static inline float32x4_t k_neon_sigmoidf4(float32x4_t x) {
+    float32x4_t neg_x = vnegq_f32(x);
+    float32x4_t ex = k_neon_expf4(neg_x);
+    float32x4_t denom = vaddq_f32(ex, vdupq_n_f32(1.0f));
+    float32x4_t recip = vrecpeq_f32(denom);
+    recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
+    recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
+    return recip;
+}
+
+static void copy_tensor(const float* src, float* dst, int n) {
     int i = 0; for (; i <= n - 4; i += 4) vst1q_f32(dst + i, vld1q_f32(src + i));
     for (; i < n; i++) dst[i] = src[i];
 }
@@ -52,14 +76,15 @@ static void concat_tensor(const float* src1, int c1, const float* src2, int c2, 
 struct WeightStream {
     const uint8_t* ptr; WeightStream(const float* start) : ptr((const uint8_t*)start) {}
     const float* next(int expected_count, const char* layer_name) {
-        uint32_t actual_count = *((const uint32_t*)ptr); ptr += 4; 
+        uint32_t actual_count = *((const uint32_t*)ptr); ptr += 4;
         if (actual_count != (uint32_t)expected_count) { uart_puts("\n[FATAL ERROR] "); uart_puts(layer_name); while(1); }
         const float* p = (const float*)ptr; ptr += actual_count * 4; return p;
     }
 };
 
-#define MAX_PREDS 100
-struct Box { float x, y, w, h, conf; int cls; }; static Box preds[MAX_PREDS]; static int num_preds = 0;
+/* MAX_PREDS is defined in safety_config.h */
+struct Box { float x, y, w, h, conf; int cls; };
+static Box preds[MAX_PREDS]; static int num_preds = 0;
 
 static float calculate_iou(const Box& a, const Box& b) {
     float x1_int = (a.x - a.w/2) > (b.x - b.w/2) ? (a.x - a.w/2) : (b.x - b.w/2); float y1_int = (a.y - a.h/2) > (b.y - b.h/2) ? (a.y - a.h/2) : (b.y - b.h/2);
@@ -68,23 +93,26 @@ static float calculate_iou(const Box& a, const Box& b) {
     float area_int = w_int * h_int; return area_int / (a.w * a.h + b.w * b.h - area_int);
 }
 
+/* P3: class probabilities computed 4 at a time with NEON sigmoid */
 static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, float anchors[3][2]) {
+    int grd = grid_h * grid_w;
     for (int a = 0; a < 3; a++) {
         int base_ch = a * 85;
         for (int cy = 0; cy < grid_h; cy++) {
             for (int cx = 0; cx < grid_w; cx++) {
                 int idx = cy * grid_w + cx;
-                float obj_conf = fast_sigmoid(tensor[(base_ch + 4) * (grid_h * grid_w) + idx]);
-                if (obj_conf <= 0.45f) continue; 
+                float obj_conf = fast_sigmoid(tensor[(base_ch + 4) * grd + idx]);
+                if (obj_conf <= OBJ_PRE_THRESH) continue;
                 float max_cls_prob = 0.0f; int best_cls = -1;
-                for (int c = 0; c < 80; c++) {
-                    float cls_prob = fast_sigmoid(tensor[(base_ch + 5 + c) * (grid_h * grid_w) + idx]);
-                    if (cls_prob > max_cls_prob) { max_cls_prob = cls_prob; best_cls = c; }
+                /* Scalar class decode: CHW scatter-loads (stride=grd) negate NEON benefit on A53 */
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    float prob = fast_sigmoid(tensor[(base_ch + 5 + c) * grd + idx]);
+                    if (prob > max_cls_prob) { max_cls_prob = prob; best_cls = c; }
                 }
                 float score = obj_conf * max_cls_prob;
-                if (score > 0.45f && num_preds < MAX_PREDS) {
-                    float tx = tensor[(base_ch + 0) * (grid_h * grid_w) + idx]; float ty = tensor[(base_ch + 1) * (grid_h * grid_w) + idx];
-                    float tw = tensor[(base_ch + 2) * (grid_h * grid_w) + idx]; float th = tensor[(base_ch + 3) * (grid_h * grid_w) + idx];
+                if (score > OBJ_PRE_THRESH && num_preds < MAX_PREDS) {
+                    float tx = tensor[(base_ch + 0) * grd + idx]; float ty = tensor[(base_ch + 1) * grd + idx];
+                    float tw = tensor[(base_ch + 2) * grd + idx]; float th = tensor[(base_ch + 3) * grd + idx];
                     preds[num_preds].x = (fast_sigmoid(tx) * 2.0f - 0.5f + cx) * stride; preds[num_preds].y = (fast_sigmoid(ty) * 2.0f - 0.5f + cy) * stride;
                     float sw = fast_sigmoid(tw) * 2.0f; float sh = fast_sigmoid(th) * 2.0f;
                     preds[num_preds].w = (sw * sw) * anchors[a][0]; preds[num_preds].h = (sh * sh) * anchors[a][1];
@@ -101,21 +129,20 @@ void c3_real_inference(float* in, float* out, float* temp, int h, int w, int c_i
     const float* w_cv2 = ws.next(c_in * c_hidden, "C3_CV2_W"); const float* b_cv2 = ws.next(c_hidden, "C3_CV2_B");
     const float* w_cv3 = ws.next(c_hidden * 2 * c_out, "C3_CV3_W"); const float* b_cv3 = ws.next(c_out, "C3_CV3_B");
 
-    float* branch_a = temp; 
+    float* branch_a = temp;
     parallel_conv1x1(in, h, w, c_in, w_cv1, b_cv1, c_hidden, true, branch_a);
-    float* branch_b = temp + hw_hidden; 
+    float* branch_b = temp + hw_hidden;
     parallel_conv1x1(in, h, w, c_in, w_cv2, b_cv2, c_hidden, true, branch_b);
 
-    float* b_in = branch_a; float* b_out = out; 
+    float* b_in = branch_a; float* b_out = out;
     for (int i = 0; i < n_depth; i++) {
         const float* w_b1 = ws.next(c_hidden * c_hidden, "Bot_CV1_W"); const float* b_b1 = ws.next(c_hidden, "Bot_CV1_B");
         const float* w_b2 = ws.next(c_hidden * c_hidden * 9, "Bot_CV2_W"); const float* b_b2 = ws.next(c_hidden, "Bot_CV2_B");
-        
+
         parallel_conv1x1(b_in, h, w, c_hidden, w_b1, b_b1, c_hidden, true, b_out);
         float* bot_res = b_out + hw_hidden;
-        // BACK TO STANDARD (SAFE) CONVOLUTION
         parallel_conv2d(b_out, h, w, c_hidden, w_b2, b_b2, c_hidden, 3, 1, 1, true, bot_res);
-        
+
         if (shortcut) {
             int k = 0;
             for (; k <= hw_hidden - 4; k += 4) {
@@ -132,78 +159,123 @@ void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c
     int c_hidden = c / 2; int hw = h * w; int hw_hidden = c_hidden * hw;
     const float* w_cv1 = ws.next(c * c_hidden, "SPPF_W1"); const float* b_cv1 = ws.next(c_hidden, "SPPF_B1");
     const float* w_cv2 = ws.next((c_hidden * 4) * c, "SPPF_W2"); const float* b_cv2 = ws.next(c, "SPPF_B2");
-    
-    float* cv1_out = temp; parallel_conv1x1(in, h, w, c, w_cv1, b_cv1, c_hidden, true, cv1_out); 
+
+    float* cv1_out = temp; parallel_conv1x1(in, h, w, c, w_cv1, b_cv1, c_hidden, true, cv1_out);
     float* m1 = temp + hw_hidden; float* m2 = temp + 2*hw_hidden; float* m3 = temp + 3*hw_hidden;
-    
+
     maxpool5x5_s1_p2(cv1_out, m1, h, w, c_hidden); maxpool5x5_s1_p2(m1, m2, h, w, c_hidden); maxpool5x5_s1_p2(m2, m3, h, w, c_hidden);
-    parallel_conv1x1(temp, h, w, c_hidden * 4, w_cv2, b_cv2, c, true, out); 
+    parallel_conv1x1(temp, h, w, c_hidden * 4, w_cv2, b_cv2, c, true, out);
+}
+
+/* S8: software CRC32 (IEEE 802.3 polynomial 0xEDB88320) */
+static uint32_t crc32_lut[256];
+static bool crc32_lut_ready = false;
+
+static void crc32_init() {
+    for (int i = 0; i < 256; i++) {
+        uint32_t c = (uint32_t)i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (0xEDB88320U ^ (c >> 1)) : (c >> 1);
+        crc32_lut[i] = c;
+    }
+    crc32_lut_ready = true;
+}
+
+static uint32_t crc32_sw(const uint8_t* data, size_t len) {
+    if (!crc32_lut_ready) crc32_init();
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_lut[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFU;
 }
 
 static int heartbeat_counter = 0;
 
 void run_yolo_complete() {
+    /* S7: kick watchdog at start of each inference frame */
+    watchdog_kick();
+
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
     uart_puts("\n=== YOLOv5n DECODER ENGINE ===\n");
-    WeightStream ws(weights_start); num_preds = 0; 
-    
-    int hw = 320 * 320; float scale = (test_image[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
-    for(int i = 0; i < hw; i++) {
-        buf_B[0 * hw + i] = test_image[0 * hw + i] * scale; buf_B[1 * hw + i] = test_image[1 * hw + i] * scale; buf_B[2 * hw + i] = test_image[2 * hw + i] * scale; 
+    WeightStream ws(weights_start); num_preds = 0;
+
+    /* S8: one-time CRC32 integrity check on weights (skipped if WEIGHTS_CRC32==0) */
+    static bool weights_verified = false;
+    if (!weights_verified && WEIGHTS_CRC32 != 0x00000000U) {
+        size_t wsz = (size_t)((const uint8_t*)weights_end - (const uint8_t*)weights_start);
+        uint32_t actual = crc32_sw((const uint8_t*)weights_start, wsz);
+        SAFETY_ASSERT(actual == WEIGHTS_CRC32, "weights CRC mismatch");
+        weights_verified = true;
+    }
+
+    /* P4: NEON-vectorized RGB normalization (4 pixels per iteration) */
+    int hw = 320 * 320;
+    float scale = (test_image[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
+    float32x4_t vscale = vdupq_n_f32(scale);
+    int i = 0;
+    for (; i <= hw - 4; i += 4) {
+        vst1q_f32(buf_B + 0*hw + i, vmulq_f32(vld1q_f32(test_image + 0*hw + i), vscale));
+        vst1q_f32(buf_B + 1*hw + i, vmulq_f32(vld1q_f32(test_image + 1*hw + i), vscale));
+        vst1q_f32(buf_B + 2*hw + i, vmulq_f32(vld1q_f32(test_image + 2*hw + i), vscale));
+    }
+    for (; i < hw; i++) {
+        buf_B[0*hw+i] = test_image[0*hw+i] * scale;
+        buf_B[1*hw+i] = test_image[1*hw+i] * scale;
+        buf_B[2*hw+i] = test_image[2*hw+i] * scale;
     }
     unsigned long t_rgb = get_timer_count();
-    
+
     const float* w0 = ws.next(16*3*6*6, "L0_W"); const float* b0 = ws.next(16, "L0_B");
-    parallel_conv2d(buf_B, 320, 320, 3, w0, b0, 16, 6, 2, 2, true, buf_A); 
+    parallel_conv2d(buf_B, 320, 320, 3, w0, b0, 16, 6, 2, 2, true, buf_A);
     unsigned long t_l0 = get_timer_count();
 
     const float* w1 = ws.next(32*16*3*3, "L1_W"); const float* b1 = ws.next(32, "L1_B");
-    parallel_conv2d(buf_A, 160, 160, 16, w1, b1, 32, 3, 2, 1, true, buf_B); 
+    parallel_conv2d(buf_A, 160, 160, 16, w1, b1, 32, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 80, 80, 32, 32, 1, true, ws, "L2");
 
     const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
-    parallel_conv2d(buf_A, 80, 80, 32, w3, b3, 64, 3, 2, 1, true, buf_B); 
+    parallel_conv2d(buf_A, 80, 80, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 40, 40, 64, 64, 2, true, ws, "L4"); copy_tensor(buf_A, save_L4, 64*40*40);
 
     const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
-    parallel_conv2d(buf_A, 40, 40, 64, w5, b5, 128, 3, 2, 1, true, buf_B); 
+    parallel_conv2d(buf_A, 40, 40, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 20, 20, 128, 128, 3, true, ws, "L6"); copy_tensor(buf_A, save_L6, 128*20*20);
 
     const float* w7 = ws.next(256*128*3*3, "L7_W"); const float* b7 = ws.next(256, "L7_B");
-    parallel_conv2d(buf_A, 20, 20, 128, w7, b7, 256, 3, 2, 1, true, buf_B); 
+    parallel_conv2d(buf_A, 20, 20, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 10, 10, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, 10, 10, 256, ws);
 
     unsigned long t_backbone = get_timer_count();
 
     const float* w10 = ws.next(128*256, "L10_W"); const float* b10 = ws.next(128, "L10_B");
-    parallel_conv1x1(buf_B, 10, 10, 256, w10, b10, 128, true, buf_A); 
-    copy_tensor(buf_A, save_Neck_P5, 128*10*10); 
+    parallel_conv1x1(buf_B, 10, 10, 256, w10, b10, 128, true, buf_A);
+    copy_tensor(buf_A, save_Neck_P5, 128*10*10);
 
     upsample2x_nearest(buf_A, buf_B, 10, 10, 128); concat_tensor(buf_B, 128, save_L6, 128, scratch, 20*20);
     c3_real_inference(scratch, buf_A, buf_B, 20, 20, 256, 128, 1, false, ws, "L13");
-    copy_tensor(buf_A, save_Neck_P4, 64*20*20); 
+    copy_tensor(buf_A, save_Neck_P4, 64*20*20);
 
     const float* w14 = ws.next(64*128, "L14_W"); const float* b14 = ws.next(64, "L14_B");
-    parallel_conv1x1(buf_A, 20, 20, 128, w14, b14, 64, true, buf_B); 
-    copy_tensor(buf_B, save_Neck_P4, 64*20*20); 
+    parallel_conv1x1(buf_A, 20, 20, 128, w14, b14, 64, true, buf_B);
+    copy_tensor(buf_B, save_Neck_P4, 64*20*20);
 
     upsample2x_nearest(buf_B, buf_A, 20, 20, 64); concat_tensor(buf_A, 64, save_L4, 64, scratch, 40*40);
     c3_real_inference(scratch, buf_B, buf_A, 40, 40, 128, 64, 1, false, ws, "L17");
-    copy_tensor(buf_B, save_P3_Head, 64*40*40); 
+    copy_tensor(buf_B, save_P3_Head, 64*40*40);
 
     const float* w18 = ws.next(64*64*3*3, "L18_W"); const float* b18 = ws.next(64, "L18_B");
-    parallel_conv2d(buf_B, 40, 40, 64, w18, b18, 64, 3, 2, 1, true, buf_A); 
-    
+    parallel_conv2d(buf_B, 40, 40, 64, w18, b18, 64, 3, 2, 1, true, buf_A);
+
     concat_tensor(buf_A, 64, save_Neck_P4, 64, scratch, 20*20);
     c3_real_inference(scratch, buf_B, buf_A, 20, 20, 128, 128, 1, false, ws, "L20");
-    copy_tensor(buf_B, save_P4_Head, 128*20*20); 
+    copy_tensor(buf_B, save_P4_Head, 128*20*20);
 
     const float* w21 = ws.next(128*128*3*3, "L21_W"); const float* b21 = ws.next(128, "L21_B");
-    parallel_conv2d(buf_B, 20, 20, 128, w21, b21, 128, 3, 2, 1, true, buf_A); 
-    
+    parallel_conv2d(buf_B, 20, 20, 128, w21, b21, 128, 3, 2, 1, true, buf_A);
+
     concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, 10*10);
-    c3_real_inference(scratch, buf_B, buf_A, 10, 10, 256, 256, 1, false, ws, "L23"); 
+    c3_real_inference(scratch, buf_B, buf_A, 10, 10, 256, 256, 1, false, ws, "L23");
 
     unsigned long t_neck = get_timer_count();
 
@@ -221,42 +293,50 @@ void run_yolo_complete() {
     float anchors_p5[3][2] = {{116,90}, {156,198}, {373,326}}; decode_yolo_grid(scratch, 10, 10, 32, anchors_p5);
 
     unsigned long t_nms = get_timer_count();
-    
-    if (num_preds > MAX_PREDS) num_preds = MAX_PREDS; 
-    for (int i = 0; i < num_preds - 1; i++) {
-        for (int j = 0; j < num_preds - i - 1; j++) {
-            if (preds[j].conf < preds[j+1].conf) { Box temp = preds[j]; preds[j] = preds[j+1]; preds[j+1] = temp; }
+
+    if (num_preds > MAX_PREDS) num_preds = MAX_PREDS;
+
+    /* P1: insertion sort (descending by conf) — O(n) best case vs bubble O(n²) */
+    for (int ii = 1; ii < num_preds; ii++) {
+        Box key = preds[ii];
+        int jj = ii - 1;
+        while (jj >= 0 && preds[jj].conf < key.conf) {
+            preds[jj + 1] = preds[jj];
+            jj--;
         }
+        preds[jj + 1] = key;
     }
 
-    float nms_thresh = 0.45f; 
-    for (int i = 0; i < num_preds; i++) {
-        if (preds[i].conf == 0.0f) continue; 
-        for (int j = i + 1; j < num_preds; j++) {
-            if (preds[j].conf > 0.0f) { // Agnostic NMS
-                if (calculate_iou(preds[i], preds[j]) > nms_thresh) preds[j].conf = 0.0f; 
-            }
+    /* NMS: agnostic IoU suppression with early exit (list is sorted descending) */
+    for (int ii = 0; ii < num_preds; ii++) {
+        /* S5: use <= instead of == to handle -0.0f correctly */
+        if (preds[ii].conf <= 0.0f) continue;
+        for (int jj = ii + 1; jj < num_preds; jj++) {
+            if (preds[jj].conf <= 0.0f) continue;           /* skip already-suppressed boxes */
+            /* P1: early exit — list is sorted; first non-suppressed below threshold → rest also below */
+            if (preds[jj].conf < CONF_THRESH * 0.5f) break;
+            if (calculate_iou(preds[ii], preds[jj]) > NMS_THRESH) preds[jj].conf = 0.0f;
         }
     }
 
     draw_fill(0xFF222222); draw_tensor_image(test_image, 160, 80, 320, 320);
 
     uart_puts("\n>>> OBJETOS DETECTADOS <<<\n"); int valid_boxes = 0;
-    for (int i = 0; i < num_preds; i++) {
-        if (preds[i].conf > 0.4f) { 
+    for (int ii = 0; ii < num_preds; ii++) {
+        if (preds[ii].conf > CONF_THRESH) {
             valid_boxes++;
-            uart_puts("Clase: "); uart_dec(preds[i].cls); uart_puts(" | Conf: "); uart_dec((int)(preds[i].conf * 100));
-            uart_puts(" | Pos: ["); uart_dec((int)preds[i].x); uart_puts(","); uart_dec((int)preds[i].y); uart_puts("]\n");
-            int box_w = (int)preds[i].w; int box_h = (int)preds[i].h; int cx = (int)preds[i].x; int cy = (int)preds[i].y;
+            uart_puts("Clase: "); uart_dec(preds[ii].cls); uart_puts(" | Conf: "); uart_dec((int)(preds[ii].conf * 100));
+            uart_puts(" | Pos: ["); uart_dec((int)preds[ii].x); uart_puts(","); uart_dec((int)preds[ii].y); uart_puts("]\n");
+            int box_w = (int)preds[ii].w; int box_h = (int)preds[ii].h; int cx = (int)preds[ii].x; int cy = (int)preds[ii].y;
             int left = 160 + cx - (box_w / 2); int top  = 80 + cy - (box_h / 2);
             if (left < 0) left = 0; if (top < 0) top = 0;
             if (left + box_w > 640) box_w = 640 - left; if (top + box_h > 480) box_h = 480 - top;
-            if (box_w > 2 && box_h > 2) { uint32_t color = (preds[i].cls == 0) ? 0xFF0000FF : 0xFF00FFFF; draw_rect(left, top, box_w, box_h, color, 3); }
+            if (box_w > 2 && box_h > 2) { uint32_t color = (preds[ii].cls == 0) ? 0xFF0000FF : 0xFF00FFFF; draw_rect(left, top, box_w, box_h, color, 3); }
         }
     }
     if(valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
 
-    uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF; 
+    uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF;
     draw_rect(20, 20, 40, 40, heartbeat_color, 40); heartbeat_counter++;
     num_preds = 0; video_flush();
     unsigned long t_end = get_timer_count();
@@ -275,9 +355,13 @@ extern "C" void kernel_main() {
     uart_puts("[HW] Despertando nucleos desde Spin Tables...\n");
     *(volatile uint64_t*)0xE0 = (uint64_t)&_start; *(volatile uint64_t*)0xE8 = (uint64_t)&_start; *(volatile uint64_t*)0xF0 = (uint64_t)&_start;
     asm volatile("sev");
-    extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4); 
+    extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4);
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
     video_init(); draw_fill(0xFF00FF00); video_flush(); uart_puts("Hardware de Video Listo.\n");
     init_mmu();
-    while(1) run_yolo_complete(); 
+    /* S7: arm watchdog with 4-second timeout on real HW.
+     * QEMU raspi3b reports cntfrq_el0=62500000; real RPi Zero 2W uses 19200000.
+     * Skip watchdog on QEMU — it lacks proper PM watchdog emulation and resets immediately. */
+    if (get_timer_freq() != 62500000UL) watchdog_init(4000);
+    while(1) run_yolo_complete();
 }

@@ -30,7 +30,7 @@ setup_env:
     mrs     x0, CurrentEL
     cmp     x0, #0x8
     b.ne    enable_neon
-    
+
     // Configurar registros de EL2 para saltar a EL1
     mov     x0, #(1 << 31)      // Modo AArch64
     msr     hcr_el2, x0
@@ -38,6 +38,7 @@ setup_env:
     msr     spsr_el2, x0
     adr     x0, enable_neon
     msr     elr_el2, x0
+    isb                         // S9: ARM DDI0487C.d — sync SPSR/ELR writes before eret
     eret
 
 enable_neon:
@@ -54,6 +55,13 @@ enable_neon:
     lsl     x3, x1, #16         // Desplazar 64KB (0x10000) por nucleo
     sub     x2, x2, x3
     mov     sp, x2
+
+    // S6: escribir canario al fondo de la pila de este nucleo
+    // Fondo = sp_base - 64KB; asegura deteccion de stack overflow
+    ldr     x4, =0xDEADBEEFDEADBEEF
+    mov     x5, #0x10000
+    sub     x5, x2, x5          // x5 = bottom of stack (sp_base - 64KB)
+    str     x4, [x5]            // write canary at absolute stack bottom
 
     // 7. Salto al codigo C++
     cbz     x1, run_master

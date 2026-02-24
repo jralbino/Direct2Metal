@@ -4,15 +4,17 @@
 #define TASK_CONV2D  2
 #define TASK_CONV1X1 1
 
+/* S2 (ISO 26262): all shared task fields are volatile to prevent the compiler
+ * from caching them across the epoch memory barrier. */
 struct ParallelTask {
-    int type;
-    const void* in;
-    const void* w_rep;
-    const void* w1x1;
-    const void* bias;
-    void* out;
-    int H; int W; int C_in; int C_out; int K; int stride; int pad; int n_grp;
-    bool do_silu;
+    volatile int         type;
+    volatile const void* in;
+    volatile const void* w_rep;
+    volatile const void* w1x1;
+    volatile const void* bias;
+    volatile void*       out;
+    volatile int         H, W, C_in, C_out, K, stride, pad, n_grp;
+    volatile bool        do_silu;
 };
 
 extern void parallel_conv2d(const float* in, int H_in, int W_in, int C_in,
