@@ -112,3 +112,57 @@ void draw_tensor_image(const float* img, int x_off, int y_off, int img_w, int im
 }
 
 void video_flush() { if (lfb) flush_to_ram((volatile void*)lfb, pitch * height); }
+
+// ---- Bitmap font 5×7 (row-major, bit4=left, bit0=right) ----
+// Supported charset (index matches position in k_font_chars):
+static const char k_font_chars[] = "0123456789FPS:. ";
+
+static const uint8_t k_font[16][7] = {
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},  // 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},  // 1
+    {0x0E,0x11,0x01,0x06,0x08,0x10,0x1F},  // 2
+    {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E},  // 3
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},  // 4
+    {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E},  // 5
+    {0x0E,0x10,0x10,0x1E,0x11,0x11,0x0E},  // 6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},  // 7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},  // 8
+    {0x0E,0x11,0x11,0x0F,0x01,0x01,0x0E},  // 9
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},  // F
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},  // P
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},  // S
+    {0x00,0x04,0x04,0x00,0x04,0x04,0x00},  // :
+    {0x00,0x00,0x00,0x00,0x00,0x04,0x04},  // .
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00},  // ' '
+};
+
+static int font_index(char c) {
+    for (int i = 0; k_font_chars[i]; i++)
+        if (k_font_chars[i] == c) return i;
+    return 15;  // unknown → space
+}
+
+// Draw one character. Each glyph pixel becomes scale×scale screen pixels.
+// fg = foreground color, bg = background color (format 0xAABBGGRR).
+static void draw_char(int x, int y, char c, uint32_t fg, uint32_t bg, int scale) {
+    const uint8_t* glyph = k_font[font_index(c)];
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 5; col++) {
+            uint32_t color = (bits & (0x10u >> col)) ? fg : bg;
+            for (int sy = 0; sy < scale; sy++)
+                for (int sx = 0; sx < scale; sx++)
+                    draw_pixel(x + col * scale + sx, y + row * scale + sy, color);
+        }
+    }
+}
+
+// Draw a null-terminated string. Characters are spaced (5+1)*scale pixels apart.
+// Only characters present in k_font_chars are rendered; others become spaces.
+void draw_text(int x, int y, const char* s, uint32_t fg, uint32_t bg, int scale) {
+    int cx = x;
+    while (*s) {
+        draw_char(cx, y, *s++, fg, bg, scale);
+        cx += (5 + 1) * scale;
+    }
+}

@@ -17,4 +17,19 @@ hdmi_mode=4
 hdmi_drive=2
 config_hdmi_boost=7
 disable_overscan=1
-gpu_mem=64
+gpu_mem=128
+
+# CAMERA (Pi Camera v3 / IMX708)
+# start_x=1 loads start_x.elf (camera-capable firmware).
+# dtoverlay=imx708: tells VPU which camera is on CSI-1, triggering:
+#   1. CSI-1 D-PHY analog frontend calibration (REQUIRED for MIPI lock —
+#      without this overlay the D-PHY stays uncalibrated and ISTA=0 always)
+#   2. MCLK clock setup on GPIO43 (GPCLK2, cam1_clk at 24 MHz — NOT GPIO34)
+#   3. GPIO config for XSHUTDOWN (VPU drives it LOW initially; our code
+#      then asserts GPIO40/41/44 HIGH which overrides the VPU GPIO state)
+# NOTE: dtoverlay=imx708 does NOT load a Linux camera driver (bare-metal has
+# no kernel). It only configures D-PHY, clocks, and GPIOs at VPU level.
+# NOTE: start_x.elf DOES scan BSC0 → spurious DONE events on BSC0 probes.
+# Fix: probe BSC1 first in camera_bsc.cpp.
+start_x=1
+dtoverlay=imx708

@@ -1,0 +1,13 @@
+# Biunary files 
+*.o
+*.elf
+*.img
+*.pt
+
+# Python env 
+tools/env/
+__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -130,6 +130,7 @@ void c3_block(const float* in, float* out, float* scratch,
 /* MaxPool 5x5, stride 1, padding 2 (Para bloque SPPF de YOLOv5) */
 void maxpool5x5_s1_p2(const float* in, float* out, int H, int W, int C);
 
+void camera_to_tensor_320(const uint32_t* camera_buffer, float* yolo_tensor);
 
 #ifdef __cplusplus
 }

@@ -1,36 +1,31 @@
-#include <stdint.h>
+/* File: src/mailbox.cpp - VIDEOCORE MAILBOX INTERFACE */
+#include "mailbox.h"
 
-extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
-extern void uart_puts(const char* s);
-extern void uart_hex(uint32_t d);
-
-volatile uint32_t* const MBOX_READ   = (uint32_t*)0x3F00B880;
-volatile uint32_t* const MBOX_STATUS = (uint32_t*)0x3F00B898;
-volatile uint32_t* const MBOX_WRITE  = (uint32_t*)0x3F00B8A0;
-
-#define MBOX_FULL  0x80000000
-#define MBOX_EMPTY 0x40000000
-
+// El buffer del Mailbox DEBE estar alineado a 16 bytes.
 __attribute__((aligned(16))) volatile uint32_t mbox[36];
 
-int mbox_call(unsigned char ch) {
-    flush_to_ram((volatile void*)&mbox, sizeof(mbox));
+// Helpers para limpiar caché
+static inline void data_sync_barrier() { asm volatile("dsb sy" : : : "memory"); }
+static inline void data_mem_barrier()  { asm volatile("dmb sy" : : : "memory"); }
 
-    // Convertir a 32 bits y aplicar el canal
-    uint32_t r = (((uint32_t)((unsigned long)&mbox) & ~0xF) | (ch & 0xF));
-    
-    // Alias de bus (Uncached) para VideoCore
-    r |= 0xC0000000; 
+int mbox_call(unsigned char ch) { // <--- CAMBIO AQUÍ
+    uint32_t r = (((uint32_t)((uint64_t)&mbox) & ~0xF) | (ch & 0xF));
 
-    while (*MBOX_STATUS & MBOX_FULL);
-    *MBOX_WRITE = r;
+    while (*MAILBOX_STATUS & MAILBOX_FULL) { asm volatile("nop"); }
+
+    data_sync_barrier();
+    *MAILBOX_WRITE = r;
+    data_mem_barrier();
 
     while (1) {
-        while (*MBOX_STATUS & MBOX_EMPTY);
-        uint32_t res = *MBOX_READ;
-        if ((res & ~0xF) == (r & ~0xF)) {
-            flush_to_ram((volatile void*)&mbox, sizeof(mbox));
-            return mbox[1] == 0x80000000; // 0x80000000 = MBOX_SUCCESS
+        while (*MAILBOX_STATUS & MAILBOX_EMPTY) { asm volatile("nop"); }
+        
+        data_sync_barrier();
+        uint32_t data = *MAILBOX_READ;
+        data_mem_barrier();
+
+        if ((data & 0xF) == ch) {
+            return mbox[1] == 0x80000000;
         }
     }
     return 0;

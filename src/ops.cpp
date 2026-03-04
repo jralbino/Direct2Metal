@@ -242,3 +242,34 @@ void maxpool5x5_s1_p2(const float* in, float* out, int H, int W, int C) {
         }
     }
 }
+
+// --- PUENTE DE CÁMARA (640x480 ARGB -> 320x320 Tensor Planar FP32) ---
+// Convierte un Framebuffer de cámara a un Tensor YOLO en ~1-2 milisegundos
+void camera_to_tensor_320(const uint32_t* camera_buffer, float* yolo_tensor) {
+    // Escala precalculada (1/255)
+    const float scale = 0.0039215686f; 
+    
+    // Punteros a los canales planos de YOLO (C, H, W)
+    float* dst_r = yolo_tensor;
+    float* dst_g = yolo_tensor + (320 * 320);
+    float* dst_b = yolo_tensor + (2 * 320 * 320);
+
+    for (int y = 0; y < 320; y++) {
+        for (int x = 0; x < 320; x++) {
+            // Nearest Neighbor: Mapeamos (y, x) a (y*2, x*2) en la cámara
+            // Asumimos pitch de 640 pixeles
+            uint32_t pixel = camera_buffer[(y * 2) * 640 + (x * 2)];
+
+            // Extracción de bytes rápida (Asumiendo formato estándar BGRA o ARGB de la Pi)
+            // Modificar el shift (>>, &) dependiendo del formato final que entregue la GPU
+            float b = (float)( pixel        & 0xFF) * scale;
+            float g = (float)((pixel >> 8)  & 0xFF) * scale;
+            float r = (float)((pixel >> 16) & 0xFF) * scale;
+            
+            int out_idx = y * 320 + x;
+            dst_r[out_idx] = r;
+            dst_g[out_idx] = g;
+            dst_b[out_idx] = b;
+        }
+    }
+}

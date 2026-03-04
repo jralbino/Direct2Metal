@@ -1,12 +1,14 @@
-/* File: src/kernel.cpp - STABLE FUSED VERSION */
+/* File: src/kernel.cpp - CLEAN VERSION (FIXED INCLUDES & WARNINGS) */
 #include <stdint.h>
-#include <cstddef>
+#include <cstddef>          // <--- AÑADIDO: Soluciona el error de size_t
 #include <arm_neon.h>
 #include "ops.h"
 #include "mmu.h"
 #include "multicore.h"
 #include "safety_config.h"
 #include "watchdog.h"
+#include "camera.h"
+#include "mailbox.h"
 
 #ifndef NULL
 #define NULL 0
@@ -15,17 +17,36 @@
 extern void video_init(); extern void draw_pixel(int x, int y, uint32_t color);
 extern void draw_rect(int x, int y, int w, int h, uint32_t color, int thickness);
 extern void draw_fill(uint32_t color); extern void draw_tensor_image(const float* img, int x_off, int y_off, int img_w, int img_h);
+extern void draw_text(int x, int y, const char* s, uint32_t fg, uint32_t bg, int scale);
 extern void video_flush();
+// Framebuffer pointer and pitch exported from video.cpp
+extern unsigned char* lfb;
+extern uint32_t pitch;
 
-volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000; volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018; volatile uint32_t* const UART0_CR = (uint32_t*)0x3F201030;
+volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
+volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
+volatile uint32_t* const UART0_CR = (uint32_t*)0x3F201030;
+
 void uart_init() {
-    *UART0_CR = 0; *((volatile uint32_t*)0x3F200004) = (*((volatile uint32_t*)0x3F200004) & ~((7 << 12) | (7 << 15))) | ((4 << 12) | (4 << 15));
-    *((volatile uint32_t*)0x3F201044) = 0x7FF; *((volatile uint32_t*)0x3F201024) = 26; *((volatile uint32_t*)0x3F201028) = 3; *((volatile uint32_t*)0x3F20102C) = 0x70; *UART0_CR = 0x301;
+    *UART0_CR = 0;
+    *((volatile uint32_t*)0x3F200004) = (*((volatile uint32_t*)0x3F200004) & ~((7 << 12) | (7 << 15))) | ((4 << 12) | (4 << 15));
+    *((volatile uint32_t*)0x3F201044) = 0x7FF;
+    *((volatile uint32_t*)0x3F201024) = 26;
+    *((volatile uint32_t*)0x3F201028) = 3;
+    *((volatile uint32_t*)0x3F20102C) = 0x70;
+    *UART0_CR = 0x301;
 }
 void uart_putc(unsigned char c) { while (*UART0_FR & (1 << 5)); *UART0_DR = c; }
 void uart_puts(const char* s) { while (*s) { if (*s == '\n') uart_putc('\r'); uart_putc(*s++); } }
 extern "C" void uart_puts_c(const char* s) { uart_puts(s); }
-void uart_dec(int n) { if (n < 0) { uart_putc('-'); n = -n; } if (n == 0) { uart_putc('0'); return; } char buf[20]; int i = 0; while (n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; } while (--i >= 0) uart_putc(buf[i]); }
+void uart_dec(int n) {
+    if (n < 0) { uart_putc('-'); n = -n; }
+    if (n == 0) { uart_putc('0'); return; }
+    char buf[20]; int i = 0;
+    while (n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; }
+    while (--i >= 0) uart_putc(buf[i]);
+}
+
 unsigned long get_timer_freq() { unsigned long v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
 unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_el0" : "=r"(v)); return v; }
 
@@ -33,18 +54,20 @@ extern "C" const float weights_start[]; extern "C" const float weights_end[];
 extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
 
 static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000];
+static float cam_frame[3 * 320 * 320];
 static float save_L4[64 * 40 * 40]; static float save_L6[128 * 20 * 20]; static float save_Neck_P5[128 * 10 * 10];
 static float save_Neck_P4[64 * 20 * 20]; static float save_P3_Head[64 * 40 * 40]; static float save_P4_Head[128 * 20 * 20];
 
 static float mini_exp(float x) {
-    if (x > 88.0f) return 3.40282347e+38f; if (x < -88.0f) return 0.0f;
-    float z = x * 1.44269504088896f; int32_t k = (z >= 0.0f) ? (int32_t)(z + 0.5f) : (int32_t)(z - 0.5f);
-    float r = x - (float)k * 0.69314718055995f; float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * (0.04166667f + r * 0.00833333f))));
+    if (x > 88.0f) { return 3.40282347e+38f; } // <--- Corregido el warning de indentación
+    if (x < -88.0f) { return 0.0f; }
+    float z = x * 1.44269504f; int32_t k = (z >= 0.0f) ? (int32_t)(z + 0.5f) : (int32_t)(z - 0.5f);
+    float r = x - (float)k * 0.69314718f;
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * (0.04166667f + r * 0.00833333f))));
     union { float f; uint32_t u; } bits; bits.u = (uint32_t)(k + 127) << 23; return bits.f * p;
 }
 static float fast_sigmoid(float x) { return 1.0f / (1.0f + mini_exp(-x)); }
 
-/* P3: NEON sigmoid for 4 values in parallel */
 static inline float32x4_t k_neon_expf4(float32x4_t x) {
     x = vminq_f32(x, vdupq_n_f32(88.0f)); x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
     float32x4_t z = vmulq_n_f32(x, 1.44269504f); int32x4_t k = vcvtaq_s32_f32(z);
@@ -64,7 +87,6 @@ static inline float32x4_t k_neon_sigmoidf4(float32x4_t x) {
     recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
     return recip;
 }
-
 static void copy_tensor(const float* src, float* dst, int n) {
     int i = 0; for (; i <= n - 4; i += 4) vst1q_f32(dst + i, vld1q_f32(src + i));
     for (; i < n; i++) dst[i] = src[i];
@@ -72,7 +94,6 @@ static void copy_tensor(const float* src, float* dst, int n) {
 static void concat_tensor(const float* src1, int c1, const float* src2, int c2, float* dst, int hw) {
     copy_tensor(src1, dst, c1 * hw); copy_tensor(src2, dst + c1 * hw, c2 * hw);
 }
-
 struct WeightStream {
     const uint8_t* ptr; WeightStream(const float* start) : ptr((const uint8_t*)start) {}
     const float* next(int expected_count, const char* layer_name) {
@@ -82,18 +103,19 @@ struct WeightStream {
     }
 };
 
-/* MAX_PREDS is defined in safety_config.h */
 struct Box { float x, y, w, h, conf; int cls; };
 static Box preds[MAX_PREDS]; static int num_preds = 0;
 
 static float calculate_iou(const Box& a, const Box& b) {
-    float x1_int = (a.x - a.w/2) > (b.x - b.w/2) ? (a.x - a.w/2) : (b.x - b.w/2); float y1_int = (a.y - a.h/2) > (b.y - b.h/2) ? (a.y - a.h/2) : (b.y - b.h/2);
-    float x2_int = (a.x + a.w/2) < (b.x + b.w/2) ? (a.x + a.w/2) : (b.x + b.w/2); float y2_int = (a.y + a.h/2) < (b.y + b.h/2) ? (a.y + a.h/2) : (b.y + b.h/2);
-    float w_int = x2_int - x1_int; float h_int = y2_int - y1_int; if (w_int <= 0 || h_int <= 0) return 0.0f;
+    float x1_int = (a.x - a.w/2) > (b.x - b.w/2) ? (a.x - a.w/2) : (b.x - b.w/2);
+    float y1_int = (a.y - a.h/2) > (b.y - b.h/2) ? (a.y - a.h/2) : (b.y - b.h/2);
+    float x2_int = (a.x + a.w/2) < (b.x + b.w/2) ? (a.x + a.w/2) : (b.x + b.w/2);
+    float y2_int = (a.y + a.h/2) < (b.y + b.h/2) ? (a.y + a.h/2) : (b.y + b.h/2);
+    float w_int = x2_int - x1_int; float h_int = y2_int - y1_int;
+    if (w_int <= 0 || h_int <= 0) return 0.0f;
     float area_int = w_int * h_int; return area_int / (a.w * a.h + b.w * b.h - area_int);
 }
 
-/* P3: class probabilities computed 4 at a time with NEON sigmoid */
 static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, float anchors[3][2]) {
     int grd = grid_h * grid_w;
     for (int a = 0; a < 3; a++) {
@@ -104,7 +126,6 @@ static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, 
                 float obj_conf = fast_sigmoid(tensor[(base_ch + 4) * grd + idx]);
                 if (obj_conf <= OBJ_PRE_THRESH) continue;
                 float max_cls_prob = 0.0f; int best_cls = -1;
-                /* Scalar class decode: CHW scatter-loads (stride=grd) negate NEON benefit on A53 */
                 for (int c = 0; c < NUM_CLASSES; c++) {
                     float prob = fast_sigmoid(tensor[(base_ch + 5 + c) * grd + idx]);
                     if (prob > max_cls_prob) { max_cls_prob = prob; best_cls = c; }
@@ -113,7 +134,8 @@ static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, 
                 if (score > OBJ_PRE_THRESH && num_preds < MAX_PREDS) {
                     float tx = tensor[(base_ch + 0) * grd + idx]; float ty = tensor[(base_ch + 1) * grd + idx];
                     float tw = tensor[(base_ch + 2) * grd + idx]; float th = tensor[(base_ch + 3) * grd + idx];
-                    preds[num_preds].x = (fast_sigmoid(tx) * 2.0f - 0.5f + cx) * stride; preds[num_preds].y = (fast_sigmoid(ty) * 2.0f - 0.5f + cy) * stride;
+                    preds[num_preds].x = (fast_sigmoid(tx) * 2.0f - 0.5f + cx) * stride;
+                    preds[num_preds].y = (fast_sigmoid(ty) * 2.0f - 0.5f + cy) * stride;
                     float sw = fast_sigmoid(tw) * 2.0f; float sh = fast_sigmoid(th) * 2.0f;
                     preds[num_preds].w = (sw * sw) * anchors[a][0]; preds[num_preds].h = (sh * sh) * anchors[a][1];
                     preds[num_preds].conf = score; preds[num_preds].cls = best_cls; num_preds++;
@@ -167,7 +189,6 @@ void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c
     parallel_conv1x1(temp, h, w, c_hidden * 4, w_cv2, b_cv2, c, true, out);
 }
 
-/* S8: software CRC32 (IEEE 802.3 polynomial 0xEDB88320) */
 static uint32_t crc32_lut[256];
 static bool crc32_lut_ready = false;
 
@@ -191,15 +212,39 @@ static uint32_t crc32_sw(const uint8_t* data, size_t len) {
 
 static int heartbeat_counter = 0;
 
-void run_yolo_complete() {
-    /* S7: kick watchdog at start of each inference frame */
-    watchdog_kick();
+static void draw_tensor_image_fullscreen(const float* img) {
+    const float* dst_r = img; const float* dst_g = img + (320 * 320); const float* dst_b = img + (2 * 320 * 320);
+    for (int y = 0; y < 480; y++) {
+        int src_y = (y * 320) / 480;
+        for (int x = 0; x < 640; x++) {
+            int src_x = (x * 320) / 640; int idx = src_y * 320 + src_x;
+            int r = (int)(dst_r[idx] * 255.0f); int g = (int)(dst_g[idx] * 255.0f); int b = (int)(dst_b[idx] * 255.0f);
+            
+            // <--- Corregidos los warnings de indentación
+            if (r < 0) { r = 0; }
+            if (r > 255) { r = 255; }
+            if (g < 0) { g = 0; }
+            if (g > 255) { g = 255; }
+            if (b < 0) { b = 0; }
+            if (b > 255) { b = 255; }
+            
+            uint32_t color = 0xFF000000 | (b << 16) | (g << 8) | r; draw_pixel(x, y, color);
+        }
+    }
+}
 
+static int global_frame_counter = 1;
+
+void run_yolo_complete() {
+    watchdog_kick();
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
-    uart_puts("\n=== YOLOv5n DECODER ENGINE ===\n");
+    uart_puts("\n=== YOLOv5n DECODER ENGINE [Frame: ");
+    uart_dec(global_frame_counter);
+    uart_puts("] ===\n");
+    global_frame_counter++;
+    
     WeightStream ws(weights_start); num_preds = 0;
 
-    /* S8: one-time CRC32 integrity check on weights (skipped if WEIGHTS_CRC32==0) */
     static bool weights_verified = false;
     if (!weights_verified && WEIGHTS_CRC32 != 0x00000000U) {
         size_t wsz = (size_t)((const uint8_t*)weights_end - (const uint8_t*)weights_start);
@@ -208,20 +253,21 @@ void run_yolo_complete() {
         weights_verified = true;
     }
 
-    /* P4: NEON-vectorized RGB normalization (4 pixels per iteration) */
+    if (g_use_camera) camera_capture_frame(cam_frame);
+    const float* input_img = g_use_camera ? cam_frame : test_image;
+
     int hw = 320 * 320;
-    float scale = (test_image[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
-    float32x4_t vscale = vdupq_n_f32(scale);
-    int i = 0;
+    float scale = (input_img[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
+    float32x4_t vscale = vdupq_n_f32(scale); int i = 0;
     for (; i <= hw - 4; i += 4) {
-        vst1q_f32(buf_B + 0*hw + i, vmulq_f32(vld1q_f32(test_image + 0*hw + i), vscale));
-        vst1q_f32(buf_B + 1*hw + i, vmulq_f32(vld1q_f32(test_image + 1*hw + i), vscale));
-        vst1q_f32(buf_B + 2*hw + i, vmulq_f32(vld1q_f32(test_image + 2*hw + i), vscale));
+        vst1q_f32(buf_B + 0*hw + i, vmulq_f32(vld1q_f32(input_img + 0*hw + i), vscale));
+        vst1q_f32(buf_B + 1*hw + i, vmulq_f32(vld1q_f32(input_img + 1*hw + i), vscale));
+        vst1q_f32(buf_B + 2*hw + i, vmulq_f32(vld1q_f32(input_img + 2*hw + i), vscale));
     }
     for (; i < hw; i++) {
-        buf_B[0*hw+i] = test_image[0*hw+i] * scale;
-        buf_B[1*hw+i] = test_image[1*hw+i] * scale;
-        buf_B[2*hw+i] = test_image[2*hw+i] * scale;
+        buf_B[0*hw+i] = input_img[0*hw+i] * scale;
+        buf_B[1*hw+i] = input_img[1*hw+i] * scale;
+        buf_B[2*hw+i] = input_img[2*hw+i] * scale;
     }
     unsigned long t_rgb = get_timer_count();
 
@@ -296,50 +342,90 @@ void run_yolo_complete() {
 
     if (num_preds > MAX_PREDS) num_preds = MAX_PREDS;
 
-    /* P1: insertion sort (descending by conf) — O(n) best case vs bubble O(n²) */
     for (int ii = 1; ii < num_preds; ii++) {
-        Box key = preds[ii];
-        int jj = ii - 1;
-        while (jj >= 0 && preds[jj].conf < key.conf) {
-            preds[jj + 1] = preds[jj];
-            jj--;
-        }
+        Box key = preds[ii]; int jj = ii - 1;
+        while (jj >= 0 && preds[jj].conf < key.conf) { preds[jj + 1] = preds[jj]; jj--; }
         preds[jj + 1] = key;
     }
 
-    /* NMS: agnostic IoU suppression with early exit (list is sorted descending) */
     for (int ii = 0; ii < num_preds; ii++) {
-        /* S5: use <= instead of == to handle -0.0f correctly */
         if (preds[ii].conf <= 0.0f) continue;
         for (int jj = ii + 1; jj < num_preds; jj++) {
-            if (preds[jj].conf <= 0.0f) continue;           /* skip already-suppressed boxes */
-            /* P1: early exit — list is sorted; first non-suppressed below threshold → rest also below */
+            if (preds[jj].conf <= 0.0f) continue;           
             if (preds[jj].conf < CONF_THRESH * 0.5f) break;
             if (calculate_iou(preds[ii], preds[jj]) > NMS_THRESH) preds[jj].conf = 0.0f;
         }
     }
 
-    draw_fill(0xFF222222); draw_tensor_image(test_image, 160, 80, 320, 320);
+    // Render frame at maximum resolution.
+    // Camera mode: debayer RAW8 → 480×480 directly to framebuffer (letterbox at x=80).
+    // Test mode: upscale 320×320 float tensor to 640×480.
+    if (g_use_camera) {
+        camera_render_fullres((uint8_t*)lfb, pitch);
+    } else {
+        draw_fill(0xFF222222);
+        draw_tensor_image_fullscreen(input_img);
+    }
+
+    // Scale factors and offsets for mapping YOLO coords (320×320) to framebuffer coords.
+    // Camera mode: uniform 1.5× scale, image at x=[80,560] y=[0,480].
+    // Test mode: non-uniform 2.0×H / 1.5×V, image at x=[0,640] y=[0,480].
+    const float disp_scale  = g_use_camera ? (CAM_DISP_W / 320.0f) : (640.0f / 320.0f);
+    const float disp_scaleY = g_use_camera ? (CAM_DISP_H / 320.0f) : (480.0f / 320.0f);
+    const int   disp_xoff   = g_use_camera ? CAM_DISP_XOFF : 0;
+    const int   disp_right  = disp_xoff + (g_use_camera ? CAM_DISP_W : 640);
+    const int   disp_bottom = g_use_camera ? CAM_DISP_H : 480;
 
     uart_puts("\n>>> OBJETOS DETECTADOS <<<\n"); int valid_boxes = 0;
+
     for (int ii = 0; ii < num_preds; ii++) {
         if (preds[ii].conf > CONF_THRESH) {
             valid_boxes++;
             uart_puts("Clase: "); uart_dec(preds[ii].cls); uart_puts(" | Conf: "); uart_dec((int)(preds[ii].conf * 100));
             uart_puts(" | Pos: ["); uart_dec((int)preds[ii].x); uart_puts(","); uart_dec((int)preds[ii].y); uart_puts("]\n");
-            int box_w = (int)preds[ii].w; int box_h = (int)preds[ii].h; int cx = (int)preds[ii].x; int cy = (int)preds[ii].y;
-            int left = 160 + cx - (box_w / 2); int top  = 80 + cy - (box_h / 2);
-            if (left < 0) left = 0; if (top < 0) top = 0;
-            if (left + box_w > 640) box_w = 640 - left; if (top + box_h > 480) box_h = 480 - top;
-            if (box_w > 2 && box_h > 2) { uint32_t color = (preds[ii].cls == 0) ? 0xFF0000FF : 0xFF00FFFF; draw_rect(left, top, box_w, box_h, color, 3); }
+
+            int box_w = (int)(preds[ii].w * disp_scale);
+            int box_h = (int)(preds[ii].h * disp_scaleY);
+            int cx    = (int)(preds[ii].x * disp_scale) + disp_xoff;
+            int cy    = (int)(preds[ii].y * disp_scaleY);
+
+            int left = cx - (box_w / 2);
+            int top  = cy - (box_h / 2);
+
+            if (left < disp_xoff) { left = disp_xoff; }
+            if (top  < 0)         { top  = 0; }
+            if (left + box_w > disp_right)  { box_w = disp_right  - left; }
+            if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
+
+            if (box_w > 2 && box_h > 2) {
+                uint32_t color = (preds[ii].cls == 0) ? 0xFF0000FF : 0xFF00FFFF;
+                draw_rect(left, top, box_w, box_h, color, 3);
+            }
         }
     }
-    if(valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
+    if (valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
 
+    // Heartbeat indicator: bottom-right corner of the display area
+    int hb_x = disp_xoff + (g_use_camera ? CAM_DISP_W : 640) - 50;
     uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF;
-    draw_rect(20, 20, 40, 40, heartbeat_color, 40); heartbeat_counter++;
-    num_preds = 0; video_flush();
+    draw_rect(hb_x, 430, 40, 40, heartbeat_color, 40); heartbeat_counter++;
+
     unsigned long t_end = get_timer_count();
+
+    {
+        unsigned long duration = t_end - t_start;
+        int fps_tenths = (duration > 0) ? (int)((unsigned long long)f * 10ULL / (unsigned long long)duration) : 0;
+        char fps_str[12]; int n = 0;
+        fps_str[n++] = 'F'; fps_str[n++] = 'P'; fps_str[n++] = 'S'; fps_str[n++] = ':'; fps_str[n++] = ' ';
+        int fps_int = fps_tenths / 10;
+        if (fps_int >= 10) fps_str[n++] = '0' + (fps_int / 10);
+        fps_str[n++] = '0' + (fps_int % 10);
+        fps_str[n++] = '.';
+        fps_str[n++] = '0' + (fps_tenths % 10);
+        fps_str[n]   = '\0';
+        draw_text(disp_xoff + 5, 10, fps_str, 0xFF00FFFF, 0xFF000000, 2);
+    }
+    num_preds = 0; video_flush();
 
     uart_puts(">> Tiempo RGB: "); uart_dec((t_rgb - t_start)*1000/f); uart_puts(" ms\n");
     uart_puts(">> Tiempo L0 (K=6): "); uart_dec((t_l0 - t_rgb)*1000/f); uart_puts(" ms\n");
@@ -352,6 +438,17 @@ void run_yolo_complete() {
 extern "C" void _start();
 extern "C" void kernel_main() {
     uart_init(); uart_puts("\r\n=== Direct2Metal: MOTOR IA EN TIEMPO REAL ===\r\n");
+
+    // --- PRUEBA DEL MAILBOX Y FIRMWARE DE GPU ---
+    uart_puts("[GPU] Solicitando Firmware Revision...\n");
+    mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
+    if (mbox_call(MBOX_CH_PROP)) {
+        uart_puts("[GPU] EXITO! Firmware de VideoCore IV detectado: 0x"); uart_dec((int)mbox[5]); uart_puts("\n");
+    } else {
+        uart_puts("[GPU] ERROR FATAL: No hay respuesta del Mailbox.\n");
+    }
+    // --------------------------------------------
+
     uart_puts("[HW] Despertando nucleos desde Spin Tables...\n");
     *(volatile uint64_t*)0xE0 = (uint64_t)&_start; *(volatile uint64_t*)0xE8 = (uint64_t)&_start; *(volatile uint64_t*)0xF0 = (uint64_t)&_start;
     asm volatile("sev");
@@ -359,9 +456,7 @@ extern "C" void kernel_main() {
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
     video_init(); draw_fill(0xFF00FF00); video_flush(); uart_puts("Hardware de Video Listo.\n");
     init_mmu();
-    /* S7: arm watchdog with 4-second timeout on real HW.
-     * QEMU raspi3b reports cntfrq_el0=62500000; real RPi Zero 2W uses 19200000.
-     * Skip watchdog on QEMU — it lacks proper PM watchdog emulation and resets immediately. */
+    if (!camera_init()) uart_puts("[CAM] No camera found, using test_image\r\n");
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
     while(1) run_yolo_complete();
 }
