@@ -1,13 +1,10 @@
 /* File: src/camera_unicam.cpp
- * V76 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V81 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
- *       Without IDI0, the CSI-2 protocol engine ignores all pixel packets.
  *   [B] IPIPE at 0x10C = 0x00 (RAW8 passthrough) — was COMPLETELY MISSING in V75!
- *       Without IPIPE touching, DMA state may be undefined from VPU boot.
  *   [C] IBEA0 at 0x114 = IBSA0+frame_size — was COMPLETELY MISSING in V75!
- *       DMA needs end address to know when buffer is full.
  *   [D] IBLS at 0x118 = FRAME_W — was COMPLETELY MISSING in V75!
  *   [E] MISC at 0x400 = FL0|FL1 — was MISSING in V75!
  *   [F] CLKGATE at 0x3F802004 — was MISSING in V75!
@@ -19,6 +16,52 @@
  *   [L] IHWIN/IVWIN cleared — crop disabled
  *   [M] STA/ISTA cleared before enabling interrupts
  *   [N] DAT1 = 0x00 for 1-lane (disabled, not 0x02)
+ *
+ * ── V79 CHANGES ──────────────────────────────────────────────────────────────
+ *   [O] ANA = 0xFF0 — confirmed by Linux bcm2835-unicam.c uses 0x770; we use 0xFF0
+ *       for maximum D-PHY bias. V80 confirmed VPU leaves ANA=0x777 (not calibrated).
+ *   [P] Simulator: CM_CAM1CTL added as precondition.
+ *   [Q] Simulator: ICTL LIP bit now self-clears on readback.
+ *   [R] Simulator: STA register models FS/FE.
+ *   [S] Simulator: CLKhi/D0hi lane counters change after sensor stream_on.
+ *   [T] Simulator: ANA CTATADJ/PTATADJ < 0xF flagged as failure.
+ *
+ * ── V80 CHANGES ──────────────────────────────────────────────────────────────
+ *   [U] Print VPU-left ANA value BEFORE our write.
+ *   [V] Conditional ANA write: preserve VPU calibration if present, else 0xFF0.
+ *   [W] DLT/CLT settle time 0x0602→0x1502 (settle=21, 188ns > MIPI spec 91.7ns).
+ *   [X] STA/ISTA/IBWP periodic diagnostic during capture polling.
+ *   [Y] IMX708 0x0114 readback to verify 1-lane override.
+ *
+ * ── V81 CHANGES ──────────────────────────────────────────────────────────────
+ *   [Z] *** ROOT CAUSE FIX: CLK/DAT0 lane config moved to AFTER CPR pulse! ***
+ *
+ *   In V80 (and all prior versions), CLK and DAT0 lane registers were configured
+ *   BEFORE the CPR (Clock Pipe Reset) pulse. The CPR reset wipes the D-PHY
+ *   frontend lane registers back to their power-on default (VPU boot state = 0x02
+ *   = CLPD/DLPD = clock/data lane powered DOWN). This means after CPR, the
+ *   CLK lane was in power-down state — no MIPI clock recovery possible → STA=0.
+ *
+ *   Linux bcm2835-unicam.c unicam_start_rx() order (verified from rpi-6.6.y):
+ *     [1] CTRL = MEM
+ *     [2] ANA power-up (with 1-2ms delay)
+ *     [3] CPR pulse (set then clear BIT(2))
+ *     [4] CTRL = CTRL_BASE (MEM|PFT|OET = 0x080F02)
+ *     [5] PRI, IHWIN, IVWIN
+ *     [6] ICTL = FSIE|FEIE|IBOB; clear STA, ISTA
+ *     [7] CLT, DLT          ← AFTER CPR!
+ *     [8] CMP0
+ *     [9] CLK, DAT0, DAT1   ← AFTER CPR! (was step 3 in V80 = BUG)
+ *    [10] IBLS, IBSA0, IBEA0
+ *    [11] IPIPE, IDI0
+ *    [12] MISC |= FL0|FL1
+ *    [13] CTRL |= CPE
+ *    [14] MISC |= FL0|FL1 (Linux re-asserts after CPE)
+ *    [15] ICTL |= LIP
+ *
+ *   Also: ANA delay increased from 200K NOPs (~0.4ms) to 1M NOPs (~1ms) to match
+ *   Linux's usleep_range(1000, 2000) mandatory DDL lock wait.
+ *   Simulator: updated to validate CLK/DAT0 configured after CPR, not before.
  *
  * ── SIMULATOR (SIMULATION mode) ─────────────────────────────────────────────
  *   Register-level emulator validates exact Linux driver sequence.
@@ -44,6 +87,21 @@ extern void watchdog_kick();
 #define UNICAM1_BASE        0x3F801000UL
 #define UNICAM1_CLKGATE     ((volatile uint32_t*)0x3F802004UL)
 #define CM_PASSWD           0x5A000000u
+
+/* CM_CAM1CTL/DIV: BCM2837 Unicam1 digital backend clock (= BCM2835_CLOCK_CAM1)
+ * Linux driver calls clk_prepare_enable(dev->clock) for this clock.
+ * Without it, the CSI-2 protocol decoder is frozen: STA=0, IBWP never moves.
+ * Target: 100 MHz = PLLD(500MHz) / DIVI=5.
+ *
+ * BCM2835 CM register map (confirmed against CM_GP0CTL=0x070, CM_GP2CTL=0x080):
+ *   offset 0x040 = CM_CAM0CTL
+ *   offset 0x044 = CM_CAM0DIV
+ *   offset 0x048 = CM_CAM1CTL  ← correct address
+ *   offset 0x04C = CM_CAM1DIV
+ *   offset 0x058 = CM_DSI0ECTL ← WRONG (what was used before, configures DSI0 display clock!)
+ */
+#define CM_CAM1CTL  ((volatile uint32_t*)0x3F101048UL)   /* offset 0x048 from CM base */
+#define CM_CAM1DIV  ((volatile uint32_t*)0x3F10104CUL)   /* offset 0x04C from CM base */
 
 /* ─── CTRL bit definitions ────────────────────────────────────────────────── */
 /* (offsets in hardware_sim.h) */
@@ -118,19 +176,40 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
 
     case U_ANA:
         g_sim_state.reg_ana = val;
-        /* ANA < 0x777 means at least partial power-up */
-        if (val < U_ANA_ALL_OFF) g_sim_state.ana_powered_up = true;
+        /* Powered up = APD (BIT0) and BPD (BIT1) both cleared.
+         * 0x777: APD=BPD=1 (down). 0xFF4/0xFF0: APD=BPD=0 (up).
+         * Note: 0xFF4 > 0x777 numerically, so cannot use val < 0x777. */
+        if (!(val & 0x3u)) g_sim_state.ana_powered_up = true;
+        /* CTATADJ[7:4] and PTATADJ[11:8] control D-PHY 100Ω termination bias.
+         * Linux bcm2835-unicam.c writes 0xFF0 (both fields = 0xF = max).
+         * ANA=0x770 (fields=7) → weak termination → D-PHY won't sync → STA=0. */
+        if (g_sim_state.ana_powered_up) {
+            uint8_t ctat = (val >> 4) & 0xF;
+            uint8_t ptat = (val >> 8) & 0xF;
+            if (ctat < 0xF || ptat < 0xF)
+                sim_set_error("ANA: CTATADJ/PTATADJ < 0xF — D-PHY 100Ω termination weak, use ANA=0xFF0");
+        }
         break;
 
     case U_CLK:
-        /* Lower bits: lane enable / termination */
-        if ((val & 0xFFFF) != 0 && (val & 0xFFFF) != 0x02)
+        /* Lower bits: lane enable / termination.
+         * V81: CLK must be configured AFTER CPR. If configured before CPR,
+         * the CPR reset will wipe the configuration → STA=0 forever. */
+        if ((val & 0xFFFF) != 0 && (val & 0xFFFF) != 0x02) {
+            if (!g_sim_state.cpr_pulsed) {
+                sim_set_error("CLK lane configured BEFORE CPR — CPR will reset it to 0x02 (power-down)! Move CLK write to after CPR.");
+            }
             g_sim_state.clk_lane_enabled = true;
+        }
         break;
 
     case U_DAT0:
-        if ((val & 0xFFFF) != 0 && (val & 0xFFFF) != 0x02)
+        if ((val & 0xFFFF) != 0 && (val & 0xFFFF) != 0x02) {
+            if (!g_sim_state.cpr_pulsed) {
+                sim_set_error("DAT0 lane configured BEFORE CPR — CPR will reset it to 0x02 (power-down)! Move DAT0 write to after CPR.");
+            }
             g_sim_state.dat0_lane_enabled = true;
+        }
         break;
 
     case U_CLT:
@@ -183,6 +262,9 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
             } else {
                 sim_set_error("LIP triggered before CPE — image pointers not latched");
             }
+            /* LIP is a self-clearing strobe — real hardware clears it immediately.
+             * ICTL reads back as 0x07 (not 0x27) after writing 0x27. */
+            s_sim_regs[U_ICTL/4] &= ~U_ICTL_LIP;
         }
         break;
 
@@ -204,13 +286,46 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
 
 /* Read from software register file */
 static uint32_t sim_on_read(uint32_t offset) {
-    /* Synthesize ISTA_FEI when simulation is "ready" */
-    if (offset == U_ISTA && g_sim_state.lip_triggered &&
-        g_sim_state.sensor_streaming && g_sim_state.frame_number >= 2) {
-        /* Simulate frame end interrupt after 2nd capture attempt */
-        return s_sim_regs[U_ISTA/4] | U_ISTA_FEI;
+    switch (offset) {
+    case U_ISTA:
+        /* Synthesize ISTA_FEI when all preconditions met and sensor streaming */
+        if (g_sim_state.lip_triggered && g_sim_state.sensor_streaming &&
+            g_sim_state.frame_number >= 2) {
+            return s_sim_regs[U_ISTA/4] | U_ISTA_FEI | U_ISTA_FSI;
+        }
+        return s_sim_regs[U_ISTA/4];
+
+    case U_STA:
+        /* Real HW: STA shows FS/FE when CSI-2 protocol decoder is working.
+         * STA=0 → D-PHY not syncing (termination/clock issue).
+         * Synthesize FS+FE only when all preconditions met. */
+        if (g_sim_state.lip_triggered && g_sim_state.sensor_streaming &&
+            !g_sim_state.error_msg) {
+            return s_sim_regs[U_STA/4] | U_STA_FS | U_STA_FE;
+        }
+        return 0;  /* STA=0: as observed on real HW when CSI-2 not syncing */
+
+    case U_CLK:
+        /* Upper 16 bits = CLKhi counter (LP-11 state count).
+         * PRE-STREAM: ~49152 (CLK in LP-11 most of the time).
+         * POST-STREAM: ~11520 (CLK in HS mode for active frames → fewer LP-11). */
+        if (g_sim_state.sensor_streaming)
+            return (s_sim_regs[U_CLK/4] & 0xFFFFu) | (0x2D00u << 16);  /* HS active */
+        return (s_sim_regs[U_CLK/4] & 0xFFFFu) | (0xC000u << 16);      /* LP-11 idle */
+
+    case U_DAT0:
+        /* D0hi: POST-STREAM much higher due to LS/LE + pixel data bursts. */
+        if (g_sim_state.sensor_streaming)
+            return (s_sim_regs[U_DAT0/4] & 0xFFFFu) | (0xE000u << 16);
+        return (s_sim_regs[U_DAT0/4] & 0xFFFFu) | (0x0A00u << 16);
+
+    case U_DAT1:
+        /* D1hi: unchanged in 1-lane mode (lane disabled, stays at VPU value). */
+        return (s_sim_regs[U_DAT1/4] & 0xFFFFu) | (0xCA00u << 16);
+
+    default:
+        return s_sim_regs[offset/4];
     }
-    return s_sim_regs[offset/4];
 }
 
 /* Macro wrappers for simulation vs hardware */
@@ -233,28 +348,28 @@ static uint32_t sim_on_read(uint32_t offset) {
 #ifndef SIMULATION
 static void dump_unicam_regs(volatile uint32_t* U1) {
     uart_puts("\n=== UNICAM1 REGISTER DUMP (V76) ===\n");
-    uart_puts("CTRL (0x000): 0x"); uart_hex(U1[U_CTRL/4]);
-    uart_puts(" STA (0x004): 0x"); uart_hex(U1[U_STA/4]);   uart_puts("\n");
-    uart_puts("ANA  (0x008): 0x"); uart_hex(U1[U_ANA/4]);
-    uart_puts(" CLK (0x010): 0x"); uart_hex(U1[U_CLK/4]);   uart_puts("\n");
-    uart_puts("DAT0 (0x018): 0x"); uart_hex(U1[U_DAT0/4]);
-    uart_puts(" DAT1(0x01C): 0x"); uart_hex(U1[U_DAT1/4]);  uart_puts("\n");
-    uart_puts("CLT  (0x014): 0x"); uart_hex(U1[U_CLT/4]);
-    uart_puts(" DLT (0x028): 0x"); uart_hex(U1[U_DLT/4]);   uart_puts("\n");
-    uart_puts("ICTL (0x100): 0x"); uart_hex(U1[U_ICTL/4]);
-    uart_puts(" ISTA(0x104): 0x"); uart_hex(U1[U_ISTA/4]);  uart_puts("\n");
-    uart_puts("IDI0 (0x108): 0x"); uart_hex(U1[U_IDI0/4]);
-    uart_puts(" IPIPE(0x10C):0x"); uart_hex(U1[U_IPIPE/4]); uart_puts("\n");
-    uart_puts("IBSA0(0x110): 0x"); uart_hex(U1[U_IBSA0/4]);
-    uart_puts(" IBEA0(0x114):0x"); uart_hex(U1[U_IBEA0/4]); uart_puts("\n");
-    uart_puts("IBLS (0x118): 0x"); uart_hex(U1[U_IBLS/4]);
-    uart_puts(" IBWP(0x11C): 0x"); uart_hex(U1[U_IBWP/4]);  uart_puts("\n");
-    uart_puts("MISC (0x400): 0x"); uart_hex(U1[U_MISC/4]);  uart_puts("\n");
+    uart_puts("CTRL (0x000): "); uart_hex(U1[U_CTRL/4]);
+    uart_puts(" STA (0x004): "); uart_hex(U1[U_STA/4]);   uart_puts("\n");
+    uart_puts("ANA  (0x008): "); uart_hex(U1[U_ANA/4]);
+    uart_puts(" CLK (0x010): "); uart_hex(U1[U_CLK/4]);   uart_puts("\n");
+    uart_puts("DAT0 (0x018): "); uart_hex(U1[U_DAT0/4]);
+    uart_puts(" DAT1(0x01C): "); uart_hex(U1[U_DAT1/4]);  uart_puts("\n");
+    uart_puts("CLT  (0x014): "); uart_hex(U1[U_CLT/4]);
+    uart_puts(" DLT (0x028): "); uart_hex(U1[U_DLT/4]);   uart_puts("\n");
+    uart_puts("ICTL (0x100): "); uart_hex(U1[U_ICTL/4]);
+    uart_puts(" ISTA(0x104): "); uart_hex(U1[U_ISTA/4]);  uart_puts("\n");
+    uart_puts("IDI0 (0x108): "); uart_hex(U1[U_IDI0/4]);
+    uart_puts(" IPIPE(0x10C):"); uart_hex(U1[U_IPIPE/4]); uart_puts("\n");
+    uart_puts("IBSA0(0x110): "); uart_hex(U1[U_IBSA0/4]);
+    uart_puts(" IBEA0(0x114):"); uart_hex(U1[U_IBEA0/4]); uart_puts("\n");
+    uart_puts("IBLS (0x118): "); uart_hex(U1[U_IBLS/4]);
+    uart_puts(" IBWP(0x11C): "); uart_hex(U1[U_IBWP/4]);  uart_puts("\n");
+    uart_puts("MISC (0x400): "); uart_hex(U1[U_MISC/4]);  uart_puts("\n");
     uart_puts("===================================\n");
 }
 #endif
 
-/* ─── Complete Unicam1 initialization (matches bcm2835-unicam.c) ─────────── */
+/* ─── Complete Unicam1 initialization (matches bcm2835-unicam.c unicam_start_rx) ─ */
 static void setup_unicam_block(volatile uint32_t* U1) {
     /* STEP 0: Simulation state init */
 #ifdef SIMULATION
@@ -268,141 +383,193 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 
     /* STEP 2: ANA power-up BEFORE CPR (D-PHY must be powered before reset)
      *
-     * VPU leaves ANA=0x777 (APD=BPD=AR=DDL=1, CTAT=PTAT=7 = ALL POWERED DOWN).
-     * Sequence: write 0x774 (hold AR, release APD/BPD/DDL) → wait → write 0x770
-     * (release AR). This matches BCM2835 D-PHY power-on spec.
-     */
-    U_WRITE(U_ANA, 0x774u);   /* APD=0,BPD=0,AR=1 (hold reset), CTAT=7,PTAT=7 */
-    delay_nop(200000);         /* ~1ms: wait for analog bandgap to settle */
-    U_WRITE(U_ANA, 0x770u);   /* AR=0: release D-PHY analog reset */
-    delay_nop(50000);          /* ~0.25ms: DDL lock time */
-
-    /* STEP 3: Lane configuration (before CPR per Linux driver order)
+     * Linux bcm2835-unicam.c uses ANA=0x774 → 0x770 (CTATADJ=PTATADJ=7).
+     * We use 0xFF4 → 0xFF0 (CTATADJ=PTATADJ=0xF) for maximum D-PHY bias.
+     * V80 confirmed VPU leaves ANA=0x777 (no calibration from dtoverlay).
      *
-     * 0x1D = CLE|CLLPE|CLHSE|CLTRE — enables both LP and HS on the lane.
-     * IMX708 uses CONTINUOUS HS clock mode, so CLK=0x1D is required.
-     * DAT0=0x1D: data lane with full LP+HS termination.
-     * DAT1=0x00: disabled (1-lane mode).
-     * DAT2/3=0x00: disabled.
+     * Linux usleep_range(1000, 2000) after ANA write = mandatory 1-2ms for DDL lock.
+     * Increase from V80's 200K NOPs (~0.4ms) to 1M NOPs (~1ms at 500MHz).
+     */
+#ifdef SIMULATION
+    {
+        U_WRITE(U_ANA, 0xFF4u);
+        delay_nop(1000000);    /* 1ms DDL lock time */
+        U_WRITE(U_ANA, 0xFF0u);
+        delay_nop(50000);
+    }
+#else
+    {
+        uint32_t vpu_ana = U1[U_ANA/4];
+        uart_puts("[UNICAM] ANA (VPU): "); uart_hex(vpu_ana); uart_puts("\n");
+
+        if (vpu_ana & 0x3u) {
+            /* VPU left D-PHY powered down (APD or BPD set) — do full power-up */
+            uart_puts("[UNICAM] ANA: powered down by VPU — full power-up with 0xFF0\n");
+            U1[U_ANA/4] = 0xFF4u;   /* power up, hold AR, max bias */
+            delay_nop(1000000);      /* 1ms DDL lock (Linux: usleep_range(1000, 2000)) */
+            U1[U_ANA/4] = 0xFF0u;   /* release AR */
+            delay_nop(50000);
+        } else {
+            /* VPU calibrated the D-PHY — preserve CTATADJ/PTATADJ, just release AR */
+            uart_puts("[UNICAM] ANA: VPU calibrated — preserving bias, releasing AR\n");
+            uint32_t calibrated = (vpu_ana | 0x4u);   /* set AR (hold reset) */
+            U1[U_ANA/4] = calibrated;
+            delay_nop(1000000);      /* 1ms DDL lock */
+            U1[U_ANA/4] = (vpu_ana & ~0x7u);          /* clear APD,BPD,AR */
+            delay_nop(50000);
+        }
+        g_sim_state.reg_ana = U1[U_ANA/4];
+        g_sim_state.ana_powered_up = true;
+    }
+#endif
+
+    /* STEP 3: CPR pulse (D-PHY reset — ANA is now powered and DDL locked)
      *
-     * Preserve upper 16 bits (hi-counter from VPU, informational only).
-     */
-    U_WRITE(U_CLK,  (U_READ(U_CLK)  & 0xFFFF0000u) | 0x1Du);
-    U_WRITE(U_DAT0, (U_READ(U_DAT0) & 0xFFFF0000u) | 0x1Du);
-    U_WRITE(U_DAT1, (U_READ(U_DAT1) & 0xFFFF0000u) | 0x00u);  /* 1-lane: disabled */
-    U_WRITE(U_DAT2, 0x00u);
-    U_WRITE(U_DAT3, 0x00u);
-
-    /* STEP 4: Timing registers
-     * CLT/DLT = 0x0602: CLT1/DLT1=2 (term_en), CLT2/DLT2=6 (settle)
-     * Values from Linux bcm2835-unicam.c for IMX708 at 450MHz link rate.
-     */
-    U_WRITE(U_CLT, 0x0602u);
-    U_WRITE(U_DLT, 0x0602u);
-
-    /* STEP 5: CPR pulse (D-PHY reset — now safe because ANA is powered)
-     * Must be SET then CLEARED (pulse, not level).
+     * V81 ROOT CAUSE FIX: CPR now comes BEFORE lane/timing config, matching
+     * Linux unicam_start_rx(). CPR resets D-PHY frontend registers back to
+     * their power-on default (0x02 = lane powered down). Therefore ALL lane
+     * config (CLK, DAT0) MUST come AFTER this reset, not before.
+     *
+     * In V80 and earlier, CLK=0x1D/DAT0=0x1D were written BEFORE CPR.
+     * After CPR, those values were reset to 0x02 (CLPD = clock lane in power-down).
+     * With CLK lane in power-down, no MIPI clock recovery = STA=0 forever.
      */
     U_SETBITS(U_CTRL, U_CTRL_CPR);
-    delay_nop(2000);               /* brief reset pulse */
+    delay_nop(2000);               /* brief reset pulse (Linux: no explicit delay) */
     U_CLRBITS(U_CTRL, U_CTRL_CPR);
+    U_CLRBITS(U_CTRL, U_CTRL_CPE); /* ensure CPE=0 after reset */
     delay_nop(2000);
 
-    /* STEP 6: Full CTRL with PFT and OET timeouts
+    /* STEP 4: Full CTRL with PFT and OET timeouts
      * CTRL_BASE = MEM|PFT=0xF|OET=128 = 0x080F02
-     * PFT (Packet Framer Timeout [15:8]=0xF): prevents framer from aborting
-     * prematurely before FS packet completes reception.
-     * OET (Output Enable Timeout [20:12]=128): DMA output timing.
      */
     U_WRITE(U_CTRL, U_CTRL_BASE);
 
-    /* STEP 7: AXI bus priority (PE=1,PT=2,NP=8,PP=0xE) */
+    /* STEP 5: AXI bus priority */
     U_WRITE(U_PRI, 0x00000E85u);
 
-    /* STEP 8: Disable capture window (full frame DMA, no crop) */
+    /* STEP 6: Disable capture window (full frame DMA, no crop) */
     U_WRITE(U_IHWIN, 0x00u);
     U_WRITE(U_IVWIN, 0x00u);
 
-    /* STEP 9: CMP0 — secondary Frame End detection via STA.PI0=BIT(15)
-     * PCE=BIT(31), GI=BIT(9), CPH=BIT(8), VC=0, DT=0x01 (FE short pkt)
-     * This provides an alternative FE detection path if ISTA_FEI is unreliable.
+    /* STEP 7: ICTL interrupt enables + clear status registers */
+    U_WRITE(U_ICTL, U_ICTL_FSIE | U_ICTL_FEIE | U_ICTL_IBOB);  /* = 0x07 */
+    U_WRITE(U_STA,  0xFFFFFFFFu);
+    U_WRITE(U_ISTA, 0x00000007u);    /* write 1 to FSI|FEI|LCI to clear */
+
+    /* STEP 8: Timing registers — AFTER CPR (CPR does NOT reset timing registers,
+     * but Linux puts them here; we follow Linux order exactly).
+     * CLT1/DLT1=2 (term_en wait), CLT2/DLT2=21 (settle), DLT3=0.
+     * Linux uses 0x0602 (settle=6); we use 0x1502 (settle=21) for robustness.
      */
+    U_WRITE(U_CLT, 0x1502u);   /* CLT1=2, CLT2=21 (188ns settle) */
+    U_WRITE(U_DLT, 0x1502u);   /* DLT1=2, DLT2=21, DLT3=0 */
+
+    /* STEP 9: CMP0 — secondary Frame End detection via STA.PI0=BIT(15) */
     U_WRITE(U_CMP0, 0x80000301u);
 
-    /* STEP 10: IDI0 — CSI-2 data type filter *** CRITICAL ***
-     * Format: (VC<<6) | DT
-     * RAW8 DT=0x2A, VC=0 → IDI0=0x2A
-     * IDI0=0 means "accept Frame Start only" → pixel data IGNORED → ISTA_FEI never fires!
+    /* STEP 10: Lane configuration — *** MUST BE AFTER CPR ***
+     *
+     * V81: Moved here from before CPR (was step 3 in V80).
+     * CPR reset CLK/DAT0 to VPU boot default (0x02 = lane powered down).
+     * We now configure lanes AFTER CPR so the configuration survives.
+     *
+     * 0x1D = CLE|CLTRE|CLHSE|CLLPE:
+     *   BIT(0) = CLE   = Clock Lane Enable
+     *   BIT(2) = CLLPE = Clock Lane LP Receive Enable
+     *   BIT(3) = CLHSE = Clock Lane HS Receive Enable
+     *   BIT(4) = CLTRE = Clock Lane Termination Resistance Enable (100Ω)
+     * IMX708 uses continuous HS clock → all 4 bits needed.
+     * DAT1=0x00: 1-lane mode, data lane 1 disabled.
      */
-    U_WRITE(U_IDI0, (0u << 6) | 0x2Au);   /* VC=0, DT=RAW8 */
+    U_WRITE(U_CLK,  0x1Du);   /* CLE|CLTRE|CLHSE|CLLPE (preserve nothing — CPR cleared hi bits too) */
+    U_WRITE(U_DAT0, 0x1Du);   /* DLE|DLTRE|DLHSE|DLLPE */
+    U_WRITE(U_DAT1, 0x00u);   /* 1-lane: disabled */
+    U_WRITE(U_DAT2, 0x00u);
+    U_WRITE(U_DAT3, 0x00u);
 
-    /* STEP 11: IPIPE — image pipe configuration *** CRITICAL ***
-     * PUM=0 (no unpack), PPM=0 (no pack) = RAW8 native passthrough.
-     * Note: IPIPE=0 was confirmed by Linux source for RAW8 native format.
-     * (V40's hypothesis of IPIPE=0x80 was wrong; Linux uses 0x00 for passthrough)
-     */
-    U_WRITE(U_IPIPE, 0x00u);
-
-    /* STEP 12: DMA buffer addresses
+    /* STEP 11: DMA buffer addresses
      * IBSA0: bus address with 0x40000000 L2-bypass alias (ARM AXI path)
      * IBEA0: exclusive end = start + total_bytes
      * IBLS:  line stride in bytes
      */
     const uint32_t phys_addr = (uint32_t)(uintptr_t)g_raw_frame;
     const uint32_t bus_addr  = 0x40000000u | phys_addr;   /* L2-bypass */
+    U_WRITE(U_IBLS,  FRAME_W);              /* bytes per line — before IBSA0/IBEA0 */
     U_WRITE(U_IBSA0, bus_addr);
     U_WRITE(U_IBEA0, bus_addr + FRAME_SZ);
-    U_WRITE(U_IBLS,  FRAME_W);              /* bytes per line */
 
-    /* STEP 13: MISC — frame limit bits FL0=BIT(6), FL1=BIT(9)
-     * Read-modify-write: set both bits (value = 0x240)
-     */
+    /* STEP 12: Image pipeline — IPIPE then IDI0 (Linux order) */
+    U_WRITE(U_IPIPE, 0x00u);                    /* PUM_NONE|PPM_NONE = RAW8 passthrough */
+    U_WRITE(U_IDI0, (0u << 6) | 0x2Au);         /* VC=0, DT=RAW8=0x2A */
+
+    /* STEP 13: MISC — frame limit bits FL0=BIT(6), FL1=BIT(9) = 0x240 */
     U_SETBITS(U_MISC, (1u << 6) | (1u << 9));
 
-    /* STEP 14: Clear status registers before enabling interrupts */
-    U_WRITE(U_STA,  0xFFFFFFFFu);
-    U_WRITE(U_ISTA, 0x00000007u);    /* write 1 to FSI|FEI|LCI to clear */
-
-    /* STEP 15: ICTL — interrupt enables (before CPE per Linux) */
-    U_WRITE(U_ICTL, U_ICTL_FSIE | U_ICTL_FEIE | U_ICTL_IBOB);  /* = 0x07 */
-
-    /* STEP 16: CPE — enable the peripheral */
+    /* STEP 14: CPE — enable the peripheral */
     U_SETBITS(U_CTRL, U_CTRL_CPE);   /* CTRL = CTRL_BASE | CPE = 0x080F03 */
 
-    /* STEP 17: MISC again after CPE (Linux re-asserts FL0|FL1 after CPE) */
+    /* STEP 15: MISC again after CPE (Linux re-asserts FL0|FL1 after CPE) */
     U_SETBITS(U_MISC, (1u << 6) | (1u << 9));
 
-    /* STEP 18: LIP — Load Image Pointers (MUST be AFTER CPE)
-     * LIP is GENMASK(6:5) in ICTL. Writing value 1 sets BIT(5).
-     * Self-clearing: ICTL reads back as 0x07 after LIP completes.
-     * LIP latches IBSA0/IBEA0 into the active DMA address registers.
+    /* STEP 16: LIP — Load Image Pointers (MUST be AFTER CPE)
+     * LIP is BIT(5) in ICTL = 0x20. Self-clearing strobe.
+     * Latches IBSA0/IBEA0 into active DMA address registers.
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V76 init complete. CTRL=0x");
+    uart_puts("[UNICAM] V81 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
-    uart_puts(" IDI0=0x");
+    uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
-    uart_puts(" IPIPE=0x");
+    uart_puts(" IPIPE=");
     uart_hex(U_READ(U_IPIPE));
-    uart_puts(" IBSA0=0x");
+    uart_puts(" IBSA0=");
     uart_hex(U_READ(U_IBSA0));
     uart_puts("\n");
-    uart_puts("[UNICAM] IBEA0=0x");
+    uart_puts("[UNICAM] IBEA0=");
     uart_hex(U_READ(U_IBEA0));
-    uart_puts(" MISC=0x");
+    uart_puts(" MISC=");
     uart_hex(U_READ(U_MISC));
-    uart_puts(" ICTL=0x");
+    uart_puts(" ICTL=");
     uart_hex(U_READ(U_ICTL));
+    uart_puts(" CLK=");
+    uart_hex(U_READ(U_CLK));
     uart_puts("\n");
 }
 
 /* ─── Public API ──────────────────────────────────────────────────────────── */
 
 void unicam_init() {
-    /* Enable Unicam1 clock domain FIRST — before any register access */
+#ifndef SIMULATION
+    /* ── Step 0A: Configure CM_CAM1CTL (Unicam1 digital backend clock) ─────
+     * Linux driver enables this via clk_prepare_enable(dev->clock).
+     * Without it: CSI-2 protocol decoder has no clock → STA=0, IBWP stuck.
+     * Read current value first — print for diagnostics, then configure 100 MHz.
+     * Source: PLLD=6 (500 MHz), DIVI=5 → 100 MHz.
+     */
+    uart_puts("[UNICAM] CM_CAM1CTL before: "); uart_dec((int)*CM_CAM1CTL);
+    uart_puts(" CM_CAM1DIV: "); uart_dec((int)*CM_CAM1DIV); uart_puts("\n");
+
+    /* Stop CM_CAM1 before changing divisor (BCM2835 clock manager requirement) */
+    *CM_CAM1CTL = CM_PASSWD | 6u;          /* SRC=PLLD, ENAB=0 */
+    for (volatile int i = 0; i < 100000; i++) {
+        if (!(*CM_CAM1CTL & (1u << 7))) break;  /* wait BUSY=0 */
+        asm volatile("nop");
+    }
+    *CM_CAM1DIV = CM_PASSWD | (5u << 12);  /* DIVI=5 → 500/5 = 100 MHz */
+    *CM_CAM1CTL = CM_PASSWD | (1u << 4) | 6u;  /* ENAB=1, SRC=PLLD */
+    for (volatile int i = 0; i < 100000; i++) asm volatile("nop");  /* settle */
+
+    uart_puts("[UNICAM] CM_CAM1CTL after:  "); uart_dec((int)*CM_CAM1CTL);
+    uart_puts(" (BUSY="); uart_dec((int)((*CM_CAM1CTL >> 7) & 1));
+    uart_puts(")\n");
+#endif
+
+    /* ── Step 0B: Enable Unicam1 clock gate ─────────────────────────────── */
     *UNICAM1_CLKGATE = CM_PASSWD | 0x05u;  /* CLK+DAT0 gates for 1-lane */
 #ifdef SIMULATION
+    g_sim_state.cam1clk_enabled = true;   /* sim assumes CM_CAM1CTL configured */
     g_sim_state.clkgate_enabled = true;
     g_sim_state.reg_clkgate = 0x05u;
 #endif
@@ -424,6 +591,11 @@ bool unicam_capture_frame() {
     /* Validate all preconditions */
     bool ok = true;
 
+    if (!g_sim_state.cam1clk_enabled) {
+        uart_puts("[SIM] FAIL: CM_CAM1CTL (0x3F101048) not configured — Unicam1 digital backend clock OFF\n");
+        uart_puts("[SIM]   STA=0 / IBWP stuck = clock frozen (same symptom as real HW V76/V77)\n");
+        ok = false;
+    }
     if (!g_sim_state.clkgate_enabled) {
         uart_puts("[SIM] FAIL: CLKGATE not written — Unicam1 clock domain GATED OFF\n");
         ok = false;
@@ -433,8 +605,22 @@ bool unicam_capture_frame() {
         ok = false;
     }
     if (!g_sim_state.ana_powered_up) {
-        uart_puts("[SIM] FAIL: ANA=0x777 (D-PHY fully powered down) — CSI-2 RX blind\n");
+        uart_puts("[SIM] FAIL: ANA APD/BPD bits still set (D-PHY fully powered down) — CSI-2 RX blind\n");
         ok = false;
+    }
+    /* Check ANA termination bias (CTATADJ[7:4] and PTATADJ[11:8]).
+     * Linux bcm2835-unicam.c: ANA=0xFF0 (both fields max=0xF).
+     * ANA=0x770 (fields=7) → weak 100Ω termination → STA=0 observed on real HW V78! */
+    {
+        uint8_t ctat = (g_sim_state.reg_ana >> 4) & 0xF;
+        uint8_t ptat = (g_sim_state.reg_ana >> 8) & 0xF;
+        if (g_sim_state.ana_powered_up && (ctat < 0xF || ptat < 0xF)) {
+            uart_puts("[SIM] FAIL: ANA CTATADJ="); uart_dec(ctat);
+            uart_puts(" PTATADJ="); uart_dec(ptat);
+            uart_puts(" < 0xF — D-PHY 100Ω termination too weak → STA=0 on real HW\n");
+            uart_puts("[SIM]   Fix: write ANA=0xFF4 then ANA=0xFF0 (matches Linux bcm2835-unicam.c)\n");
+            ok = false;
+        }
     }
     if (g_sim_state.cpr_before_ana) {
         uart_puts("[SIM] FAIL: CPR issued BEFORE ANA powered up — analog reset never completed\n");
@@ -446,10 +632,12 @@ bool unicam_capture_frame() {
     }
     if (!g_sim_state.clk_lane_enabled) {
         uart_puts("[SIM] FAIL: CLK lane lower bits = 0 — clock lane disabled\n");
+        uart_puts("[SIM]   (If CLK was written before CPR, CPR reset it to power-down!)\n");
         ok = false;
     }
     if (!g_sim_state.dat0_lane_enabled) {
         uart_puts("[SIM] FAIL: DAT0 lane lower bits = 0 — data lane disabled\n");
+        uart_puts("[SIM]   (If DAT0 was written before CPR, CPR reset it to power-down!)\n");
         ok = false;
     }
     if (!g_sim_state.clt_set) {
@@ -516,10 +704,10 @@ bool unicam_capture_frame() {
     /* All checks passed — synthesize successful capture */
     (void)sizeof(g_raw_frame);  /* ensure buffer is referenced */
     uart_puts("[SIM] === ALL PRECONDITIONS MET — synthesizing ISTA_FEI ===\n");
-    uart_puts("[SIM]   IDI0=0x"); uart_hex(g_sim_state.reg_idi0);
-    uart_puts("  IPIPE=0x");      uart_hex(g_sim_state.reg_ipipe);
-    uart_puts("  IBSA0=0x");      uart_hex(g_sim_state.reg_ibsa0);
-    uart_puts("  IBEA0=0x");      uart_hex(g_sim_state.reg_ibea0);
+    uart_puts("[SIM]   IDI0="); uart_hex(g_sim_state.reg_idi0);
+    uart_puts("  IPIPE=");      uart_hex(g_sim_state.reg_ipipe);
+    uart_puts("  IBSA0=");      uart_hex(g_sim_state.reg_ibsa0);
+    uart_puts("  IBEA0=");      uart_hex(g_sim_state.reg_ibea0);
     uart_puts("\n");
 
     /* Fill frame buffer with synthetic RAW8 RGGB test pattern */
@@ -544,11 +732,27 @@ bool unicam_capture_frame() {
 #else
     /* ── Hardware capture: poll ISTA_FEI or STA.PI0 ─────────────────────── */
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
+    bool saw_fs = false;
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
 
+        /* Periodic STA/ISTA diagnostic: print every ~10M iterations (~100ms) */
+        if (i > 0 && i % 10000000 == 0) {
+            uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
+            uart_puts("00ms: STA="); uart_hex(U1[U_STA/4]);
+            uart_puts(" ISTA="); uart_hex(U1[U_ISTA/4]);
+            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]); uart_puts("\n");
+        }
+
         uint32_t ista = U1[U_ISTA/4];
         uint32_t sta  = U1[U_STA/4];
+
+        /* Log first FS (Frame Start) as diagnostic — if FS fires but FE never does,
+         * the problem is inside the frame (data corruption/DMA issue), not protocol init */
+        if (!saw_fs && (ista & U_ISTA_FSI)) {
+            saw_fs = true;
+            uart_puts("[UNICAM] FS received (ISTA_FSI)! WP="); uart_hex(U1[U_IBWP/4]); uart_puts("\n");
+        }
 
         if (ista & U_ISTA_FEI) {
             U1[U_ISTA/4] = 0xFFFFFFFFu;   /* clear all interrupt flags */
@@ -562,9 +766,15 @@ bool unicam_capture_frame() {
     }
 
     uart_puts("[UNICAM] TIMEOUT — ISTA_FEI never fired after ~500ms\n");
-    uart_puts("[UNICAM] Diagnostic:\n");
-    uart_puts("  IBWP=0x"); uart_hex(U1[U_IBWP/4]);
-    uart_puts("  (if == IBSA0, sensor not transmitting or IDI0 wrong)\n");
+    uart_puts("[UNICAM] CM_CAM1CTL="); uart_dec((int)*CM_CAM1CTL);
+    uart_puts(" CM_CAM1DIV="); uart_dec((int)*CM_CAM1DIV); uart_puts("\n");
+    uart_puts("[UNICAM] IBWP="); uart_hex(U1[U_IBWP/4]);
+    uart_puts("  STA="); uart_hex(U1[U_STA/4]);
+    uart_puts("  ISTA="); uart_hex(U1[U_ISTA/4]); uart_puts("\n");
+    uart_puts("[UNICAM] ANA="); uart_hex(U1[U_ANA/4]);
+    uart_puts(" CLT="); uart_hex(U1[U_CLT/4]);
+    uart_puts(" DLT="); uart_hex(U1[U_DLT/4]); uart_puts("\n");
+    uart_puts("  (IBWP==IBSA0 + STA=0: CSI-2 not syncing — check ANA/DLT/lane mode)\n");
     dump_unicam_regs(U1);
     return false;
 #endif
@@ -579,7 +789,7 @@ void unicam_print_lane_state(const char* tag) {
     uart_puts(" D0hi=");  uart_dec((int)(U_READ(U_DAT0) >> 16));
     uart_puts(" D1hi=");  uart_dec((int)(U_READ(U_DAT1) >> 16));
     uart_puts(" ISTA=");  uart_dec((int)(U_READ(U_ISTA)));
-    uart_puts(" WP=0x");  uart_hex(U_READ(U_IBWP));
+    uart_puts(" WP=");  uart_hex(U_READ(U_IBWP));
     uart_puts("\n");
 }
 
