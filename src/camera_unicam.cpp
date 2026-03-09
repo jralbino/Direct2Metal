@@ -33,6 +33,17 @@
  *   [X] STA/ISTA/IBWP periodic diagnostic during capture polling.
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
+ * ── V83 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AA] *** FIX: CLKGATE written without CM_PASSWD (0x5A000000) ***
+ *   CLKGATE at 0x3F802004 is a CSI1 peripheral register, not a CM register.
+ *   Previous code wrote CM_PASSWD|0x05 = 0x5A000005, setting spurious bits
+ *   [31:8] that may starve the CSI-2 decoder of its clock → STA=0.
+ *   Linux writes raw 0x05. CLKGATE readback added for diagnostic.
+ *
+ * ── V82 CHANGES ──────────────────────────────────────────────────────────────
+ *   [Z2] DLT/CLT: 0x1502 → 0x0602 (settle=6, 60ns = Linux exact value).
+ *   settle=21 (210ns) exceeded HS preamble (~154ns at 1+ Gbps) → missed SYNC.
+ *
  * ── V81 CHANGES ──────────────────────────────────────────────────────────────
  *   [Z] *** ROOT CAUSE FIX: CLK/DAT0 lane config moved to AFTER CPR pulse! ***
  *
@@ -459,11 +470,28 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 
     /* STEP 8: Timing registers — AFTER CPR (CPR does NOT reset timing registers,
      * but Linux puts them here; we follow Linux order exactly).
-     * CLT1/DLT1=2 (term_en wait), CLT2/DLT2=21 (settle), DLT3=0.
-     * Linux uses 0x0602 (settle=6); we use 0x1502 (settle=21) for robustness.
+     * CLT1/DLT1=2 (term_en wait), CLT2/DLT2=6 (settle), DLT3=0.
+     *
+     * V82 ROOT CAUSE FIX #2: settle=6 (60ns at 100MHz) is REQUIRED.
+     *
+     * IMX708 in 1-lane mode at 1536x864 ~100fps transmits at ~1.1–1.8 Gbps.
+     * At 1.1 Gbps: T_UI≈0.91ns, T_HS-ZERO-min ≈ 145ns + 10*T_UI ≈ 154ns.
+     * The SYNC byte (0xB8, 8 bits) arrives at t>154ns after LP→HS transition.
+     *
+     * With settle=21 (210ns at 100MHz): receiver arms at 210ns → SYNC byte
+     * (arriving at 154–161ns) has already passed → CSI-2 decoder never syncs
+     * → STA=0 forever, even though physical MIPI (CLKhi, D0hi) is active.
+     *
+     * With settle=6 (60ns at 100MHz): receiver arms at 60ns → still in the
+     * HS-0 preamble (zeros) → sees SYNC (0xB8) when it arrives at ~154ns ✓
+     *
+     * Linux bcm2835-unicam.c uses 0x0602 exactly. We now match it.
+     * V79–V81 used 0x1502 ("robustness") — actually BROKE high-speed sync.
+     * Note: In V76–V78 (settle=6), CLK was wiped by CPR → different failure.
+     * V82 with both fixes: settle=6 + CLK after CPR → should produce STA>0.
      */
-    U_WRITE(U_CLT, 0x1502u);   /* CLT1=2, CLT2=21 (188ns settle) */
-    U_WRITE(U_DLT, 0x1502u);   /* DLT1=2, DLT2=21, DLT3=0 */
+    U_WRITE(U_CLT, 0x0602u);   /* CLT1=2, CLT2=6 (60ns settle — Linux exact) */
+    U_WRITE(U_DLT, 0x0602u);   /* DLT1=2, DLT2=6, DLT3=0 */
 
     /* STEP 9: CMP0 — secondary Frame End detection via STA.PI0=BIT(15) */
     U_WRITE(U_CMP0, 0x80000301u);
@@ -481,7 +509,15 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      *   BIT(4) = CLTRE = Clock Lane Termination Resistance Enable (100Ω)
      * IMX708 uses continuous HS clock → all 4 bits needed.
      * DAT1=0x00: 1-lane mode, data lane 1 disabled.
+     *
+     * V82 diagnostic: print CLK value BEFORE our write to prove CPR reset it.
+     * Expected: CLK=0x00000002 (power-down default) if CPR works correctly.
      */
+#ifndef SIMULATION
+    uart_puts("[UNICAM] CLK after CPR (pre-write): ");
+    uart_hex(U1[U_CLK/4]);
+    uart_puts("\n");
+#endif
     U_WRITE(U_CLK,  0x1Du);   /* CLE|CLTRE|CLHSE|CLLPE (preserve nothing — CPR cleared hi bits too) */
     U_WRITE(U_DAT0, 0x1Du);   /* DLE|DLTRE|DLHSE|DLLPE */
     U_WRITE(U_DAT1, 0x00u);   /* 1-lane: disabled */
@@ -518,7 +554,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V81 init complete. CTRL=");
+    uart_puts("[UNICAM] V83 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -535,6 +571,13 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     uart_hex(U_READ(U_ICTL));
     uart_puts(" CLK=");
     uart_hex(U_READ(U_CLK));
+    uart_puts("\n");
+    uart_puts("[UNICAM] CLT=");
+    uart_hex(U_READ(U_CLT));
+    uart_puts(" DLT=");
+    uart_hex(U_READ(U_DLT));
+    uart_puts(" ANA=");
+    uart_hex(U_READ(U_ANA));
     uart_puts("\n");
 }
 
@@ -567,13 +610,34 @@ void unicam_init() {
 #endif
 
     /* ── Step 0B: Enable Unicam1 clock gate ─────────────────────────────── */
-    *UNICAM1_CLKGATE = CM_PASSWD | 0x05u;  /* CLK+DAT0 gates for 1-lane */
-#ifdef SIMULATION
-    g_sim_state.cam1clk_enabled = true;   /* sim assumes CM_CAM1CTL configured */
+    /* V83 FIX: CLKGATE at 0x3F802004 is a CSI1 peripheral register, NOT a
+     * Clock Manager register. CM_PASSWD (0x5A000000) applies only to the CM
+     * block at 0x3F101000. Writing CM_PASSWD|0x05 = 0x5A000005 to CLKGATE
+     * sets spurious bits [31:8] which may enable wrong clock domains or
+     * corrupt the gate configuration → CSI-2 decoder starved of clock.
+     * Linux bcm2835-unicam.c maps this as raw MMIO and writes the lane mask
+     * directly: writel(0x05, priv->clkgate_regs) — no password.
+     *
+     * CLKGATE bit map (BCM2837 CSI1, confirmed from Linux DTS + driver):
+     *   BIT(0) = CLEKG  — Clock lane gate
+     *   BIT(2) = DATEK0 — Data lane 0 gate  (BIT(2+n) for lane n)
+     *   BIT(3) = DATEK1 — Data lane 1 gate
+     * 1-lane: 0x05 = BIT(0)|BIT(2) = CLK + DAT0
+     */
+#ifndef SIMULATION
+    {
+        uint32_t cg_before = *UNICAM1_CLKGATE;
+        *UNICAM1_CLKGATE = 0x05u;   /* no password — raw lane mask */
+        uint32_t cg_after  = *UNICAM1_CLKGATE;
+        uart_puts("[UNICAM] CLKGATE: before="); uart_hex(cg_before);
+        uart_puts(" wrote=0x05 readback="); uart_hex(cg_after); uart_puts("\n");
+    }
+#else
+    g_sim_state.cam1clk_enabled = true;
     g_sim_state.clkgate_enabled = true;
     g_sim_state.reg_clkgate = 0x05u;
-#endif
     uart_puts("[UNICAM] CLKGATE=0x05 (1-lane: CLK+D0)\n");
+#endif
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
     setup_unicam_block(U1);
