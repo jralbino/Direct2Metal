@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V85 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V86 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -34,6 +34,14 @@
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
  * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V86 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AE] *** FIX mailbox format: mbox[4]=0 (req_resp_indicator), not buf_size ***
+ *   Linux rpi_firmware_property() always sets req_resp_size field to 0 for requests.
+ *   V85 sent mbox[4]=8 → firmware saw "8 bytes of request data" for GET (which only
+ *   has 4 bytes: device_id) → firmware returned parse error → mbox_call returned 0.
+ *   Also: always print mbox[1] (firmware response code) for diagnostics, regardless
+ *   of mbox_call return value.
+ *
  * ── V85 CHANGES ──────────────────────────────────────────────────────────────
  *   [AC] *** VPU firmware mailbox: SET_POWER_STATE(Unicam1=0x0d, on+wait) ***
  *   Linux calls pm_runtime_get_sync() → genpd_runtime_resume() → VPU firmware
@@ -579,7 +587,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V85 init complete. CTRL=");
+    uart_puts("[UNICAM] V86 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -625,27 +633,35 @@ void unicam_init() {
      * GET first, SET second. Response mbox[6] should be 0x03 = on.
      */
     {
-        /* GET_POWER_STATE(device=0x0d) — diagnostic readback */
+        /* GET_POWER_STATE(device=0x0d) — diagnostic readback.
+         *
+         * V86 FORMAT FIX: Linux rpi_firmware_property() always sets
+         * req_resp_size (mbox[4]) = 0 for requests. The firmware uses
+         * buf_size (mbox[3]) to know the buffer length. We previously sent
+         * mbox[4]=8 which told the firmware "8 bytes of request data", but
+         * GET only has 4 bytes (device_id) — firmware returned parse error.
+         *
+         * Correct format (rpi_firmware_property_list in rpi-firmware.c):
+         *   [0] total size  [1] 0=request  [2] tag_id
+         *   [3] buf_size    [4] 0=req_resp_indicator  [5..] value buffer
+         *   [N] 0=end_tag
+         */
         mbox[0] = 8 * 4; mbox[1] = 0;
-        mbox[2] = 0x00020001; mbox[3] = 8; mbox[4] = 8;
+        mbox[2] = 0x00020001; mbox[3] = 8; mbox[4] = 0;
         mbox[5] = 0x0000000d; mbox[6] = 0; mbox[7] = 0;
-        if (mbox_call(8)) {
-            uart_puts("[UNICAM] V85 PWR GET[0x0d]="); uart_hex(mbox[6]);
-            uart_puts(" (0=off,1=on,3=on+wait_resp)\n");
-        } else {
-            uart_puts("[UNICAM] V85 PWR GET FAILED\n");
-        }
+        int get_ok = mbox_call(8);
+        uart_puts("[UNICAM] V86 PWR GET resp="); uart_hex(mbox[1]);
+        uart_puts(" state="); uart_hex(mbox[6]);
+        uart_puts(get_ok ? " OK\n" : " FAILED\n");
 
         /* SET_POWER_STATE(device=0x0d, state=0x03=on+wait) */
         mbox[0] = 8 * 4; mbox[1] = 0;
-        mbox[2] = 0x00028001; mbox[3] = 8; mbox[4] = 8;
+        mbox[2] = 0x00028001; mbox[3] = 8; mbox[4] = 0;
         mbox[5] = 0x0000000d; mbox[6] = 0x00000003; mbox[7] = 0;
-        if (mbox_call(8)) {
-            uart_puts("[UNICAM] V85 PWR SET[0x0d]="); uart_hex(mbox[6]);
-            uart_puts(" (should be 0x00000001=on)\n");
-        } else {
-            uart_puts("[UNICAM] V85 PWR SET FAILED\n");
-        }
+        int set_ok = mbox_call(8);
+        uart_puts("[UNICAM] V86 PWR SET resp="); uart_hex(mbox[1]);
+        uart_puts(" state="); uart_hex(mbox[6]);
+        uart_puts(set_ok ? " OK\n" : " FAILED\n");
     }
 
     /* ── Step 0A: Configure CM_CAM1CTL (Unicam1 digital backend clock) ─────
