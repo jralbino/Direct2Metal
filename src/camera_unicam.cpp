@@ -33,6 +33,15 @@
  *   [X] STA/ISTA/IBWP periodic diagnostic during capture polling.
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
+ * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AB] *** ANA reverted to Linux exact: 0x774→0x770 (CTATADJ=PTAT=7) ***
+ *   V79 changed ANA to 0xFF0 (CTAT=F, PTAT=F) "for maximum bias" — wrong.
+ *   Linux uses 0x770 on the same BCM2837+IMX708 hardware. CTAT/PTAT=F may give
+ *   wrong termination impedance → reflections → SYNC byte corrupted → STA=0.
+ *   V76-V78 had correct 0x770 but also CPR bug — STA=0 was blamed on wrong cause.
+ *   With CPR fixed (V81), settle=6 (V82), and ANA=0x770 (V84), all Linux values
+ *   are now matched. Simulator ANA check updated (accept any non-zero CTAT/PTAT).
+ *
  * ── V83 CHANGES ──────────────────────────────────────────────────────────────
  *   [AA] *** FIX: CLKGATE written without CM_PASSWD (0x5A000000) ***
  *   CLKGATE at 0x3F802004 is a CSI1 peripheral register, not a CM register.
@@ -192,13 +201,13 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
          * Note: 0xFF4 > 0x777 numerically, so cannot use val < 0x777. */
         if (!(val & 0x3u)) g_sim_state.ana_powered_up = true;
         /* CTATADJ[7:4] and PTATADJ[11:8] control D-PHY 100Ω termination bias.
-         * Linux bcm2835-unicam.c writes 0xFF0 (both fields = 0xF = max).
-         * ANA=0x770 (fields=7) → weak termination → D-PHY won't sync → STA=0. */
+         * Linux bcm2835-unicam.c uses ANA=0x770 (CTAT=7, PTAT=7).
+         * V84: accept any non-zero CTAT/PTAT as valid (0=completely uncalibrated). */
         if (g_sim_state.ana_powered_up) {
             uint8_t ctat = (val >> 4) & 0xF;
             uint8_t ptat = (val >> 8) & 0xF;
-            if (ctat < 0xF || ptat < 0xF)
-                sim_set_error("ANA: CTATADJ/PTATADJ < 0xF — D-PHY 100Ω termination weak, use ANA=0xFF0");
+            if (ctat == 0 && ptat == 0)
+                sim_set_error("ANA: CTATADJ=0 PTATADJ=0 — D-PHY termination uncalibrated, use ANA=0x770");
         }
         break;
 
@@ -394,18 +403,28 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 
     /* STEP 2: ANA power-up BEFORE CPR (D-PHY must be powered before reset)
      *
-     * Linux bcm2835-unicam.c uses ANA=0x774 → 0x770 (CTATADJ=PTATADJ=7).
-     * We use 0xFF4 → 0xFF0 (CTATADJ=PTATADJ=0xF) for maximum D-PHY bias.
-     * V80 confirmed VPU leaves ANA=0x777 (no calibration from dtoverlay).
+     * V84 FIX: Use Linux exact ANA values: 0x774 → 0x770 (CTATADJ=PTATADJ=7).
+     *
+     * Linux bcm2835-unicam.c writes ANA=0x774 (power-up, hold AR, CTAT=7, PTAT=7)
+     * then ANA=0x770 (release AR). CTATADJ=7 / PTATADJ=7 are the values Linux
+     * uses on the SAME hardware (BCM2837 + Pi Camera v3 / IMX708).
+     *
+     * V79 changed to 0xFF0 (CTAT=F, PTAT=F) "for maximum D-PHY bias" — this was
+     * wrong. CTAT/PTAT control the 100Ω differential termination bias current.
+     * Wrong bias → wrong termination impedance → signal reflections → CSI-2 SYNC
+     * (0xB8) corrupted → decoder never syncs → STA=0 forever.
+     *
+     * V76-V78 used the correct 0x770 but also had the CPR bug (CLK wiped), so
+     * STA=0 was blamed on the wrong cause. Now that CPR is fixed (V81), reverting
+     * to the Linux-verified 0x770 should be the final fix.
      *
      * Linux usleep_range(1000, 2000) after ANA write = mandatory 1-2ms for DDL lock.
-     * Increase from V80's 200K NOPs (~0.4ms) to 1M NOPs (~1ms at 500MHz).
      */
 #ifdef SIMULATION
     {
-        U_WRITE(U_ANA, 0xFF4u);
+        U_WRITE(U_ANA, 0x774u);
         delay_nop(1000000);    /* 1ms DDL lock time */
-        U_WRITE(U_ANA, 0xFF0u);
+        U_WRITE(U_ANA, 0x770u);
         delay_nop(50000);
     }
 #else
@@ -413,22 +432,14 @@ static void setup_unicam_block(volatile uint32_t* U1) {
         uint32_t vpu_ana = U1[U_ANA/4];
         uart_puts("[UNICAM] ANA (VPU): "); uart_hex(vpu_ana); uart_puts("\n");
 
-        if (vpu_ana & 0x3u) {
-            /* VPU left D-PHY powered down (APD or BPD set) — do full power-up */
-            uart_puts("[UNICAM] ANA: powered down by VPU — full power-up with 0xFF0\n");
-            U1[U_ANA/4] = 0xFF4u;   /* power up, hold AR, max bias */
-            delay_nop(1000000);      /* 1ms DDL lock (Linux: usleep_range(1000, 2000)) */
-            U1[U_ANA/4] = 0xFF0u;   /* release AR */
-            delay_nop(50000);
-        } else {
-            /* VPU calibrated the D-PHY — preserve CTATADJ/PTATADJ, just release AR */
-            uart_puts("[UNICAM] ANA: VPU calibrated — preserving bias, releasing AR\n");
-            uint32_t calibrated = (vpu_ana | 0x4u);   /* set AR (hold reset) */
-            U1[U_ANA/4] = calibrated;
-            delay_nop(1000000);      /* 1ms DDL lock */
-            U1[U_ANA/4] = (vpu_ana & ~0x7u);          /* clear APD,BPD,AR */
-            delay_nop(50000);
-        }
+        /* VPU always leaves ANA=0x777 (fully powered down, uncalibrated).
+         * Always do full power-up with Linux-matched values: 0x774 → 0x770.
+         * CTATADJ=7, PTATADJ=7 = Linux bcm2835-unicam.c exact values. */
+        uart_puts("[UNICAM] ANA: power-up 0x774->0x770 (Linux CTAT=7 PTAT=7)\n");
+        U1[U_ANA/4] = 0x774u;   /* power up, hold AR, CTATADJ=7, PTATADJ=7 */
+        delay_nop(1000000);      /* 1ms DDL lock (Linux: usleep_range(1000, 2000)) */
+        U1[U_ANA/4] = 0x770u;   /* release AR */
+        delay_nop(50000);
         g_sim_state.reg_ana = U1[U_ANA/4];
         g_sim_state.ana_powered_up = true;
     }
@@ -554,7 +565,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V83 init complete. CTRL=");
+    uart_puts("[UNICAM] V84 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -673,16 +684,13 @@ bool unicam_capture_frame() {
         ok = false;
     }
     /* Check ANA termination bias (CTATADJ[7:4] and PTATADJ[11:8]).
-     * Linux bcm2835-unicam.c: ANA=0xFF0 (both fields max=0xF).
-     * ANA=0x770 (fields=7) → weak 100Ω termination → STA=0 observed on real HW V78! */
+     * Linux bcm2835-unicam.c: ANA=0x770 (CTAT=7, PTAT=7). V84: any non-zero OK. */
     {
         uint8_t ctat = (g_sim_state.reg_ana >> 4) & 0xF;
         uint8_t ptat = (g_sim_state.reg_ana >> 8) & 0xF;
-        if (g_sim_state.ana_powered_up && (ctat < 0xF || ptat < 0xF)) {
-            uart_puts("[SIM] FAIL: ANA CTATADJ="); uart_dec(ctat);
-            uart_puts(" PTATADJ="); uart_dec(ptat);
-            uart_puts(" < 0xF — D-PHY 100Ω termination too weak → STA=0 on real HW\n");
-            uart_puts("[SIM]   Fix: write ANA=0xFF4 then ANA=0xFF0 (matches Linux bcm2835-unicam.c)\n");
+        if (g_sim_state.ana_powered_up && ctat == 0 && ptat == 0) {
+            uart_puts("[SIM] FAIL: ANA CTATADJ=0 PTATADJ=0 — termination uncalibrated\n");
+            uart_puts("[SIM]   Fix: write ANA=0x774 then ANA=0x770 (Linux exact)\n");
             ok = false;
         }
     }
