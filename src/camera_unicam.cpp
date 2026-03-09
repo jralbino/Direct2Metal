@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V81 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V85 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -32,6 +32,16 @@
  *   [W] DLT/CLT settle time 0x0602→0x1502 (settle=21, 188ns > MIPI spec 91.7ns).
  *   [X] STA/ISTA/IBWP periodic diagnostic during capture polling.
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
+ *
+ * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V85 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AC] *** VPU firmware mailbox: SET_POWER_STATE(Unicam1=0x0d, on+wait) ***
+ *   Linux calls pm_runtime_get_sync() → genpd_runtime_resume() → VPU firmware
+ *   mailbox SET_POWER_STATE (tag 0x00028001), device 0x0d = RPI_POWER_DOMAIN_UNICAM1.
+ *   Without this, the CSI-2 decoder may be power-gated (MMIO accessible, pads
+ *   active, but decoder logic frozen) → STA=0 forever despite correct register
+ *   sequence. Added GET_POWER_STATE first for diagnostic readback.
+ *   [AD] CTRL added to periodic diagnostic prints in unicam_capture_frame().
  *
  * ── V84 CHANGES ──────────────────────────────────────────────────────────────
  *   [AB] *** ANA reverted to Linux exact: 0x774→0x770 (CTATADJ=PTAT=7) ***
@@ -102,6 +112,10 @@ extern void uart_puts(const char* s);
 extern void uart_dec(int n);
 extern void uart_hex(uint32_t n);
 extern void watchdog_kick();
+
+/* VPU firmware mailbox (defined in mailbox.cpp / kernel.cpp) */
+extern volatile uint32_t mbox[36];
+extern int mbox_call(unsigned char ch);
 
 /* ─── Hardware Base Addresses ─────────────────────────────────────────────── */
 #define UNICAM1_BASE        0x3F801000UL
@@ -565,7 +579,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V84 init complete. CTRL=");
+    uart_puts("[UNICAM] V85 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -596,6 +610,44 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 
 void unicam_init() {
 #ifndef SIMULATION
+    /* ── Step 0: VPU firmware: power on Unicam1 domain (V85) ────────────────
+     * Linux calls pm_runtime_get_sync() → genpd_runtime_resume() → VPU firmware
+     * mailbox property SET_POWER_STATE (tag 0x00028001) for device 0x0d
+     * = RPI_POWER_DOMAIN_UNICAM1 (from bcm2835-pm.h line 43).
+     *
+     * Without this, the CSI-2 decoder hardware block may be power-gated:
+     *   - MMIO is readable/writable (register fabric is always-on)
+     *   - D-PHY analog pads are active (D-PHY is separate power rail)
+     *   - But the digital CSI-2 protocol decoder is frozen (no clock/power)
+     *   → STA=0, ISTA=0, IBWP stuck even with perfect register sequence
+     *
+     * State value: BIT(0)=on, BIT(1)=wait-for-power → 0x03.
+     * GET first, SET second. Response mbox[6] should be 0x03 = on.
+     */
+    {
+        /* GET_POWER_STATE(device=0x0d) — diagnostic readback */
+        mbox[0] = 8 * 4; mbox[1] = 0;
+        mbox[2] = 0x00020001; mbox[3] = 8; mbox[4] = 8;
+        mbox[5] = 0x0000000d; mbox[6] = 0; mbox[7] = 0;
+        if (mbox_call(8)) {
+            uart_puts("[UNICAM] V85 PWR GET[0x0d]="); uart_hex(mbox[6]);
+            uart_puts(" (0=off,1=on,3=on+wait_resp)\n");
+        } else {
+            uart_puts("[UNICAM] V85 PWR GET FAILED\n");
+        }
+
+        /* SET_POWER_STATE(device=0x0d, state=0x03=on+wait) */
+        mbox[0] = 8 * 4; mbox[1] = 0;
+        mbox[2] = 0x00028001; mbox[3] = 8; mbox[4] = 8;
+        mbox[5] = 0x0000000d; mbox[6] = 0x00000003; mbox[7] = 0;
+        if (mbox_call(8)) {
+            uart_puts("[UNICAM] V85 PWR SET[0x0d]="); uart_hex(mbox[6]);
+            uart_puts(" (should be 0x00000001=on)\n");
+        } else {
+            uart_puts("[UNICAM] V85 PWR SET FAILED\n");
+        }
+    }
+
     /* ── Step 0A: Configure CM_CAM1CTL (Unicam1 digital backend clock) ─────
      * Linux driver enables this via clk_prepare_enable(dev->clock).
      * Without it: CSI-2 protocol decoder has no clock → STA=0, IBWP stuck.
@@ -813,7 +865,8 @@ bool unicam_capture_frame() {
             uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
             uart_puts("00ms: STA="); uart_hex(U1[U_STA/4]);
             uart_puts(" ISTA="); uart_hex(U1[U_ISTA/4]);
-            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]); uart_puts("\n");
+            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
+            uart_puts(" CTRL="); uart_hex(U1[U_CTRL/4]); uart_puts("\n");
         }
 
         uint32_t ista = U1[U_ISTA/4];
