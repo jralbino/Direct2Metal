@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V87 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V88 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -34,6 +34,18 @@
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
  * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V88 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AG] *** FIX: CLKGATE = 0x01 (active_data_lanes count), NOT 0x05 (bitmask) ***
+ *   Linux bcm2835-unicam.c: writel(dev->active_data_lanes, dev->clkgate_regs)
+ *   where active_data_lanes = NUMBER of data lanes (1 or 2), NOT a bitmask.
+ *   For 1-lane: write 1. For 2-lane: write 2. Linux writes 2 for IMX708 (2-lane).
+ *   We have been writing 0x05 = BIT(0)|BIT(2) (our assumed "CLK gate + D0 gate"
+ *   bitmask interpretation). Writing 5 to a register that expects a lane count
+ *   (hardware uses bits[1:0] as: 0=off, 1=1lane, 2=2lane) sends an invalid/garbage
+ *   value. The decoder clock gate may be left in an undefined state → decoder
+ *   never starts → STA=0, IBWP stuck, even though physical MIPI is active.
+ *   Fix: write 0x01 (1 active data lane) for our 1-lane configuration.
+ *
  * ── V87 CHANGES ──────────────────────────────────────────────────────────────
  *   [AF] *** FIX: flush mbox[] D-cache to DRAM before mbox_call (DC CIVAC) ***
  *   mbox[] lives in Normal-cacheable RAM. With D-cache enabled, writes to mbox[]
@@ -625,7 +637,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V87 init complete. CTRL=");
+    uart_puts("[UNICAM] V88 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -729,33 +741,34 @@ void unicam_init() {
 #endif
 
     /* ── Step 0B: Enable Unicam1 clock gate ─────────────────────────────── */
-    /* V83 FIX: CLKGATE at 0x3F802004 is a CSI1 peripheral register, NOT a
-     * Clock Manager register. CM_PASSWD (0x5A000000) applies only to the CM
-     * block at 0x3F101000. Writing CM_PASSWD|0x05 = 0x5A000005 to CLKGATE
-     * sets spurious bits [31:8] which may enable wrong clock domains or
-     * corrupt the gate configuration → CSI-2 decoder starved of clock.
-     * Linux bcm2835-unicam.c maps this as raw MMIO and writes the lane mask
-     * directly: writel(0x05, priv->clkgate_regs) — no password.
+    /* V88 FIX: CLKGATE = active_data_lanes COUNT (1 or 2), NOT a bitmask.
      *
-     * CLKGATE bit map (BCM2837 CSI1, confirmed from Linux DTS + driver):
-     *   BIT(0) = CLEKG  — Clock lane gate
-     *   BIT(2) = DATEK0 — Data lane 0 gate  (BIT(2+n) for lane n)
-     *   BIT(3) = DATEK1 — Data lane 1 gate
-     * 1-lane: 0x05 = BIT(0)|BIT(2) = CLK + DAT0
+     * Linux bcm2835-unicam.c unicam_start_rx():
+     *   writel(dev->active_data_lanes, dev->clkgate_regs);
+     * where active_data_lanes = number of data lanes (1=1lane, 2=2lane).
+     * This is a LANE COUNT register, not a bitmask of individual lane gates.
+     *
+     * V83 assumed CLKGATE was a bitmask: BIT(0)=CLK, BIT(2)=D0 → wrote 0x05.
+     * If the hardware uses bits[1:0] as a count field (0=off, 1=1lane, 2=2lane),
+     * writing 0b101=5 is invalid and leaves the clock gate in unknown state →
+     * decoder has no clock → STA=0 forever, even with correct CTRL/ANA/CLK regs.
+     *
+     * For our 1-lane configuration: write 0x01 (= 1 active data lane).
+     * Linux writes 2 for IMX708 in 2-lane mode.
      */
 #ifndef SIMULATION
     {
         uint32_t cg_before = *UNICAM1_CLKGATE;
-        *UNICAM1_CLKGATE = 0x05u;   /* no password — raw lane mask */
+        *UNICAM1_CLKGATE = 0x01u;   /* 1 active data lane (lane count, not bitmask) */
         uint32_t cg_after  = *UNICAM1_CLKGATE;
         uart_puts("[UNICAM] CLKGATE: before="); uart_hex(cg_before);
-        uart_puts(" wrote=0x05 readback="); uart_hex(cg_after); uart_puts("\n");
+        uart_puts(" wrote=0x01 readback="); uart_hex(cg_after); uart_puts("\n");
     }
 #else
     g_sim_state.cam1clk_enabled = true;
     g_sim_state.clkgate_enabled = true;
-    g_sim_state.reg_clkgate = 0x05u;
-    uart_puts("[UNICAM] CLKGATE=0x05 (1-lane: CLK+D0)\n");
+    g_sim_state.reg_clkgate = 0x01u;
+    uart_puts("[UNICAM] CLKGATE=0x01 (1-lane data lane count)\n");
 #endif
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
