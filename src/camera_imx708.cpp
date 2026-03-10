@@ -56,17 +56,32 @@ bool imx708_init() {
         i2c_write_reg16(IMX708_ADDR, k_imx708_init[i].reg, k_imx708_init[i].val);
     }
 
-    /* V76: 1-LANE mode override
-     * k_imx708_common sets 0x0114=0x01 (2-lane). We override to 0x00 (1-lane).
-     * Evidence: 1-lane → D0hi oscillates (sensor transmits MIPI) ✓
-     *           2-lane → D0hi=D1hi=LP-11 always (sensor SILENT) ✗
+    /* V89: TEST 2-LANE mode — re-evaluate V73 "2-lane SILENT" conclusion.
+     *
+     * V73 tested 2-lane but had the CPR bug: CLK/DAT0 configured BEFORE CPR,
+     * then CPR wiped them to 0x02 (power-down). With CLK lane in power-down,
+     * Unicam never asserted 100Ω termination on CLK or D1. The sensor sees
+     * missing termination on D1 → keeps both lanes in LP-11 → "SILENT".
+     *
+     * V73 diagnosis ("sensor SILENT") was actually the CPR bug, not a physical
+     * D1 connectivity problem. With V81 CPR fix + DAT1=0x1D (termination on D1),
+     * the sensor in 2-lane mode should now see proper 100Ω on both D0 and D1
+     * and transition to HS on both lanes.
+     *
+     * k_imx708_common already sets 0x0114=0x01 (2-lane). We no longer override.
+     * If 2-lane works (STA fires): V73's "silent" was CPR bug, D1 IS connected.
+     * If 2-lane also fails: decoder issue independent of lane count.
      */
     i2c_write_reg16(IMX708_ADDR, 0x0112, 0x08);  /* RAW8 MSB */
     i2c_write_reg16(IMX708_ADDR, 0x0113, 0x08);  /* RAW8 LSB */
-    i2c_write_reg16(IMX708_ADDR, 0x0114, 0x00);  /* 1-lane override (V72 confirmed HS) */
+    i2c_write_reg16(IMX708_ADDR, 0x0114, 0x01);  /* V89: 2-lane test (k_imx708_common default) */
     i2c_write_reg16(IMX708_ADDR, 0x0100, 0x00);  /* standby until stream_on() */
 
-    uart_puts("[IMX708] V76: RAW8 + 1-Lane (0x0114=0x00, sensor transmits on D0)\n");
+    uint8_t lane_mode = i2c_read_reg16(IMX708_ADDR, 0x0114);
+    uint8_t pixel_fmt = i2c_read_reg16(IMX708_ADDR, 0x0112);
+    uart_puts("[IMX708] V89: 0x0114="); uart_dec((int)lane_mode);
+    uart_puts(" (0=1lane,1=2lane)  0x0112="); uart_dec((int)pixel_fmt);
+    uart_puts(" (8=RAW8)\n");
     return true;
 }
 

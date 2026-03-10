@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V88 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V89 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -34,6 +34,22 @@
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
  * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V89 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AH] *** TEST: 2-lane mode — re-examine V73 "silent" conclusion ***
+ *   V73 observed D0hi=D1hi=LP-11 constant in 2-lane mode and concluded D1 is
+ *   physically broken. BUT V73 had the CPR bug: CLK/DAT0 written before CPR →
+ *   CPR wiped them to 0x02 (power-down) → Unicam never asserted 100Ω termination
+ *   on D1 → IMX708 sees missing termination on D1 → sensor keeps both lanes in
+ *   LP-11 → "SILENT." CPR bug = real cause, not physical D1 failure.
+ *
+ *   V89 tests 2-lane with all current fixes (CPR fixed, ANA=0x770, settle=6):
+ *   - IMX708: 0x0114=0x01 (2-lane, k_imx708_common default)
+ *   - DAT1 = 0x1D (100Ω termination on D1 → sensor sees valid 2-lane RX)
+ *   - CLKGATE = 0x02 (2 active data lanes per bcm2835-unicam.c convention)
+ *
+ *   Expected: if D1 is physically connected, sensor now sees proper termination
+ *   on both D0 and D1 → transitions to 2-lane HS → STA shows FS/FE.
+ *
  * ── V88 CHANGES ──────────────────────────────────────────────────────────────
  *   [AG] *** FIX: CLKGATE = 0x01 (active_data_lanes count), NOT 0x05 (bitmask) ***
  *   Linux bcm2835-unicam.c: writel(dev->active_data_lanes, dev->clkgate_regs)
@@ -601,9 +617,9 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     uart_hex(U1[U_CLK/4]);
     uart_puts("\n");
 #endif
-    U_WRITE(U_CLK,  0x1Du);   /* CLE|CLTRE|CLHSE|CLLPE (preserve nothing — CPR cleared hi bits too) */
+    U_WRITE(U_CLK,  0x1Du);   /* CLE|CLTRE|CLHSE|CLLPE */
     U_WRITE(U_DAT0, 0x1Du);   /* DLE|DLTRE|DLHSE|DLLPE */
-    U_WRITE(U_DAT1, 0x00u);   /* 1-lane: disabled */
+    U_WRITE(U_DAT1, 0x1Du);   /* V89: 2-lane test — enable D1 with full termination */
     U_WRITE(U_DAT2, 0x00u);
     U_WRITE(U_DAT3, 0x00u);
 
@@ -637,7 +653,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V88 init complete. CTRL=");
+    uart_puts("[UNICAM] V89 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -759,16 +775,16 @@ void unicam_init() {
 #ifndef SIMULATION
     {
         uint32_t cg_before = *UNICAM1_CLKGATE;
-        *UNICAM1_CLKGATE = 0x01u;   /* 1 active data lane (lane count, not bitmask) */
+        *UNICAM1_CLKGATE = 0x02u;   /* V89: 2 active data lanes (2-lane test) */
         uint32_t cg_after  = *UNICAM1_CLKGATE;
         uart_puts("[UNICAM] CLKGATE: before="); uart_hex(cg_before);
-        uart_puts(" wrote=0x01 readback="); uart_hex(cg_after); uart_puts("\n");
+        uart_puts(" wrote=0x02 readback="); uart_hex(cg_after); uart_puts("\n");
     }
 #else
     g_sim_state.cam1clk_enabled = true;
     g_sim_state.clkgate_enabled = true;
-    g_sim_state.reg_clkgate = 0x01u;
-    uart_puts("[UNICAM] CLKGATE=0x01 (1-lane data lane count)\n");
+    g_sim_state.reg_clkgate = 0x02u;
+    uart_puts("[UNICAM] CLKGATE=0x02 (2-lane data lane count)\n");
 #endif
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
