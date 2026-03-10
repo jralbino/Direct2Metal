@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V86 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V87 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -34,6 +34,16 @@
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
  * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V87 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AF] *** FIX: flush mbox[] D-cache to DRAM before mbox_call (DC CIVAC) ***
+ *   mbox[] lives in Normal-cacheable RAM. With D-cache enabled, writes to mbox[]
+ *   stay in L1/L2 D-cache and never reach DRAM until flushed. VideoCore reads from
+ *   ARM DRAM physical address → sees stale/zero values → doesn't respond →
+ *   mbox[1] stays 0x00000000 → mbox_call() returns false. video_init() works because
+ *   it runs before D-cache becomes dirty for the mbox range (or mailbox.cpp clears
+ *   its own buffer). mbox_flush_to_vc() issues DC CIVAC on each cache line of the
+ *   8-word message, plus DSB SY + ISB, before calling mbox_call.
+ *
  * ── V86 CHANGES ──────────────────────────────────────────────────────────────
  *   [AE] *** FIX mailbox format: mbox[4]=0 (req_resp_indicator), not buf_size ***
  *   Linux rpi_firmware_property() always sets req_resp_size field to 0 for requests.
@@ -124,6 +134,34 @@ extern void watchdog_kick();
 /* VPU firmware mailbox (defined in mailbox.cpp / kernel.cpp) */
 extern volatile uint32_t mbox[36];
 extern int mbox_call(unsigned char ch);
+
+/* Flush mbox[] buffer to Point of Coherency before sending to VPU.
+ *
+ * With D-cache enabled (MMU + Normal-cacheable RAM), writes to mbox[] stay
+ * in the L1/L2 D-cache and never reach DRAM unless explicitly flushed.
+ * The VideoCore DMA reads from the ARM physical DRAM address — it sees
+ * the DRAM contents, NOT the cached ARM view. Without a flush, the VPU
+ * reads stale/zeroed DRAM → ignores the message → mbox[1] stays 0x00000000
+ * → mbox_call() returns false ("FAILED").
+ *
+ * DC CIVAC: Clean and Invalidate by VA to Point of Coherency.
+ *   Clean  = write dirty cache lines to DRAM (VPU can now see our message).
+ *   Invalidate = mark line invalid (next read after VPU response fetches
+ *                fresh DRAM instead of stale cached value).
+ * DSB SY: Data Synchronization Barrier — ensures all CIVAC ops complete.
+ * ISB:    Instruction Synchronization Barrier — prevents pipeline reorder.
+ *
+ * `words` = number of uint32_t words in the message (usually 8 for single-tag).
+ */
+static void mbox_flush_to_vc(unsigned int words) {
+    unsigned long addr = (unsigned long)(void*)mbox;
+    unsigned long end  = addr + words * 4u;
+    /* BCM2837 Cortex-A53: cache line = 64 bytes */
+    for (unsigned long a = addr & ~63UL; a < end; a += 64)
+        asm volatile("dc civac, %0" :: "r"(a) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("isb"    ::: "memory");
+}
 
 /* ─── Hardware Base Addresses ─────────────────────────────────────────────── */
 #define UNICAM1_BASE        0x3F801000UL
@@ -587,7 +625,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V86 init complete. CTRL=");
+    uart_puts("[UNICAM] V87 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -649,8 +687,9 @@ void unicam_init() {
         mbox[0] = 8 * 4; mbox[1] = 0;
         mbox[2] = 0x00020001; mbox[3] = 8; mbox[4] = 0;
         mbox[5] = 0x0000000d; mbox[6] = 0; mbox[7] = 0;
+        mbox_flush_to_vc(8);   /* V87: flush dirty D-cache lines to DRAM */
         int get_ok = mbox_call(8);
-        uart_puts("[UNICAM] V86 PWR GET resp="); uart_hex(mbox[1]);
+        uart_puts("[UNICAM] V87 PWR GET resp="); uart_hex(mbox[1]);
         uart_puts(" state="); uart_hex(mbox[6]);
         uart_puts(get_ok ? " OK\n" : " FAILED\n");
 
@@ -658,8 +697,9 @@ void unicam_init() {
         mbox[0] = 8 * 4; mbox[1] = 0;
         mbox[2] = 0x00028001; mbox[3] = 8; mbox[4] = 0;
         mbox[5] = 0x0000000d; mbox[6] = 0x00000003; mbox[7] = 0;
+        mbox_flush_to_vc(8);   /* V87: flush dirty D-cache lines to DRAM */
         int set_ok = mbox_call(8);
-        uart_puts("[UNICAM] V86 PWR SET resp="); uart_hex(mbox[1]);
+        uart_puts("[UNICAM] V87 PWR SET resp="); uart_hex(mbox[1]);
         uart_puts(" state="); uart_hex(mbox[6]);
         uart_puts(set_ok ? " OK\n" : " FAILED\n");
     }
