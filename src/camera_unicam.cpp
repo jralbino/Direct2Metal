@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V89 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V93 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -7,7 +7,7 @@
  *   [C] IBEA0 at 0x114 = IBSA0+frame_size — was COMPLETELY MISSING in V75!
  *   [D] IBLS at 0x118 = FRAME_W — was COMPLETELY MISSING in V75!
  *   [E] MISC at 0x400 = FL0|FL1 — was MISSING in V75!
- *   [F] CLKGATE at 0x3F802004 — was MISSING in V75!
+ *   [F] CLKGATE at 0x3F802000 — was MISSING in V75! (V92: corrected from 0x3F802004)
  *   [G] ANA power-up before CPR — was MISSING in V75 (regression from V72)!
  *   [H] CLT/DLT timing registers — were MISSING in V75!
  *   [I] Removed incorrect U_CTRL_LSM = BIT(14) — BIT(14) is OET field, not LSM!
@@ -33,7 +33,55 @@
  *   [X] STA/ISTA/IBWP periodic diagnostic during capture polling.
  *   [Y] IMX708 0x0114 readback to verify 1-lane override.
  *
- * ── V84 CHANGES ──────────────────────────────────────────────────────────────
+ * ── V93 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AL] *** ROOT CAUSE FIX: V90 accidentally set CPM=CCP2, breaking CSI-2 decode ***
+ *
+ *   CTRL register field layout (from vc4-regs-unicam.h, NOT what V90 assumed):
+ *     BIT(0) = CPE  BIT(1) = MEM  BIT(2) = CPR
+ *     BIT(3) = CPM_MASK (0=CSI-2, 1=CCP2)  BIT(4) = SOE  ...
+ *   "UNICAM_DAT_LANES_SHIFT=3" DOES NOT EXIST in bcm2835-unicam.c.
+ *   Data lanes are enabled by writing 0x1D to DAT0/DAT1 registers (offset 0x018/0x01C).
+ *
+ *   V90 computed lane_bits = BIT(3)|BIT(4) = 0x18 and OR'd into CTRL:
+ *   → BIT(3)=1 = CPM = 1 = CCP2 mode → Unicam tries to decode CCP2 serial protocol
+ *   → sensor sends MIPI CSI-2 → every packet is garbage to the CCP2 decoder
+ *   → STA=0 GUARANTEED (explains V90, V91, V92 persistent STA=0 despite all fixes)
+ *   Fix: remove lane_bits — CTRL = U_CTRL_BASE = 0x080F02 (CPM=0=CSI-2)
+ *
+ *   [AM] *** FIX: CLKGATE value is NOT a lane count — it uses a shift+OR algorithm ***
+ *
+ *   Linux bcm2835-unicam.c clk_write() ALWAYS ORs 0x5A000000 (same as CM password):
+ *     static inline void clk_write(struct unicam_device *dev, u32 val) {
+ *         writel(val | 0x5a000000, dev->clk_gate_base);
+ *     }
+ *   And val is computed by: val=1; for each lane: val = (val<<2)|1
+ *     1-lane: val=5  → write 0x5A000005
+ *     2-lane: val=21 → write 0x5A000015
+ *   Previous versions: V83 wrote 0x5A000005 for 1-lane (accidentally correct!), then
+ *   "fixed" it to raw 0x05 (removed password). V88 changed to lane count (0x01/0x02).
+ *   Fix: 2-lane → 0x5A000015, 1-lane → 0x5A000005.
+ *
+ * ── V92 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AK] *** FIX: CLKGATE address corrected 0x3F802004 → 0x3F802000 ***
+ *   Linux BCM2837 DT CSI1 second resource = 0x7e802000 = ARM 0x3F802000.
+ *   Previous address was +4 into the resource block. CLKGATE register is
+ *   write-only (readback=0 is normal, confirmed by Linux source).
+ *
+ * ── V91 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AJ] *** ROOT CAUSE FIX: IDI0=0x2A (RAW8) does NOT match sensor output ***
+ *   IMX708 has no RAW8 mode. k_imx708_common sets 0x0112/0x0113=0x0A (RAW10).
+ *   Our 0x0112=0x08 override in imx708_init() is ignored — sensor still sends
+ *   DT=0x2B (RAW10). Frame-count=52fps at 450Mbps/lane confirms 10-bit pixels
+ *   (52 * 1536 * 864 * 10 bits / 2 lanes ≈ 345 Mbps/lane, consistent with 450Mbps).
+ *   Unicam IDI0=0x2A packet filter drops EVERY RAW10 packet → STA=0 forever.
+ *   Fix: IDI0=0x2B (RAW10) and FRAME_W=1920 (RAW10-packed stride: 1536*10/8=1920).
+ *
+ * ── V90 CHANGES (SUPERSEDED — INTRODUCED CCP2 BUG, FIXED IN V93) ─────────────
+ *   [AI] *** WRONG FIX: Added non-existent "UNICAM_DAT_LANES_SHIFT=3" to CTRL ***
+ *   This hypothesis was incorrect. BIT(3) in CTRL is CPM (Camera Port Mode),
+ *   not a data lane enable. Setting lane_bits=0x18 put Unicam in CCP2 mode.
+ *   V93 reverts this change. V90 also confirmed D1 physically connected (D1hi=57344 HS).
+ *
  * ── V89 CHANGES ──────────────────────────────────────────────────────────────
  *   [AH] *** TEST: 2-lane mode — re-examine V73 "silent" conclusion ***
  *   V73 observed D0hi=D1hi=LP-11 constant in 2-lane mode and concluded D1 is
@@ -100,7 +148,7 @@
  *
  * ── V83 CHANGES ──────────────────────────────────────────────────────────────
  *   [AA] *** FIX: CLKGATE written without CM_PASSWD (0x5A000000) ***
- *   CLKGATE at 0x3F802004 is a CSI1 peripheral register, not a CM register.
+ *   CLKGATE at 0x3F802000 is a CSI1 peripheral register, not a CM register.
  *   Previous code wrote CM_PASSWD|0x05 = 0x5A000005, setting spurious bits
  *   [31:8] that may starve the CSI-2 decoder of its clock → STA=0.
  *   Linux writes raw 0x05. CLKGATE readback added for diagnostic.
@@ -193,7 +241,7 @@ static void mbox_flush_to_vc(unsigned int words) {
 
 /* ─── Hardware Base Addresses ─────────────────────────────────────────────── */
 #define UNICAM1_BASE        0x3F801000UL
-#define UNICAM1_CLKGATE     ((volatile uint32_t*)0x3F802004UL)
+#define UNICAM1_CLKGATE     ((volatile uint32_t*)0x3F802000UL)  /* V92: was 0x3F802004 */
 #define CM_PASSWD           0x5A000000u
 
 /* CM_CAM1CTL/DIV: BCM2837 Unicam1 digital backend clock (= BCM2835_CLOCK_CAM1)
@@ -215,9 +263,12 @@ static void mbox_flush_to_vc(unsigned int words) {
 /* (offsets in hardware_sim.h) */
 
 /* ─── Frame geometry ──────────────────────────────────────────────────────── */
-#define FRAME_W  1536
+/* V91: IMX708 outputs RAW10 (DT=0x2B). CSI-2 packed RAW10: 4 pixels per 5 bytes.
+ * Byte stride per line = 1536 pixels * 10 bits / 8 bits/byte = 1920 bytes/line.
+ * FRAME_W is the BYTE stride (used for IBLS), not pixel count. */
+#define FRAME_W  1920   /* RAW10-packed bytes/line: 1536px * 10bit / 8 = 1920 */
 #define FRAME_H   864
-#define FRAME_SZ  (FRAME_W * FRAME_H)
+#define FRAME_SZ  (FRAME_W * FRAME_H)  /* 1920 * 864 = 1,658,880 bytes */
 
 /* ─── DMA frame buffer ────────────────────────────────────────────────────── */
 __attribute__((aligned(64)))
@@ -258,12 +309,20 @@ static void sim_set_error(const char* msg) {
 
 /* Called on every MMIO write to offset/4 */
 static void sim_on_write(uint32_t offset, uint32_t val) {
+    /* ISTA is write-to-clear: writing 1s clears the corresponding bits */
+    if (offset == U_ISTA) {
+        s_sim_regs[U_ISTA/4] &= ~val;
+        return;
+    }
     s_sim_regs[offset/4] = val;
     g_sim_state.reg_ctrl = s_sim_regs[U_CTRL/4];
 
     switch (offset) {
     case U_CTRL:
         if (val & U_CTRL_MEM) g_sim_state.mem_bit_set = true;
+        /* V93: CPM (BIT(3)) must be 0 for CSI-2 mode. BIT(3)=1 → CCP2 → STA=0. */
+        if (val & U_CTRL_CPM)
+            sim_set_error("CTRL: CPM=1 (BIT(3) set) — Unicam in CCP2 mode, sensor sends CSI-2 → STA=0. Remove lane bits from CTRL.");
         if (val & U_CTRL_CPR) {
             /* CPR pulse: ANA must be powered ON at this point */
             if (!g_sim_state.ana_powered_up) {
@@ -320,6 +379,15 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
         }
         break;
 
+    case U_DAT1:
+        if ((val & 0xFFFF) != 0 && (val & 0xFFFF) != 0x02) {
+            if (!g_sim_state.cpr_pulsed) {
+                sim_set_error("DAT1 lane configured BEFORE CPR — CPR will reset it to 0x02 (power-down)! Move DAT1 write to after CPR.");
+            }
+            g_sim_state.dat1_lane_enabled = true;
+        }
+        break;
+
     case U_CLT:
         if (val != 0) g_sim_state.clt_set = true;
         break;
@@ -333,7 +401,7 @@ static void sim_on_write(uint32_t offset, uint32_t val) {
         if (val != 0) {
             g_sim_state.idi0_set = true;
         } else {
-            sim_set_error("IDI0=0 — CSI-2 engine only sees FS short pkts, ignores RAW8 pixel data");
+            sim_set_error("IDI0=0 — packet filter disabled, CSI-2 engine drops all pixel data (use 0x2B for RAW10)");
         }
         break;
 
@@ -428,8 +496,18 @@ static uint32_t sim_on_read(uint32_t offset) {
         return (s_sim_regs[U_DAT0/4] & 0xFFFFu) | (0x0A00u << 16);
 
     case U_DAT1:
-        /* D1hi: unchanged in 1-lane mode (lane disabled, stays at VPU value). */
+        /* D1hi: in 2-lane mode with sensor streaming, D1 should show HS activity.
+         * In 1-lane or pre-stream: LP-11 constant (0xCA00). */
+        if (g_sim_state.dat1_lane_enabled && g_sim_state.sensor_streaming)
+            return (s_sim_regs[U_DAT1/4] & 0xFFFFu) | (0xE000u << 16);
         return (s_sim_regs[U_DAT1/4] & 0xFFFFu) | (0xCA00u << 16);
+
+    case U_IBWP:
+        /* IBWP: after LIP triggers and sensor is streaming, DMA writes data starting
+         * at IBSA0. Simulate write pointer advancing into the buffer. */
+        if (g_sim_state.lip_triggered && g_sim_state.sensor_streaming)
+            return g_sim_state.reg_ibsa0 + 0x600u;  /* partial frame written */
+        return g_sim_state.reg_ibsa0;  /* stuck at start = no DMA activity */
 
     default:
         return s_sim_regs[offset/4];
@@ -550,10 +628,17 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     U_CLRBITS(U_CTRL, U_CTRL_CPE); /* ensure CPE=0 after reset */
     delay_nop(2000);
 
-    /* STEP 4: Full CTRL with PFT and OET timeouts
-     * CTRL_BASE = MEM|PFT=0xF|OET=128 = 0x080F02
+    /* STEP 4: Full CTRL with PFT, OET timeouts
+     *
+     * V93 FIX: Remove V90 lane_bits (0x18). BIT(3) in CTRL is CPM (Camera Port Mode),
+     * not a lane enable. CPM=0=CSI-2, CPM=1=CCP2. V90 set BIT(3)=1 → CCP2 mode →
+     * Unicam tried to decode CCP2 when sensor sent CSI-2 → STA=0 in V90/V91/V92.
+     *
+     * Data lanes are enabled by writing 0x1D to DAT0/DAT1 registers (STEP 10 below).
+     * There are NO lane-enable bits in CTRL. CTRL_BASE=0x080F02 is already correct.
+     * CPM=BIT(3)=0 → CSI-2 mode ✓
      */
-    U_WRITE(U_CTRL, U_CTRL_BASE);
+    U_WRITE(U_CTRL, U_CTRL_BASE);  /* = 0x080F02 (MEM|PFT=0xF|OET=128, CPM=0=CSI-2) */
 
     /* STEP 5: AXI bus priority */
     U_WRITE(U_PRI, 0x00000E85u);
@@ -634,9 +719,12 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     U_WRITE(U_IBSA0, bus_addr);
     U_WRITE(U_IBEA0, bus_addr + FRAME_SZ);
 
-    /* STEP 12: Image pipeline — IPIPE then IDI0 (Linux order) */
-    U_WRITE(U_IPIPE, 0x00u);                    /* PUM_NONE|PPM_NONE = RAW8 passthrough */
-    U_WRITE(U_IDI0, (0u << 6) | 0x2Au);         /* VC=0, DT=RAW8=0x2A */
+    /* STEP 12: Image pipeline — IPIPE then IDI0 (Linux order)
+     * V91: IDI0=0x2B (DT=RAW10). IMX708 has no RAW8 mode — k_imx708_common sets
+     * 0x0112/0x0113=0x0A (RAW10). 52fps at 450Mbps/2-lane confirms 10-bit pixels.
+     * IPIPE=0 = RAW passthrough (same for RAW10 as for RAW8). */
+    U_WRITE(U_IPIPE, 0x00u);                    /* PUM_NONE|PPM_NONE = passthrough */
+    U_WRITE(U_IDI0, (0u << 6) | UNICAM_DT_RAW10); /* VC=0, DT=RAW10 — IMX708 always 0x2B */
 
     /* STEP 13: MISC — frame limit bits FL0=BIT(6), FL1=BIT(9) = 0x240 */
     U_SETBITS(U_MISC, (1u << 6) | (1u << 9));
@@ -653,7 +741,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
 
-    uart_puts("[UNICAM] V89 init complete. CTRL=");
+    uart_puts("[UNICAM] V93 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -757,35 +845,36 @@ void unicam_init() {
 #endif
 
     /* ── Step 0B: Enable Unicam1 clock gate ─────────────────────────────── */
-    /* V88 FIX: CLKGATE = active_data_lanes COUNT (1 or 2), NOT a bitmask.
+    /* V93 FIX: CLKGATE uses shift+OR algorithm with 0x5A000000 password.
      *
-     * Linux bcm2835-unicam.c unicam_start_rx():
-     *   writel(dev->active_data_lanes, dev->clkgate_regs);
-     * where active_data_lanes = number of data lanes (1=1lane, 2=2lane).
-     * This is a LANE COUNT register, not a bitmask of individual lane gates.
+     * Linux bcm2835-unicam.c clk_write():
+     *   static inline void clk_write(struct unicam_device *dev, u32 val) {
+     *       writel(val | 0x5a000000, dev->clk_gate_base);  // always ORs password
+     *   }
+     * val computed as: val=1; for each active_data_lane: val = (val<<2)|1
+     *   1-lane: val = (1<<2)|1 = 5         → write 0x5A000005
+     *   2-lane: val = ((1<<2)|1)<<2|1 = 21 → write 0x5A000015
      *
-     * V83 assumed CLKGATE was a bitmask: BIT(0)=CLK, BIT(2)=D0 → wrote 0x05.
-     * If the hardware uses bits[1:0] as a count field (0=off, 1=1lane, 2=2lane),
-     * writing 0b101=5 is invalid and leaves the clock gate in unknown state →
-     * decoder has no clock → STA=0 forever, even with correct CTRL/ANA/CLK regs.
-     *
-     * For our 1-lane configuration: write 0x01 (= 1 active data lane).
-     * Linux writes 2 for IMX708 in 2-lane mode.
+     * V83 wrote 0x5A000005 for 1-lane (accidentally correct!), then removed the
+     * password thinking it was wrong. V88 changed to lane count (0x01/0x02).
+     * Register is write-only — readback=0x00000000 is normal/expected.
      */
-#ifndef SIMULATION
     {
+        /* 2-lane: val = 1 → (1<<2)|1=5 → (5<<2)|1=21=0x15 → | 0x5A000000 */
+        const uint32_t clkgate_val = 0x5A000015u;  /* V93: 2-lane correct value */
+#ifndef SIMULATION
         uint32_t cg_before = *UNICAM1_CLKGATE;
-        *UNICAM1_CLKGATE = 0x02u;   /* V89: 2 active data lanes (2-lane test) */
+        *UNICAM1_CLKGATE = clkgate_val;
         uint32_t cg_after  = *UNICAM1_CLKGATE;
         uart_puts("[UNICAM] CLKGATE: before="); uart_hex(cg_before);
-        uart_puts(" wrote=0x02 readback="); uart_hex(cg_after); uart_puts("\n");
-    }
+        uart_puts(" wrote=0x5A000015 readback="); uart_hex(cg_after); uart_puts("\n");
 #else
-    g_sim_state.cam1clk_enabled = true;
-    g_sim_state.clkgate_enabled = true;
-    g_sim_state.reg_clkgate = 0x02u;
-    uart_puts("[UNICAM] CLKGATE=0x02 (2-lane data lane count)\n");
+        g_sim_state.cam1clk_enabled = true;
+        g_sim_state.clkgate_enabled = true;
+        g_sim_state.reg_clkgate = clkgate_val;
+        uart_puts("[UNICAM] CLKGATE=0x5A000015 (2-lane, shift+OR algo with password)\n");
 #endif
+    }
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
     setup_unicam_block(U1);
@@ -849,6 +938,27 @@ bool unicam_capture_frame() {
         uart_puts("[SIM]   (If DAT0 was written before CPR, CPR reset it to power-down!)\n");
         ok = false;
     }
+    /* 2-lane validation: if sensor configured for 2 lanes, DAT1 must be enabled */
+    if (g_sim_state.sensor_lane_count >= 2 && !g_sim_state.dat1_lane_enabled) {
+        uart_puts("[SIM] FAIL: Sensor in 2-lane mode (0x0114=0x01) but DAT1 not enabled\n");
+        uart_puts("[SIM]   Sensor sees no 100Ohm termination on D1 -> keeps both lanes LP-11\n");
+        uart_puts("[SIM]   Fix: write DAT1=0x1D (after CPR, same as DAT0)\n");
+        ok = false;
+    }
+    /* V93: CLKGATE must use shift+OR algorithm with 0x5A000000 password.
+     * Expected: 1-lane=0x5A000005, 2-lane=0x5A000015 */
+    if (g_sim_state.clkgate_enabled) {
+        uint32_t expected_cg = 0x5A000000u;
+        uint32_t val = 1u;
+        for (int i = 0; i < (int)g_sim_state.sensor_lane_count; i++)
+            val = (val << 2) | 1u;
+        expected_cg |= val;
+        if (g_sim_state.reg_clkgate != expected_cg) {
+            uart_puts("[SIM] WARN: CLKGATE="); uart_hex(g_sim_state.reg_clkgate);
+            uart_puts(" expected="); uart_hex(expected_cg);
+            uart_puts(" (shift+OR algo: val=1; for each lane: val=(val<<2)|1)\n");
+        }
+    }
     if (!g_sim_state.clt_set) {
         uart_puts("[SIM] FAIL: CLT not written — clock timing undefined\n");
         ok = false;
@@ -889,6 +999,16 @@ bool unicam_capture_frame() {
         uart_puts("[SIM] FAIL: CPE never set — Unicam peripheral not enabled\n");
         ok = false;
     }
+    /* V93: Verify CTRL CPM field = 0 (CSI-2 mode, not CCP2).
+     * BIT(3) = CPM_MASK. CPM=0=CSI-2, CPM=1=CCP2.
+     * V90 accidentally set BIT(3)=1 (CCP2) by adding "lane_bits=0x18". */
+    if (g_sim_state.reg_ctrl & (1u << 3)) {
+        uart_puts("[SIM] FAIL: CTRL CPM=1 (CCP2 mode)! Must be CPM=0 (CSI-2).\n");
+        uart_puts("[SIM]   CTRL="); uart_hex(g_sim_state.reg_ctrl);
+        uart_puts("  BIT(3)=1 means Unicam is decoding CCP2, not MIPI CSI-2.\n");
+        uart_puts("[SIM]   Fix: CTRL = U_CTRL_BASE (0x080F02), no extra BITs.\n");
+        ok = false;
+    }
     if (!g_sim_state.lip_triggered) {
         uart_puts("[SIM] FAIL: LIP never triggered — DMA address registers not latched\n");
         ok = false;
@@ -919,23 +1039,33 @@ bool unicam_capture_frame() {
     uart_puts("  IBEA0=");      uart_hex(g_sim_state.reg_ibea0);
     uart_puts("\n");
 
-    /* Fill frame buffer with synthetic RAW8 RGGB test pattern */
+    /* Fill frame buffer with synthetic RAW10-packed RGGB test pattern.
+     * CSI-2 RAW10 packed: every 5 bytes hold 4 pixels (8 MSBs in bytes 0-3,
+     * 2 LSBs packed into byte 4). Debayer sees: RGGB pattern at 1536x864. */
     for (int y = 0; y < FRAME_H; y++) {
-        for (int x = 0; x < FRAME_W; x++) {
-            /* Simple gradient + Bayer pattern */
-            uint8_t pixel;
-            bool isR  = ((y & 1) == 0) && ((x & 1) == 0);
-            bool isG1 = ((y & 1) == 0) && ((x & 1) == 1);
-            bool isG2 = ((y & 1) == 1) && ((x & 1) == 0);
-            bool isB  = ((y & 1) == 1) && ((x & 1) == 1);
-            (void)isG1; (void)isG2;
-            if (isR)       pixel = 200 + (x % 55);    /* bright red channel */
-            else if (isB)  pixel = 50  + (y % 50);    /* dim blue channel */
-            else           pixel = 120 + ((x + y) % 30); /* medium green */
-            g_raw_frame[y * FRAME_W + x] = pixel;
+        uint8_t* row = g_raw_frame + y * FRAME_W;
+        /* Each group of 5 bytes covers 4 horizontal pixels */
+        for (int grp = 0; grp < FRAME_W / 5; grp++) {
+            int px = grp * 4;  /* pixel column (0, 4, 8, ...) */
+            uint16_t p[4];
+            for (int k = 0; k < 4; k++) {
+                int col = px + k;
+                bool isR = ((y & 1) == 0) && ((col & 1) == 0);
+                bool isB = ((y & 1) == 1) && ((col & 1) == 1);
+                uint16_t v;
+                if (isR)      v = (200 + (col % 55)) << 2;
+                else if (isB) v = (50  + (y   % 50)) << 2;
+                else          v = (120 + ((col + y) % 30)) << 2;
+                p[k] = v;  /* 10-bit pixel value */
+            }
+            row[grp*5+0] = (uint8_t)(p[0] >> 2);
+            row[grp*5+1] = (uint8_t)(p[1] >> 2);
+            row[grp*5+2] = (uint8_t)(p[2] >> 2);
+            row[grp*5+3] = (uint8_t)(p[3] >> 2);
+            row[grp*5+4] = (uint8_t)(((p[0]&3)<<6)|((p[1]&3)<<4)|((p[2]&3)<<2)|(p[3]&3));
         }
     }
-    uart_puts("[SIM] Synthetic RAW8 RGGB frame written (1536x864).\n");
+    uart_puts("[SIM] Synthetic RAW10-packed RGGB frame written (1536x864).\n");
     return true;
 
 #else

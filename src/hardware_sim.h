@@ -56,14 +56,29 @@
 #define U_CTRL_CPE   (1u << 0)      /* Control Peripheral Enable */
 #define U_CTRL_MEM   (1u << 1)      /* Memory/DMA Interface Enable */
 #define U_CTRL_CPR   (1u << 2)      /* Control Peripheral Reset */
+/* bits [4:3] = CPM/SOE fields — NOT lane enables (V93 root cause fix):
+ *   BIT(3) = CPM (Camera Port Mode): 0=CSI-2, 1=CCP2.
+ *   BIT(4) = SOE (Sync-On-Enable).
+ *   UNICAM_DAT_LANES_SHIFT=3 does NOT exist in bcm2835-unicam.c.
+ *   Data lanes are enabled by writing 0x1D to DAT0/DAT1 (offsets 0x018/0x01C).
+ *   Setting BIT(3)=1 switches to CCP2 mode → STA=0 with a CSI-2 sensor. */
+#define U_CTRL_CPM        (1u << 3) /* Camera Port Mode: 0=CSI-2 (default), 1=CCP2 */
+#define U_CTRL_SOE        (1u << 4) /* Sync-On-Enable */
 /* bits [15:8] = PFT_MASK (Packet Framer Timeout) */
 /* bits [20:12] = OET_MASK (Output Enable Timeout) */
 /* NOTE: BIT(14) is NOT "LSM" — it is part of OET_MASK! */
 
 /* Combined CTRL value from Linux bcm2835-unicam.c for CSI-2:
  * MEM=BIT(1) | PFT=0xF<<8 | OET=128<<12 = 0x080F02
- * With CPE: 0x080F03 */
+ * CPM=0 (BIT(3)=0) ensures CSI-2 mode — do NOT add lane bits to CTRL.
+ * After CPE: 0x080F03. Data lane count set via DAT0/DAT1 registers only. */
 #define U_CTRL_BASE  0x00080F02u
+
+/* ─── IDI0 Register: CSI-2 Data Types ────────────────────────────────────── */
+/* IDI0 = (VC << 6) | DT — only packets matching this VC+DT are captured.
+ * IMX708 has no RAW8 mode; it always sends DT=0x2B (RAW10 packed). */
+#define UNICAM_DT_RAW8   0x2Au   /* CSI-2 data type RAW8  (IMX708 does NOT send this) */
+#define UNICAM_DT_RAW10  0x2Bu   /* CSI-2 data type RAW10 — IMX708 default output */
 
 /* ─── ICTL Register Bit Fields ───────────────────────────────────────────── */
 #define U_ICTL_FSIE  (1u << 0)   /* Frame Start Interrupt Enable */
@@ -77,6 +92,8 @@
 #define U_ISTA_FEI   (1u << 1)   /* Frame End Interrupt */
 
 /* ─── STA Register Bit Fields ────────────────────────────────────────────── */
+#define U_STA_FS     (1u <<  0)  /* Frame Start received */
+#define U_STA_FE     (1u <<  1)  /* Frame End received */
 #define U_STA_PI0    (1u << 15)  /* CMP0 match — secondary FE detection */
 
 /* ─── ANA Register Bit Fields ────────────────────────────────────────────── */
@@ -89,7 +106,8 @@
  * If any step is missing/wrong, captures the first error as a string. */
 struct UnicamSimState {
     /* Clocking */
-    bool clkgate_enabled;       /* CLKGATE at 0x3F802004 written with password */
+    bool cam1clk_enabled;       /* CM_CAM1CTL at 0x3F101048 configured (ENAB=1) */
+    bool clkgate_enabled;       /* CLKGATE at 0x3F802000 written with password (0x5A000015 for 2-lane) */
 
     /* D-PHY power sequence */
     bool mem_bit_set;           /* CTRL: MEM=1 */
@@ -101,6 +119,7 @@ struct UnicamSimState {
     /* Lane configuration */
     bool clk_lane_enabled;      /* CLK lower bits set (non-zero) */
     bool dat0_lane_enabled;     /* DAT0 lower bits set (non-zero) */
+    bool dat1_lane_enabled;     /* DAT1 lower bits set (non-zero) — required for 2-lane */
 
     /* Timing */
     bool clt_set;               /* CLT timing register written */

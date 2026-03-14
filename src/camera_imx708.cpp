@@ -35,7 +35,7 @@ bool imx708_probe() {
 bool imx708_init() {
 #ifdef SIMULATION
     uart_puts("[SIM] Bypass I2C: IMX708 simulated present (ID=0x0708)\n");
-    g_sim_state.sensor_lane_count = 1;   /* 1-lane mode for V76 */
+    g_sim_state.sensor_lane_count = 2;   /* V89: 2-lane test (0x0114=0x01) */
     return true;
 #endif
 
@@ -56,32 +56,23 @@ bool imx708_init() {
         i2c_write_reg16(IMX708_ADDR, k_imx708_init[i].reg, k_imx708_init[i].val);
     }
 
-    /* V89: TEST 2-LANE mode — re-evaluate V73 "2-lane SILENT" conclusion.
+    /* V91: Use native RAW10 — remove RAW8 override.
      *
-     * V73 tested 2-lane but had the CPR bug: CLK/DAT0 configured BEFORE CPR,
-     * then CPR wiped them to 0x02 (power-down). With CLK lane in power-down,
-     * Unicam never asserted 100Ω termination on CLK or D1. The sensor sees
-     * missing termination on D1 → keeps both lanes in LP-11 → "SILENT".
+     * k_imx708_common sets 0x0112/0x0113=0x0A (RAW10) and 0x0114=0x01 (2-lane).
+     * IMX708 has NO RAW8 output mode. Previous 0x0112=0x08 write was ignored:
+     * sensor kept sending DT=0x2B (RAW10), but Unicam IDI0=0x2A expected DT=0x2A
+     * (RAW8) → packet filter dropped every pixel packet → STA=0 forever.
+     * Proof: frame_count=52fps at 450Mbps/2-lane = 10 bits/pixel (RAW10 math).
      *
-     * V73 diagnosis ("sensor SILENT") was actually the CPR bug, not a physical
-     * D1 connectivity problem. With V81 CPR fix + DAT1=0x1D (termination on D1),
-     * the sensor in 2-lane mode should now see proper 100Ω on both D0 and D1
-     * and transition to HS on both lanes.
-     *
-     * k_imx708_common already sets 0x0114=0x01 (2-lane). We no longer override.
-     * If 2-lane works (STA fires): V73's "silent" was CPR bug, D1 IS connected.
-     * If 2-lane also fails: decoder issue independent of lane count.
-     */
-    i2c_write_reg16(IMX708_ADDR, 0x0112, 0x08);  /* RAW8 MSB */
-    i2c_write_reg16(IMX708_ADDR, 0x0113, 0x08);  /* RAW8 LSB */
-    i2c_write_reg16(IMX708_ADDR, 0x0114, 0x01);  /* V89: 2-lane test (k_imx708_common default) */
+     * V91 fix: remove RAW8 override, let sensor use native RAW10 (0x0A/0x0A).
+     * Unicam IDI0 changed to 0x2B (RAW10). IBLS changed to 1920 (1536*10/8). */
     i2c_write_reg16(IMX708_ADDR, 0x0100, 0x00);  /* standby until stream_on() */
 
     uint8_t lane_mode = i2c_read_reg16(IMX708_ADDR, 0x0114);
     uint8_t pixel_fmt = i2c_read_reg16(IMX708_ADDR, 0x0112);
-    uart_puts("[IMX708] V89: 0x0114="); uart_dec((int)lane_mode);
+    uart_puts("[IMX708] V91: 0x0114="); uart_dec((int)lane_mode);
     uart_puts(" (0=1lane,1=2lane)  0x0112="); uart_dec((int)pixel_fmt);
-    uart_puts(" (8=RAW8)\n");
+    uart_puts(" (10=RAW10 expected)\n");
     return true;
 }
 

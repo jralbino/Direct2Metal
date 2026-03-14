@@ -11,8 +11,9 @@ void uart_hex(uint32_t d) {
     for(int i=28; i>=0; i-=4) {
         int n = (d >> i) & 0xF;
         n += n > 9 ? 0x37 : 0x30;
-        *((volatile uint32_t*)0x3F201000) = n; 
-        while (*((volatile uint32_t*)0x3F201018) & (1 << 5)); 
+        /* Wait for TX FIFO not full BEFORE writing (fixes character drop bug) */
+        while (*((volatile uint32_t*)0x3F201018) & (1 << 5));
+        *((volatile uint32_t*)0x3F201000) = n;
     }
 }
 

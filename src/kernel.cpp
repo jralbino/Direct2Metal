@@ -458,5 +458,17 @@ extern "C" void kernel_main() {
     init_mmu();
     if (!camera_init()) uart_puts("[CAM] No camera found, using test_image\r\n");
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
+#ifdef SIMULATION
+    /* In simulation mode: run 3 frames to verify the pipeline, then exit QEMU
+     * cleanly via AArch64 semihosting HLT #0xF000 (QEMU processes this as
+     * ADP_Stopped_ApplicationExit and terminates with return code 0). */
+    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_yolo_complete();
+    uart_puts("[SIM] All simulation frames complete — exiting QEMU.\n");
+    register uint64_t _x0 asm("x0") = 0x20026; /* ADP_Stopped_ApplicationExit */
+    register uint64_t _x1 asm("x1") = 0;       /* exit code 0 = success */
+    asm volatile("hlt #0xf000" :: "r"(_x0), "r"(_x1));
+    __builtin_unreachable();
+#else
     while(1) run_yolo_complete();
+#endif
 }
