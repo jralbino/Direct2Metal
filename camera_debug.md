@@ -5,7 +5,7 @@
 | Fact | Evidence |
 |------|----------|
 | D0/D1 physically crossed on Pi Zero 2W FFC | V17(LSM=1)→WP+4096 vs V19(LSM=0)→WP=IBSA0 |
-| DMA bus alias must be 0x40000000 (ARM AXI) | 0xC0000000 (VC GPU bus) → silent DMA fail (V18) |
+| DMA bus alias: IBSA0 must be 0xC0000000 (VC bus) | Pi OS IBWP=0xCBD95000=0xC0000000\|phys; 0x40000000 (V18–V104) = wrong bus alias for Unicam (V105) |
 | IDI0=0x00 required | IDI0=0x2A filtered ALL packets (V20) — sensor sends non-RAW8 embedded data first |
 | IPIPE=1 required | IPIPE=0 disconnects CSI-2→DMA routing |
 | BSC1 probe first | BSC0 has spurious DONE from VPU boot scan |
@@ -322,16 +322,494 @@ Fix: IDI0=0x2B, FRAME_W=1920 (1536px×10bit/8), FRAME_SZ=1,658,880.
 D0hi=D1hi=51712 (LP-11, caught in blanking). STA=0 STILL.
 
 ### V93 — ROOT CAUSE FIX: CPM=0 (CSI-2) + CLKGATE=0x5A000015
-**Status**: Code written, NOT YET TESTED ON HARDWARE. Last git commit = V89 (a817135).
-V90-V93 changes are in working tree, uncommitted.
-
 Fixes:
 1. CTRL = 0x080F02 (U_CTRL_BASE, no lane_bits) → CPM=0=CSI-2 ✓
 2. CLKGATE = 0x5A000015 (shift+OR algo with password, 2-lane)
 
-Expected: CTRL=0x00080F03 in diagnostic, STA>0 (FS/FE set), IBWP advancing.
+**Hardware V93 result (2-lane, CPR active)**:
+- CTRL=0x00080F03 ✓ (CPM=0=CSI-2 confirmed)
+- D-PHY post-stream: CLK=0xE000001D, DAT0=0xE000001D, DAT1=0xE000001D (ALL lanes HS active) ✓
+- Frame count via I2C = 52 (sensor streaming at 52fps) ✓
+- **STA=0x00000000 PERSISTENT** — CSI-2 byte-sync never achieves lock
+- IBWP=IBSA0 (zero DMA writes)
+- STA is W1C sticky → STA=0 at every 100ms poll = ZERO Frame Start ever received in 500ms
 
-**Known inconsistency in code**: `hardware_sim.h` lines 59-64 still describe BIT(3)/BIT(4) as
-"lane enable bits" (V90 interpretation). Comments are wrong per V93. The simulator runtime
-check (line ~1002) correctly checks CPM=0, but the #define comments are misleading.
-Also: UnicamSimState.clkgate_enabled comment still says "0x3F802004" (should be 0x3F802000).
+### V94 — DIAGNOSTIC: 1-lane mode
+**Hypothesis**: STA=0 could be 2-lane specific (Unicam lane-count register we haven't found).
+
+Changes:
+- IMX708: 0x0114=0x00 (1-lane override)
+- Unicam: DAT1=0x00 (D1 disabled), CLKGATE=0x5A000005 (1-lane formula)
+- CMP0 write removed (not in Linux start_rx, BIT(31) may interfere)
+
+**Hardware V94 result**:
+- 0x0114=0 confirmed (1-lane) ✓
+- D1hi=51712=0xCA00 constant (LP-11, D1 disabled correctly) ✓
+- D0hi=57344=0xE000 post-stream (D0 HS active) ✓
+- frame_count=52 in 1-lane too (sensor outputs same fps either way)
+- **STA=0x00000000 STILL** — issue is NOT 2-lane specific; it's fundamental
+
+**Conclusion**: 1-lane and 2-lane both fail identically. Lane count ruled out.
+
+### V95 — Skip CPR (preserve VPU DDL calibration hypothesis)
+**Hypothesis**: Our CPR pulse destroys the D-PHY DDL calibration that VPU's dtoverlay=imx708
+performs at boot. config.txt notes: "D-PHY analog frontend calibration REQUIRED for MIPI lock."
+
+New data from V95 diagnostics:
+- `ANA (VPU): 0x00000777` — VPU left D-PHY powered DOWN (APD=BPD=AR=1)
+- `CLK pre-write (VPU state): 0xCD000002` — VPU left CLK in power-down (lower=0x02)
+- `DAT0=0x0A000002` — VPU left DAT0 in power-down
+
+Changes:
+- CPR skipped entirely (STEP 3 commented out)
+- ANA: direct 0x770 write (no 0x774 AR intermediate), to avoid disturbing VPU calibration
+- Diagnostic: print CLK/DAT0 VPU state before our writes
+
+**Hardware V95 result**:
+- Fast-poll not added yet; periodic 100ms polls: STA=0 throughout
+- D0hi=0xE000 post-stream (D0 HS active) ✓
+- **STA=0x00000000 STILL** — CPR skip does NOT fix the issue
+
+**Conclusion**: CPR (or no CPR) is irrelevant. VPU DDL calibration hypothesis falsified.
+
+### V96 — AR pulse restored + no CPR (untested combination)
+**Hypothesis**: The 0x774→0x770 AR pulse sequence triggers D-PHY DLL calibration. Skipping it
+(V95's direct 0x770) leaves the DLL uncalibrated. We had NEVER tested AR pulse + no CPR together.
+
+New data from V96 diagnostics:
+- `VPU init state: CTRL=0x00000000 STA=0x00000000 CLT=0x00000000 DLT=0x00000000`
+  → VPU leaves ALL Unicam MMIO registers at 0. dtoverlay=imx708 does NOT configure Unicam.
+- Fast-poll (50ms, 1ms resolution) immediately after stream_on: `STA_accum=0x00000000`
+  → Not even ONE Frame Start event in first 50ms. CSI-2 decoder is completely deaf.
+
+Changes:
+- ANA: restored 0x774→0x770 sequence (Linux exact, AR calibration pulse)
+- CPR: still skipped
+- Init diagnostics: CTRL/STA/CLT/DLT readout before any writes
+- Capture loop: fast-poll 50ms at ~1ms resolution before regular 100ms polling
+
+**Hardware V96 result**:
+- VPU init state: CTRL=0 STA=0 CLT=0 DLT=0 → confirmed VPU doesn't touch Unicam
+- ANA (VPU): 0x777 → we write 0x774→0x770 ✓
+- D0hi=0xE000 post-stream (D0 HS active) ✓, D1hi=0xCA00 (D1 disabled) ✓
+- Fast-poll: **STA_accum=0x00000000, ISTA_accum=0x00000000** (50ms, 50 samples)
+- Periodic polls: STA=0, ISTA=0 throughout 500ms
+- **STA=0x00000000 STILL** — AR pulse + no CPR does NOT fix the issue
+
+**Conclusion**: All ANA sequences (AR/no-AR) and CPR states (CPR/no-CPR) exhausted. STA=0 in all.
+
+## Exhausted Hypotheses Matrix
+
+| ANA sequence | CPR | Lane | Result |
+|---|---|---|---|
+| 0x774→0x770 (AR pulse) | Yes | 2-lane | STA=0 (V84–V93) |
+| 0x774→0x770 (AR pulse) | Yes | 1-lane | STA=0 (V94) |
+| 0x770 direct (no AR) | No | 1-lane | STA=0 (V95) |
+| 0x774→0x770 (AR pulse) | No | 1-lane | STA=0 (V96) |
+| 0x770 direct (no AR) | No | 2-lane | NOT YET TESTED |
+
+## Remaining Hypotheses (V97+)
+
+### 1. CM_CAM1 wrong frequency (HIGHEST PRIORITY)
+Our CM_CAM1=100MHz (PLLD/5=500/5). Linux might use a different rate. The CLT/DLT settle
+counters are timed by CM_CAM1. If Linux uses 200MHz, our settle=6 at 100MHz = 60ns but
+Linux's settle=6 at 200MHz = 30ns. At 690Mbps 1-lane: T_HS-ZERO-min ≈ 46ns. If the
+settle timer counts from start of HS-0 (not LP-00), 60ns > 46ns → misses SYNC → STA=0.
+
+**V97 action**: Try CLT=DLT=0x0302 (settle=3, 30ns at 100MHz) and 0x0102 (10ns).
+Alternatively: set CM_CAM1 to 200MHz (PLLD/2.5 or PLLD/2) and keep settle=6.
+
+### 2. Linux /dev/mem register dump (DEFINITIVE)
+Boot Pi OS on the Pi Zero 2W, run camera with libcamera, dump Unicam1 registers at
+0x3F801000 via /dev/mem while streaming. Compare ALL register values with ours.
+
+```bash
+# On Pi OS with camera working:
+sudo apt install python3
+sudo python3 -c "
+import mmap, struct, os
+f = open('/dev/mem', 'rb')
+m = mmap.mmap(f.fileno(), 4096, offset=0x3F801000, access=mmap.ACCESS_READ)
+regs = ['CTRL','STA','ANA','?','CLK','CLT','DAT0','DAT1','?','?','DLT']
+for i,name in enumerate(regs):
+    val = struct.unpack('<I', m[i*4:(i+1)*4])[0]
+    print(f'[0x{i*4:03X}] {name:6s} = 0x{val:08X}')
+# Also print key CSI2 regs
+for off,name in [(0x100,'ICTL'),(0x104,'ISTA'),(0x108,'IDI0'),(0x10C,'IPIPE'),
+                 (0x110,'IBSA0'),(0x114,'IBEA0'),(0x118,'IBLS'),(0x11C,'IBWP'),
+                 (0x400,'MISC')]:
+    val = struct.unpack('<I', m[off:off+4])[0]
+    print(f'[0x{off:03X}] {name:6s} = 0x{val:08X}')
+"
+```
+
+### 3. IMX708 register verification
+Verify that k_imx708_common[] and k_imx708_init[] are writing correctly by reading back
+multiple registers after initialization (not just 0x0114 and 0x0112).
+Key registers to check: 0x0101 (mode), 0x0110 (CSI clock), 0x012D (lane speed).
+
+### 4. 2-lane + no CPR (untested)
+V96 fixed 1-lane. 2-lane + no CPR has also never been tested. Unlikely to help given
+V94 ruled out lane count, but eliminates one cell from the matrix.
+
+## V97 — A2: Settle timing sweep (FALSIFIED)
+
+**Hypothesis**: CLT/DLT settle counter clocks from CM_CAM1. At 100MHz, settle=6=60ns.
+If settle timer starts from HS-0 (not LP-00), 60ns > 46ns T_HS-ZERO-min → misses SYNC.
+
+**V97 changes:**
+- Settle sweep: try CLT=DLT for settle values 5,4,3,2,1 at 100MHz while sensor streams
+- Each value tested ~100ms (5 frame intervals at 52fps)
+- A3: IMX708 extended readback (bin_type, fmt, mode)
+- V98 bug fix: watchdog_kick() added inside sweep loop (V97 crashed at settle=5 due to watchdog)
+
+**Hardware V97/V98 results:**
+- A3 confirmed: `fmt=0x00000A0A` ✓, `bin_en=1` ✓, `bin_type=0x00000022` ✓
+  → sensor IS correctly configured 2×2 binned RAW10. Discards sensor misconfiguration hypothesis.
+- Settle sweep: STA=0 for ALL values (settle=5=50ns, 4=40ns, 3=30ns, 2=20ns, 1=10ns)
+  → Even at 10ns settle (essentially instant), CSI-2 decoder sees ZERO Frame Start packets.
+
+**Conclusion**: Settle timing is DEFINITIVELY NOT the root cause.
+The D-PHY byte aligner cannot achieve byte sync regardless of when the receiver arms.
+
+## V99 — V97c: CM_CAM1=250MHz (digital decoder frequency)
+
+**Hypothesis**: CM_CAM1 clocks the CSI-2 digital decoder (not just the settle counter).
+At 690Mbps 1-lane, byte clock = 86.25MHz. If the Unicam digital decoder requires ≥200MHz
+for correct pipeline operation (some designs have minimum operating frequency constraints),
+running at 100MHz might cause the decoder to malfunction.
+
+Also: at 250MHz, settle=6 = 6×4ns = 24ns — shorter than T_HS-ZERO-min=46ns, meaning we
+arm correctly inside the HS-0 preamble (unlike 100MHz where settle=6=60ns > 46ns if timer
+starts from HS-0 reference point).
+
+**V99 changes:**
+- CM_CAM1: PLLD/5=100MHz → PLLD/2=250MHz (DIVI=2, integer division, no MASH needed)
+- CLT=DLT: kept at 0x0602 (settle=6 = 24ns at 250MHz — now correctly inside T_HS-ZERO window)
+- Settle sweep removed (proven useless in V97/V98)
+- If V99 STA>0 → CM_CAM1 frequency was the root cause
+- If V99 STA=0 → ALL code-level hypotheses exhausted → MUST do A1 (Linux /dev/mem dump)
+
+**Hardware V99 results (TESTED):**
+```
+CM_CAM1CTL after: 662 (BUSY=1)
+CM_CAM1DIV=8192 = 0x2000 = (2<<12) → 250 MHz CONFIRMED
+CLK=0x2D00001D (CLKhi=11520, HS active) ✓
+DAT0=0xE000001D (D0hi=57344, HS bursts) ✓
+DAT1=0xCA000000 (D1hi=51712, LP-11, 1-lane expected) ✓
+CLKGATE readback=0x00000005 (NEW: register stores low bits without password; previously always 0)
+STA=0x00000000 PERSISTENT ✗ — same as every version since V81
+V99 fast-poll (50ms): STA_accum=0x00000000 ISTA_accum=0x00000000
+```
+
+**Conclusion**: CM_CAM1 frequency was NOT the root cause. 250 MHz ≡ 100 MHz in terms of result.
+
+**Complete Exhausted Hypothesis Matrix (12 scenarios, all STA=0):**
+
+| ANA | CPR | Lanes | Settle | CM_CAM1 | STA |
+|-----|-----|-------|--------|---------|-----|
+| 0x774→0x770 | Yes | 2-lane | 6 | 100MHz | 0 (V84–V93) |
+| 0x774→0x770 | Yes | 1-lane | 6 | 100MHz | 0 (V94) |
+| 0x770 direct | No | 1-lane | 6 | 100MHz | 0 (V95) |
+| 0x774→0x770 | No | 1-lane | 6 | 100MHz | 0 (V96) |
+| 0x774→0x770 | No | 1-lane | 5,4,3,2,1 | 100MHz | 0 (V97/V98) |
+| 0x774→0x770 | No | 1-lane | 6 | 250MHz | 0 (V99) |
+
+---
+
+## New Hypothesis: VPU Power Domain (UNRESOLVED)
+
+The mailbox power state response has been declared "harmless" without verification.
+
+- GET_POWER_STATE(0x0D): returns `state=0x02`
+- SET_POWER_STATE(0x0D, 0x03): returns `state=0x02` (unchanged)
+
+If `bit0=power_on (1=on)` and `bit1=device_exists`, then:
+- 0x02 = bit0=0 (OFF) + bit1=1 (exists) → **Unicam1 is NOT powering on**
+- Our SET(0x03) should return 0x03 (on+wait) if successful → returning 0x02 = FAILURE
+
+If Unicam1 digital decoder is power-gated:
+- MMIO registers accessible ✓ (AXI bus fabric is always-on)
+- CLKhi/D0hi counters change ✓ (D-PHY analog frontend is always-on, separate rail)
+- STA=0 ✓ (CSI-2 decode engine = frozen/power-gated)
+
+This would explain ALL observed behavior perfectly.
+
+**Test without Pi OS (V100 diagnostic)**:
+- Poll GET_POWER_STATE for multiple device IDs (0x00, 0x01, 0x0C=CAM0, 0x0D=CAM1) to understand response encoding
+- If CAM0 (0x0C) returns 0x03 after SET but CAM1 (0x0D) still returns 0x02 → the VPU refuses to power on CAM1 on this firmware/hardware combo
+
+---
+
+## V100 Results — Power Domain Sweep + CPR Post-Stream (2026-03-17)
+
+### Power Domain Sweep
+
+| Device | ID | GET state | After SET(0x03) | Meaning |
+|--------|-----|-----------|-----------------|---------|
+| SD   | 0x00 | 0x01 | — | ON? (bit0=1 but not bit1) |
+| UART | 0x01 | 0x00 | — | OFF/unknown |
+| USB  | 0x03 | 0x00 | — | OFF/unknown |
+| CAM0 | 0x0C | 0x02 | 0x02 | OFF+exists |
+| CAM1 | 0x0D | 0x02 | 0x02 | OFF+exists — SET had no effect |
+| DSP0 | 0x0E | 0x02 | 0x02 | OFF+exists |
+
+**Conclusion:** SET_POWER_STATE(CAM1, 0x03) returns unchanged 0x02. The VPU firmware accepted the
+message but power-on had no visible effect. AMBIGUOUS: SD returns 0x01 (not 0x03), so encoding
+may differ from published spec. Cannot determine if 0x02 means "truly power-gated" without
+/dev/mem comparison showing working Linux state.
+
+### CPR Post-Stream (V100/V101)
+
+**FALSIFIED**: CPR post-stream → STA=0 both before and after CPR in every frame.
+CPR at any time (pre- or post-stream) makes no difference.
+
+**Bug discovered in V100, fixed in V101**: CPR clears ICTL and MISC:
+- ICTL: 0x07 → 0x04 (lost FSIE + FEIE)
+- MISC: 0x240 → 0x000 (lost FL0 + FL1)
+V101 fix: restore ICTL=0x07, MISC|=0x240, re-assert CPE, trigger LIP strobe after CPR.
+V101 confirmed: ICTL=0x00000007 MISC=0x00000240 in post-CPR state ✓
+
+---
+
+## V101 Results — ICTL/MISC Fix Confirmed, STA Still 0 (2026-03-17)
+
+```
+V101 CPR-post-stream: post-CPR state:
+  CLK=0x0D00001D DAT0=0xE000001D ICTL=0x00000007 MISC=0x00000240 CTRL=0x00080F03
+V101 fast-poll (50ms): STA_accum=0x00000000 ISTA_accum=0x00000000
+```
+
+Frame dumps (Frames 1–5, identical):
+- CTRL=0x00080F03, ANA=0x00000770, CLK=0x2D00001D (CLKhi=11520 HS)
+- DAT0=0x2600001D (D0hi=9728 HS), DAT1=0xCA000000 (D1 disabled, upper=LP counter)
+- IDI0=0x0000002B, IPIPE=0x00000000, IBLS=0x00000780
+- STA=0x00000000, ISTA=0x00000000, IBWP=0x42240200=IBSA0 (zero DMA)
+- CM_CAM1CTL=662 (BUSY=1), CM_CAM1DIV=8192 (DIVI=2 → 250MHz) ✓
+
+**Note on DAT1=0xCA000000**: We write 0x00 (1-lane disabled). Upper 16 bits = 0xCA00 = 51712 = D1hi
+lane counter (live status in upper bits, config in lower bits). This is normal — D1 physically
+present in LP-11 even when disabled in config.
+
+**Conclusion after V101 (14 scenarios, STA=0 in all):** All software configuration variables are
+correct and all code paths exhausted. The CSI-2 byte decoder never receives a valid SYNC. The
+only remaining actions are physical (A4: FFC cable) and diagnostic (A1: /dev/mem in Pi OS).
+
+---
+
+## COMPLETE Exhausted Hypothesis Matrix (V84–V101)
+
+| ANA | CPR | Lanes | Settle | CM_CAM1 | CPR post-stream | ICTL/MISC | STA |
+|-----|-----|-------|--------|---------|-----------------|-----------|-----|
+| 0x774→0x770 | Yes | 2-lane | 6 | 100MHz | No | Partial | 0 (V84–V93) |
+| 0x774→0x770 | Yes | 1-lane | 6 | 100MHz | No | Partial | 0 (V94) |
+| 0x770 direct | No | 1-lane | 6 | 100MHz | No | Partial | 0 (V95) |
+| 0x774→0x770 | No | 1-lane | 6 | 100MHz | No | Partial | 0 (V96) |
+| 0x774→0x770 | No | 1-lane | 5,4,3,2,1 | 100MHz | No | Partial | 0 (V97/V98) |
+| 0x774→0x770 | No | 1-lane | 6 | 250MHz | No | Partial | 0 (V99) |
+| 0x774→0x770 | No | 1-lane | 6 | 250MHz | Yes (buggy) | Buggy | 0 (V100) |
+| 0x774→0x770 | No | 1-lane | 6 | 250MHz | Yes (fixed) | Full ✓ | 0 (V101) |
+
+---
+
+## ~~A4~~ — Physical FFC cable inspection ← COMPLETADO (SIN EFECTO)
+
+Reseated cable (audible click, correct orientation). STA=0 unchanged. Cable ruled out.
+
+---
+
+## ~~A1~~ — Pi OS /dev/mem Ground Truth ← COMPLETADO (2026-03-17)
+
+Ran via `busybox devmem` (Python mmap failed with CONFIG_STRICT_DEVMEM).
+**Ground truth with libcamera-vid active:**
+
+| Register | Pi OS value | Our V101 | Difference |
+|----------|-------------|----------|------------|
+| CTRL | 0x00080F03 | 0x00080F03 | ✓ same |
+| STA | 0x00000002 (FS set!) | 0x00000000 | ← |
+| ANA | 0x00000770 | 0x00000770 | ✓ same |
+| CLK | **0x06000005** | 0x2D00001D | lower=0x0005 (no CLHSE/CLTRE!) |
+| CLT | 0x00000602 | 0x00000602 | ✓ same |
+| DAT0 | **0xC0000005** | 0xE000001D | lower=0x0005 |
+| DAT1 | **0xC0000005** | 0xCA000000 | 2-lane! both active |
+| DLT | 0x00000602 | 0x00000602 | ✓ same |
+| CMP0 | 0x80000301 | removed V94 | added back V102 |
+| ICTL | **0x00D80007** | 0x00000007 | upper DMA enable bits |
+| IDI0 | 0x0000002B | 0x0000002B | ✓ same |
+| IBLS | 0x00000780 | 0x00000780 | ✓ same |
+| IBWP | 0xCBD95000 (moving!) | 0x42240200=IBSA0 | DMA active in Pi OS |
+| MISC | 0x00000240 | 0x00000240 | ✓ same |
+| CM_CAM1CTL | 0x296 (100MHz!) | 0x662 (250MHz) | |
+| CM_CAM1DIV | 0x5000 (DIVI=5=100MHz) | 0x2000 (DIVI=2) | |
+| CLKGATE | 0x00000000 | 0x5A000005 | Linux does NOT write CLKGATE |
+
+**CRITICAL FINDING**: Pi OS uses CLK/DAT = 0x0005 (CLE|CLLPE only, no CLHSE/CLTRE).
+Linux bcm2835-unicam.c: `use_lp_clock=true` for IMX708 → non-continuous HS clock mode → 0x0005.
+Our V84–V102 used 0x001D (added CLHSE+CLTRE, incorrect for non-continuous clock).
+
+**Also**: Pi OS IBWP = 0xCBD95000 = 0xC0000000 | 0x0BD95000 — VideoCore bus address, NOT 0x40000000.
+
+---
+
+## V102 — CMP0 restore ← COMPLETADO (FALSIFICADO, 2026-03-17)
+
+CMP0=0x80000301 restored. Readback=0x80000101 (BIT9 ignored by HW, normal). STA=0.
+
+---
+
+## V103 — Match Pi OS exactly ← COMPLETADO (FALSIFICADO, 2026-03-17)
+
+**Changes**: CLK=0x0005, DAT0=0x0005, DAT1=0x0005 (2-lane), CM_CAM1=100MHz, CLKGATE not written, ICTL=0x00D80007.
+
+**Hardware V103 result:**
+```
+CTRL=0x00080F03 ✓ ANA=0x00000770 ✓
+CLK=0x06000005 (lower=0x0005 ✓, upper=CLKhi counter)
+DAT0=0xE0000005, DAT1=0xE0000005 (2-lane, both HS active) ✓
+CM_CAM1DIV=20480=0x5000=DIVI=5=100MHz ✓
+ICTL=0x00D80007 ✓ MISC=0x00000240 ✓
+STA=0x00000000 PERSISTENT ✗
+```
+
+ALL Pi OS register values confirmed in hardware. STA=0 persists.
+
+**Conclusion**: The issue is NOT any Unicam register value. Something else differs.
+
+---
+
+## V104 — MIPI clock mode 0x0310=0x00 ← COMPLETADO (FALSIFICADO, 2026-03-17)
+
+**Hypothesis**: k_imx708_init had `{0x0310, 0x01}` = continuous HS clock. Pi OS with CLK=0x0005 (CLLPE, no CLHSE) expects non-continuous clock. Mismatch → CLK HS receiver not enabled → STA=0.
+
+**Change**: `{0x0310, 0x01}` → `{0x0310, 0x00}` (non-continuous HS clock).
+
+**Hardware V104 result:**
+```
+[IMX708] V104: 0x0310(clk_mode)=0 (expect 0=non-continuous) ✓
+CLK=0x06000005, DAT0=0xE0000005, DAT1=0xE0000005 (2-lane, both HS) ✓
+STA=0x00000000 PERSISTENT ✗
+```
+
+`0x0310=0x00` confirmed. CLK lane now in non-continuous mode (CLKhi drops post-stream as expected). STA=0 remains. Clock mode was NOT the cause.
+
+---
+
+## V105 — IBSA0 bus address 0x40000000 → 0xC0000000 ← EN PROGRESO (2026-03-17)
+
+**Hypothesis**: Pi OS IBWP = 0xCBD95000 = `0xC0000000 | 0x0BD95000` (physical). Unicam is on the VideoCore bus. BCM2837 Linux DT: `dma-ranges = <0xC0000000 0x0 0x40000000>`. The correct DMA bus address for Unicam is `0xC0000000 | phys_addr`, NOT `0x40000000 | phys_addr` (L2-bypass ARM AXI alias).
+
+V18 noted "0xC0000000 → silent DMA fail" but that was with multiple OTHER bugs (MCLK=32kHz, IPIPE=0, etc.) masking the result. With V103's correct configuration, the bus address is the last untested variable.
+
+If Unicam requires valid IBSA0 before the CSI-2 capture engine starts (DMA-readiness gate on STA.FS), using bus address 0x40240200 (unmapped from VC bus perspective) would keep STA=0.
+
+**Change**: `bus_addr = 0xC0000000u | phys_addr` (was `0x40000000u`). Sim PASS ✓.
+
+**Expected UART confirmation**: `IBSA0=0xC2xxxxxx`.
+
+---
+
+## Exhausted Hypothesis Matrix (V84–V104, ALL STA=0)
+
+| Version | ANA | CLK/DAT | Lanes | CM_CAM1 | 0x0310 | IBSA0 alias | STA |
+|---------|-----|---------|-------|---------|--------|-------------|-----|
+| V84–V93 | 0x770 | 0x001D | 2-lane | 100MHz | 0x01 | 0x40M | 0 |
+| V94 | 0x770 | 0x001D | 1-lane | 100MHz | 0x01 | 0x40M | 0 |
+| V95 | 0x770 | 0x001D | 1-lane | 100MHz | 0x01 | 0x40M | 0 |
+| V96–V98 | 0x770 | 0x001D | 1-lane | 100MHz | 0x01 | 0x40M | 0 |
+| V99 | 0x770 | 0x001D | 1-lane | 250MHz | 0x01 | 0x40M | 0 |
+| V100–V101 | 0x770 | 0x001D | 1-lane | 250MHz | 0x01 | 0x40M | 0 |
+| V102 | 0x770 | 0x001D | 1-lane | 250MHz | 0x01 | 0x40M | 0 |
+| V103 | 0x770 | **0x0005** | **2-lane** | **100MHz** | 0x01 | 0x40M | 0 |
+| V104 | 0x770 | 0x0005 | 2-lane | 100MHz | **0x00** | 0x40M | 0 |
+| V105 | 0x770 | 0x0005 | 2-lane | 100MHz | 0x00 | **0xC0M** | 0 |
+| V106 | 0x770 | 0x0005 | 2-lane | 100MHz | 0x00 | 0xC0M | 0 |
+| V107 | 0x770 | 0x0005 | 2-lane | 100MHz | 0x00 | 0xC0M | 0 |
+| **V108** | 0x770 | 0x0005 | 2-lane | 100MHz | 0x00 | 0xC0M | **0xD001 ✓** |
+
+---
+
+## V106 — CLKGATE @0x3F802004 (CSI1, not CSI0)
+
+**Date**: 2026-03-17
+
+**Discovery**: bcm2835-peripherals.dtsi defines separate clock gates:
+- `csi0: reg = <0x7e802000 0x4>` → ARM `0x3F802000`
+- `csi1: reg = <0x7e802004 0x4>` → ARM `0x3F802004`
+
+V92 wrongly "corrected" from 0x3F802004 to 0x3F802000 (CSI0). All CLKGATE writes since V92
+went to the wrong peripheral.
+
+**HW result**: CLKGATE readback=0x00000015 (value retained at correct address). STA=0 persists.
+CLKGATE address was necessary but not sufficient.
+
+---
+
+## V107 — CLKGATE write post-CPE (Linux ordering)
+
+**Date**: 2026-03-17
+
+Moved CLKGATE write from Step 0B (before CPR) to Step 14B (after CPE), matching Linux
+`unicam_start_rx()` order: CPR → registers → CPE → clk_write() → MISC → LIP.
+
+**HW result**: CLKGATE post-CPE confirmed. STA=0 persists. Ordering alone not the issue.
+
+---
+
+## V108 — SET_DOMAIN_STATE + SET_CLOCK_RATE ★★★ ROOT CAUSE ★★★
+
+**Date**: 2026-03-17/18
+
+**Discovery**: Linux bcm2835-unicam.c uses `pm_runtime` → `raspberrypi-genpd` →
+`SET_DOMAIN_STATE` (mailbox tag 0x00038030), NOT `SET_POWER_STATE` (tag 0x00028001).
+- domain=14 = RPI_POWER_DOMAIN_UNICAM1 (DT index 13 + 1)
+- Also: SET_CLOCK_RATE(clock_id=4, rate=250MHz) for CORE clock
+
+`SET_POWER_STATE` always returned state=0x02 — wrong tag namespace entirely.
+Without domain power, CSI-2 digital decoder was frozen: MMIO accessible, D-PHY active,
+but decoder logic unpowered → STA=0, ISTA=0, IBWP stuck.
+
+**HW result — BREAKTHROUGH**:
+```
+DOMAIN GET resp=0x80000000 domain=14 on=0 OK    ← was OFF!
+DOMAIN SET resp=0x80000000 domain=0 on=1 OK     ← now ON
+CORE CLK SET resp=0x80000000 rate=250000000 OK
+
+STA_accum=0x0000D001   ← FIRST TIME STA > 0 IN 21 VERSIONS!
+ISTA_accum=0x00000005  ← FSI (BIT0) + LCI (BIT2)
+```
+
+- STA BIT(0) = Frame Start received ✓
+- STA BIT(15) = PI0 (CMP0 Frame End match) ✓
+- ISTA BIT(0) = FSI ✓, BIT(2) = LCI ✓
+- IBWP advances from 0xC2240200 through buffer — DMA receives real pixel data
+- **Noise visible on HDMI screen** — actual sensor data reaching framebuffer
+
+**FEI (BIT1) never fires**: CPR-post-stream diagnostic (from V100 era) fires a D-PHY reset
+mid-reception. Before CPR: PI0 present in STA. After CPR: PI0 gone, FEI never fires.
+The CPR destroys frame boundary detection.
+
+**⚠️ CODE LOSS INCIDENT**: During simulator testing, `git checkout src/camera_unicam.cpp`
+reverted the file to V93 (last committed version), losing ALL V105–V108 changes.
+`hardware_sim.h` (V108 fields) survived because it had been read but not checked out.
+The file was manually regenerated from conversation context. **Lesson: always commit
+before running `git checkout` on modified files.**
+
+---
+
+## V109 — Remove CPR-post-stream + fast-poll
+
+**Date**: 2026-03-18
+
+V108 proved that PI0 (Frame End via CMP0) fires BEFORE the CPR diagnostic, and disappears
+AFTER. The CPR mid-reception resets D-PHY → loses frame boundary → FEI never arrives.
+
+**Changes**:
+1. No CPR in capture path (completely removed)
+2. Clear ISTA/STA (W1C) before each frame capture
+3. Fast-poll 50ms: if FEI or PI0 fires during fast-poll, return success immediately
+4. All V108 fixes preserved (SET_DOMAIN_STATE, SET_CLOCK_RATE, CLKGATE post-CPE, bus 0xC0000000)
+
+**Expected**: fast-poll detects FEI or PI0 within 50ms → capture succeeds → debayer runs.
+If FEI still missing: investigate why Frame End short packet not triggering ISTA BIT(1).
+
+Sim PASS ✓. kernel8.img ready to flash.

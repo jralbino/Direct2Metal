@@ -1,213 +1,298 @@
 # Direct2Metal — Plan de Desarrollo
 
-> Última actualización: 2026-03-14
-> Estado del proyecto: Phase 9 en curso — driver CSI-2 bare-metal IMX708, V93 pendiente de flash
+> Última actualización: 2026-03-18
+> Estado: Phase 9 activa — V109 listo para flash. **STA>0 CONFIRMADO en V108** (primer Frame Start en 21 versiones). Root cause: SET_DOMAIN_STATE faltante. V109 elimina CPR-post-stream que destruía Frame End.
 
 ---
 
 ## Resumen ejecutivo
 
-El motor de inferencia (Phases 1–8) está completo y funcional: YOLOv5n 320×320 corriendo en bare-metal AArch64 a **511 ms / ~2 FPS** con 4 cores Cortex-A53, NEON SIMD, MMU + D-cache, y safety hardening ISO 26262.
+El motor de inferencia (Phases 1–8) está completo: YOLOv5n 320×320 en bare-metal AArch64 a
+**511 ms / ~2 FPS** con 4 cores Cortex-A53, NEON SIMD, MMU + D-cache, e ISO 26262 safety hardening.
 
-El bloqueante actual es **Phase 9**: el driver CSI-2 bare-metal para la Pi Camera v3 (IMX708) no ha logrado capturar un frame todavía. Los cambios V90–V93 tienen identificado el root cause (CPM=CCP2 bug + IDI0=0x2B) pero están en el working tree sin commitear y sin probar en hardware.
+Phase 9 (driver CSI-2 IMX708) — **ROOT CAUSE CONFIRMADO en V108: SET_DOMAIN_STATE faltante.**
+Tras 21 versiones con STA=0, V108 descubrió que Linux usa `SET_DOMAIN_STATE` (tag 0x00038030,
+domain=14) vía raspberrypi-genpd, NO el viejo `SET_POWER_STATE` (tag 0x00028001).
+Sin domain power, el decoder CSI-2 digital estaba congelado — MMIO funcional, D-PHY activo,
+pero STA=0 siempre. V108 HW: STA=0xD001 (FS + PI0), ISTA=0x05, IBWP avanza, ruido en HDMI.
+V109 elimina CPR diagnóstico que destruía detección de Frame End.
+
+---
+
+## Hallazgos clave V93–V109
+
+| Versión | Cambio | Resultado | Conclusión |
+|:--------|:-------|:----------|:-----------|
+| V93 | CPM=0 (CSI-2), IDI0=0x2B, CLKGATE=0x5A000015 | STA=0 | Protocolo correcto; CLKGATE en dirección CSI0 (0x3F802000) — nunca llegó a CSI1 |
+| V94 | 1-lane (0x0114=0), DAT1 disabled | STA=0 | Número de lanes descartado |
+| V95 | CPR skipped, ANA=0x770 directo | STA=0 | CPR irrelevante; VPU NO calibra D-PHY |
+| V96 | AR pulse + no CPR; fast-poll 1ms/50ms | STA_accum=0 en 50 muestras | Cero Frame Start events — CPE sordo al MIPI |
+| V97/V98 | Settle sweep 1–5 ciclos a 100 MHz | STA=0 en todos | Settle timing NO es la causa raíz |
+| V99 | CM_CAM1: 100 MHz → 250 MHz (DIVI=5→2) | STA=0 | Frecuencia del decoder NO es la causa |
+| V100 | Power domain sweep + CPR post-stream | STA=0; CAM1=0x02 after SET(0x03); CPR borró ICTL/MISC | Power domain ambiguo; bug CPR descubierto |
+| V101 | Fix ICTL/MISC post-CPR; ICTL=0x07 MISC=0x240 ✓ | STA=0 | Todos los registros correctos — espacio SW agotado |
+| V102 | CMP0=0x80000301 restaurado | STA=0 | CMP0 descartado |
+| A4 | Cable FFC re-seated | STA=0 | Cable físico descartado |
+| A1 | Pi OS /dev/mem ground truth | — | CLK=0x0005, 2-lane, ICTL=0x00D80007, CM_CAM1=100MHz, IBWP=0xCBD95000=0xC0000000\|phys |
+| V103 | Igualar Pi OS exactamente (CLK/DAT=0x0005, 2-lane, CM=100MHz, ICTL=0x00D80007) | STA=0 | Todos registros iguales. **Deshabilitó CLKGATE** basándose en lectura de CSI0 (0x3F802000) |
+| V104 | IMX708 0x0310=0x00 (non-continuous HS clock) | STA=0 | Modo reloj MIPI descartado |
+| ~~V105~~ | IBSA0 bus addr 0x40000000→0xC0000000 (VC bus alias) | STA=0 | Bus addr correcto pero no era causa. Kept (matches Pi OS) |
+| V106 | CLKGATE @0x3F802004 (CSI1!) + 0x5A000015 | STA=0, readback=0x15 | Dirección corregida, pero no era suficiente solo |
+| V107 | CLKGATE write post-CPE (orden Linux) | STA=0 | Orden correcto, falta algo más |
+| **V108** | **SET_DOMAIN_STATE(14,1) + SET_CLOCK_RATE(4,250M)** | **STA=0xD001 ✓** | **ROOT CAUSE: firmware domain power faltante** |
+| V109 | Eliminar CPR-post-stream + clear ISTA/STA | PENDIENTE | Fix: CPR destruía FE; fast-poll para captura temprana |
+
+**ROOT CAUSE (V108): SET_DOMAIN_STATE faltante.**
+
+Linux `bcm2835-unicam.c` usa `pm_runtime` → `raspberrypi-genpd` → `SET_DOMAIN_STATE`
+(tag `0x00038030`, domain=14), NO el viejo `SET_POWER_STATE` (tag `0x00028001`, device=0x0d).
+`SET_POWER_STATE` siempre devolvió state=0x02 (namespace de tags incorrecto).
+Sin domain power, el decoder CSI-2 digital estaba congelado.
+
+Resultado V108 en hardware:
+- `STA_accum=0x0000D001` — Frame Start (BIT0) + PI0/CMP0 match (BIT15) por primera vez
+- `ISTA=0x05` — FSI (Frame Start Int) + LCI (Line Capture Int)
+- IBWP avanza de 0xC2240200 a 0xC238A200 — DMA recibiendo datos reales
+- **Ruido visible en HDMI** — datos del sensor llegando al framebuffer
+- FEI (BIT1) no dispara → timeout. Causa: CPR-post-stream diagnóstico destruyó detección FE
+
+**⚠️ Incidente V108: pérdida y regeneración de código.**
+Durante pruebas del simulador V108, un `git checkout src/camera_unicam.cpp` revirtió
+el archivo a V93 (último commit), perdiendo TODOS los cambios V105–V108. El archivo se
+regeneró manualmente a partir del contexto de la conversación. `hardware_sim.h` (V108)
+sobrevivió. Lección: **hacer commit antes de ejecutar `git checkout` en archivos modificados.**
+
+Hallazgos acumulados de versiones anteriores:
+- **V96:** VPU deja `CTRL=STA=CLT=DLT=0x00000000`. `dtoverlay=imx708` no toca Unicam MMIO.
+- **V100:** CPR borra ICTL (0x07→0x04) y MISC (0x240→0x000).
+- **V106:** CSI0 CLKGATE=0x3F802000, CSI1 CLKGATE=0x3F802004 (Linux DT).
 
 ---
 
 ## Track A — Desbloquear la cámara *(bloqueante)*
 
-### A1 — Commit y flash V93
-
-**Estado:** Cambios listos en working tree. Pendiente de commit + flash.
-
-Tres fixes simultáneos identificados a través de V90–V93:
-
-| Fix | Registro | Valor incorrecto | Valor correcto | Motivo |
-|:----|:---------|:-----------------|:---------------|:-------|
-| CPM=CSI-2 | `CTRL` | `0x00080F1B` (BIT(3)=CPM=1→CCP2) | `0x080F02/03` | BIT(3) no es "lane enable" — activa modo CCP2 que silencia el protocol engine |
-| Data type | `IDI0` | `0x2A` (RAW8 filter) | `0x2B` (RAW10) | IMX708 no tiene modo RAW8; siempre emite DT=0x2B. IDI0=0x2A descarta 100% de los paquetes de pixel |
-| Clock gate | `CLKGATE` | `0x5A000005` | `0x5A000015` | Shift+OR correcto para 2-lane; dirección `0x3F802000` (no `0x3F802004`) ya confirmada en V92 |
-
-**Checklist de commit:**
-- [ ] `CTRL = 0x080F02` (U_CTRL_BASE sin lane bits)
-- [ ] `IDI0 = 0x2B`
-- [ ] `CLKGATE = 0x5A000015` en `0x3F802000`
-- [ ] `FRAME_W = 1920` (1536 px × 10 bit / 8 = 1920 bytes/línea)
-- [ ] `FRAME_SZ = 1,658,880`
-- [ ] Corregir comentarios stale en `hardware_sim.h` líneas 59–64 (BIT(3)/BIT(4) descritos como "lane enable bits" — descripción del modelo incorrecto de V90)
-- [ ] Corregir `UnicamSimState.clkgate_enabled` comment (todavía dice `0x3F802004`)
-- [ ] Validar en QEMU sim → ALL preconditions pass
-- [ ] Flash en hardware
-
-**Resultado esperado:** `CTRL=0x00080F03`, `STA > 0` (FS+FE bits set), `IBWP` avanzando más allá de `IBSA0`.
+> **Estado V109**: ROOT CAUSE confirmado en V108 (SET_DOMAIN_STATE). STA>0 por primera vez.
+> V109 elimina CPR diagnóstico que destruía Frame End. Si FEI/PI0 dispara → captura funciona → A5 debayer.
 
 ---
 
-### A2 — Primer frame: validar STA y IBWP
+### ~~V102~~ — CMP0 restore ← COMPLETADO (FALSIFICADO)
 
-Una vez flasheado V93, el criterio de éxito es:
-
-```
-STA  = 0x00000003   (ISTA_FS | ISTA_FE fired)
-IBWP = IBSA0 + FRAME_SZ   (DMA completó el buffer)
-```
-
-Si `STA > 0` pero `IBWP` no avanza → revisar `IBEA0` y `IBLS` (stride).
-
-Si `STA = 0` todavía → pasar a **Track C**.
+CMP0=0x80000301 restaurado. Readback=0x80000101 (BIT(9) ignorado por hardware, normal).
+STA=0. CMP0 no es la causa.
 
 ---
 
-### A3 — Debayer RAW10
+### ~~A4~~ — Inspección física FFC ← COMPLETADO (SIN EFECTO)
 
-`camera_debayer.cpp` actualmente asume RAW8 (1 byte/pixel). Con IDI0=0x2B el DMA recibe RAW10 packed: **4 pixels en 5 bytes** (MSBs + 4 pares de 2 LSBs).
+Un cable FFC con resistencia elevada en un contacto pasa estados DC (LP-11 = líneas en
+reposo, ~1.2V) pero falla en AC a 690 Mbps. El receptor BCM2837 ve actividad HS (D0hi
+cambia de 0x0A00 a 0xE000) pero el byte-stream tiene errores de bit que impiden el
+SYNC 0xB8. Este síntoma es **idéntico** al STA=0 que observamos.
 
-**Cambios requeridos:**
-
-```
-Unpack RAW10:
-  byte[0..3] = 8 MSBs de pixels P0..P3
-  byte[4]    = {P3[1:0], P2[1:0], P1[1:0], P0[1:0]}
-
-  P0_10bit = (byte[0] << 2) | ((byte[4] >> 0) & 0x3)
-  P1_10bit = (byte[1] << 2) | ((byte[4] >> 2) & 0x3)
-  P2_10bit = (byte[2] << 2) | ((byte[4] >> 4) & 0x3)
-  P3_10bit = (byte[3] << 2) | ((byte[4] >> 6) & 0x3)
-```
-
-Implementar con `vld1q_u8` + shift/mask NEON para procesar 4 grupos (16 pixels) por iteración. La conversión a float32 puede hacerse directamente: `pixel_f32 = pixel_10bit * (1.0f / 1023.0f)`.
-
-Verificar orientación del sensor tras primer frame (la conclusión sobre el cruce D0/D1 cambió entre V17 y V35 — no asumir la orientación hasta verla).
+**Checklist:**
+- [ ] Cable FFC completamente insertado — contacto audible en ambos extremos
+- [ ] Orientación correcta — contactos metálicos mirando hacia abajo en Pi Zero 2W
+- [ ] Sin doblez visible, sin microfractura en el centro del cable
+- [ ] Probar con cable de reemplazo si disponible
 
 ---
 
-### A4 — Crop y resize al tensor YOLO
+### ~~V100~~ / ~~V101~~ — Power domain + CPR post-stream ← COMPLETADO (V100 hallazgos, V101 fix)
 
-El pipeline ya contempla `1536×864 → center-crop 864×864 → bilinear resize 320×320 CHW float32`. Validar:
+**Resultados V100:**
+- Power domain: SD=0x01, UART/USB=0x00, CAM0/CAM1/DSP0=0x02. SET_POWER_STATE(CAM1,0x03)→0x02 (sin efecto).
+  SD usa encoding diferente (0x01 no 0x03) → significado de 0x02 es AMBIGUO. No descartable sin /dev/mem.
+- CPR post-stream: STA=0 antes y después. Bug: CPR borró ICTL (0x07→0x04) y MISC (0x240→0x000).
 
-- Crop centrado correcto (offset x = 336 px)
-- Resize bilinear o nearest neighbor (nearest es suficiente para detección, ~3× más rápido)
-- Output layout `[3][320][320]` normalizado `[0.0, 1.0]`
+**Fix V101**: Restaurar ICTL=0x07, MISC|=0x240, re-assert CPE, trigger LIP después de CPR post-stream.
+Confirmado en hardware: ICTL=0x00000007 MISC=0x00000240 ✓. STA=0 persiste.
 
 ---
 
-### A5 — Loop cerrado: Camera → YOLO → HDMI
+### A1 — Ground truth: `/dev/mem` en Pi OS ← DEFINITIVO (requiere Pi OS)
 
-Reemplazar `test_image.bin` con `camera_capture_frame()` en el main loop:
+Esta es la única acción que puede resolver el problema con certeza.
+Comparar CADA registro con nuestros valores de V99 revelará la diferencia exacta.
+
+```bash
+# En Pi OS con cámara funcionando:
+libcamera-vid -t 0 --nopreview &
+sleep 2
+
+sudo python3 -c "
+import mmap, struct
+with open('/dev/mem', 'rb') as f:
+    m = mmap.mmap(f.fileno(), 4096, offset=0x3F801000, access=mmap.ACCESS_READ)
+    d_regs = [
+        (0x000,'CTRL'), (0x004,'STA'), (0x008,'ANA'), (0x010,'CLK'),
+        (0x014,'CLT'), (0x018,'DAT0'),(0x01C,'DAT1'),(0x020,'DAT2'),
+        (0x024,'DLT'), (0x028,'?28'), (0x400,'MISC')
+    ]
+    csi_regs = [
+        (0x100,'ICTL'),(0x104,'ISTA'),(0x108,'IDI0'),(0x10C,'IPIPE'),
+        (0x110,'IBSA0'),(0x114,'IBEA0'),(0x118,'IBLS'),(0x11C,'IBWP'),
+        (0x120,'IHWIN'),(0x124,'IHSTA'),(0x128,'IVWIN')
+    ]
+    for off, name in d_regs + csi_regs:
+        val = struct.unpack('<I', m[off:off+4])[0]
+        print(f'[0x{off:03X}] {name:6s} = 0x{val:08X}')
+"
+
+# CM_CAM1 frecuencia real + power domain status
+sudo python3 -c "
+import mmap, struct
+with open('/dev/mem', 'rb') as f:
+    m = mmap.mmap(f.fileno(), 256, offset=0x3F101000, access=mmap.ACCESS_READ)
+    for off, name in [(0x048,'CAM1CTL'),(0x04C,'CAM1DIV')]:
+        val = struct.unpack('<I', m[off:off+4])[0]
+        print(f'[0x{off:03X}] {name} = 0x{val:08X}')
+"
+```
+
+**Resultado A1:** Ground truth obtenida vía `busybox devmem` (Python mmap bloqueado por CONFIG_STRICT_DEVMEM). Diferencias críticas encontradas: CLK/DAT=0x0005 (no 0x001D), 2-lane, CM_CAM1=100MHz, IBWP=0xCBD95000=0xC0000000|phys. Implementadas en V103.
+
+---
+
+### ~~V103~~ — Match Pi OS exactamente ← COMPLETADO (FALSIFICADO)
+
+CLK=DAT=0x0005, 2-lane, CM_CAM1=100MHz, ICTL=0x00D80007, CLKGATE no escrito.
+Hardware V103: todos los registros iguales a Pi OS confirmados. **STA=0 persiste.**
+Conclusión: no es ningún registro de Unicam. La diferencia está en otro lugar.
+
+---
+
+### ~~V104~~ — Modo reloj MIPI 0x0310=0x00 ← COMPLETADO (FALSIFICADO)
+
+k_imx708_init tenía `{0x0310, 0x01}` = continuous HS clock. Cambiado a `0x00`.
+Hardware V104: `0x0310(clk_mode)=0` confirmado. **STA=0 persiste.**
+
+---
+
+### ~~V105~~ — IBSA0 bus addr 0xC0000000 ← COMPLETADO (FALSIFICADO)
+
+IBSA0=0xC2240200 confirmado en hardware. STA=0 persiste. Bus address no era la causa.
+Cambio conservado porque es correcto per Pi OS ground truth.
+
+---
+
+### ~~V106~~ — CLKGATE @0x3F802004 (CSI1) ← COMPLETADO (necesario pero no suficiente)
+
+CLKGATE dirección corregida a 0x3F802004 (CSI1). Readback=0x15 confirma escritura exitosa.
+STA=0 persiste — CLKGATE solo no era suficiente sin domain power.
+
+---
+
+### ~~V107~~ — CLKGATE write post-CPE ← COMPLETADO (FALSIFICADO)
+
+Movido CLKGATE write de Step 0B (antes de CPR) a Step 14B (después de CPE), igualando
+orden de Linux `unicam_start_rx()`: CPR → registros → CPE → clk_write() → MISC → LIP.
+STA=0 persiste.
+
+---
+
+### ~~V108~~ — SET_DOMAIN_STATE + SET_CLOCK_RATE ← **COMPLETADO (ROOT CAUSE CONFIRMADO ✓)**
+
+**ROOT CAUSE REAL.** Linux usa `SET_DOMAIN_STATE` (0x00038030, domain=14) vía raspberrypi-genpd.
+Nuestro `SET_POWER_STATE` (0x00028001, device=0x0d) siempre devolvió state=0x02 — namespace incorrecto.
+
+Resultado HW: **STA>0 por primera vez** (STA_accum=0xD001, ISTA=0x05, IBWP avanza, ruido en HDMI).
+FEI no dispara porque CPR-post-stream diagnóstico destruye la detección de Frame End.
+
+**⚠️ INCIDENTE:** `git checkout src/camera_unicam.cpp` revirtió a V93 durante pruebas del simulador.
+Código V105–V108 regenerado manualmente desde contexto de conversación. `hardware_sim.h` sobrevivió.
+
+---
+
+### V109 — Eliminar CPR-post-stream + fast-poll ← LISTO PARA FLASH
+
+V108 demostró que PI0 (Frame End vía CMP0) dispara ANTES del CPR diagnóstico, y desaparece
+DESPUÉS. El CPR mid-recepción resetea D-PHY → pierde frame boundary → FEI nunca llega.
+
+Cambios V109:
+1. **Sin CPR en captura** — eliminado completamente
+2. **Clear ISTA/STA** antes de cada frame (W1C, limpiar flags residuales)
+3. **Fast-poll 50ms** — si FEI o PI0 dispara durante fast-poll, retorna éxito inmediato
+4. Todos los fixes V108 conservados (SET_DOMAIN_STATE, SET_CLOCK_RATE, CLKGATE post-CPE, bus 0xC0000000)
+
+Sim PASS ✓. kernel8.img listo.
+
+---
+
+### ~~A2 — V97/V98: Sweep settle timing~~ ← COMPLETADO (FALSIFICADO)
+All settle values 1–5 at 100MHz tested. STA=0 for all. Settle timing not the cause.
+
+### ~~A3 — V97: IMX708 readback~~ ← COMPLETADO (CONFIRMADO CORRECTO)
+fmt=0x0A0A ✓, bin_en=1 ✓, bin_type=0x22 ✓. Sensor configuration is correct.
+
+### ~~A2c — V99: CM_CAM1=250MHz~~ ← COMPLETADO (FALSIFICADO)
+CM_CAM1 at 250MHz also gives STA=0. Clock frequency not the cause.
+
+---
+
+### A5 — Post-STA: debayer RAW10 y loop cerrado
+
+Una vez que `STA > 0` y `IBWP` avance más allá de `IBSA0`:
+
+**Debayer RAW10** — `camera_debayer.cpp` asume RAW8. RAW10 packed = 4 pixels en 5 bytes:
+
+```cpp
+// Grupo de 5 bytes → 4 pixels de 10 bits
+P0 = (byte[0] << 2) | ((byte[4] >> 0) & 0x3)
+P1 = (byte[1] << 2) | ((byte[4] >> 2) & 0x3)
+P2 = (byte[2] << 2) | ((byte[4] >> 4) & 0x3)
+P3 = (byte[3] << 2) | ((byte[4] >> 6) & 0x3)
+// Conversión directa a float32:
+px_f32 = px_10bit * (1.0f / 1023.0f)
+```
+
+Implementar con `vld1q_u8` + shift/mask NEON. Verificar orientación del sensor en el primer
+frame (no asumir — la conclusión sobre cruce D0/D1 cambió entre V17 y V35).
+
+**Loop cerrado:**
 
 ```cpp
 while (true) {
-    watchdog_kick();
-    if (g_use_camera) {
-        camera_capture_frame(g_input_tensor);   // bloquea hasta ISTA_FE
-    } else {
-        memcpy(g_input_tensor, test_image, INPUT_SIZE);
-    }
+    watchdog_kick();                        // antes del blocking wait
+    camera_capture_frame(g_input_tensor);   // bloquea hasta ISTA_FE (~18 ms)
     run_yolo_complete(g_input_tensor);
     video_render_detections();
     flush_to_ram();
 }
 ```
 
-El `watchdog_kick()` debe ir **antes** de `camera_capture_frame()` para evitar timeout durante la espera de ISTA_FE (hasta ~18 ms a 55 fps del sensor).
-
 ---
 
 ## Track B — Optimizaciones de performance *(paralelo al Track A)*
 
-Orden de prioridad por retorno sobre esfuerzo:
+### B1 — INT8 post-training quantization ← mayor impacto
 
-### B1 — INT8 post-training quantization ⚡ mayor impacto
+**Ganancia estimada:** −300 ms → total ~210 ms / ~4.7 FPS | **Esfuerzo:** Alto
 
-**Ganancia estimada:** ~300 ms → total ~210 ms / **~4.7 FPS**
-**Esfuerzo:** Alto (1–2 semanas)
-
-Requiere dos etapas:
-
-**Host (PyTorch):**
-```python
-# Calibration dataset: 100-200 imágenes COCO
-model_int8 = torch.quantization.quantize_dynamic(model, {nn.Conv2d}, dtype=torch.qint8)
-# Exportar escalas por capa a weights_int8.bin
-```
-
-**Bare-metal:**
-- Reemplazar `float32x4_t` por `int8x16_t` en `conv2d_partial()` y `conv2d_partial_8ch()`
-- Usar `vmull_s8` + `vpaddlq_s16` para accumulation
-- Dequantize solo en las salidas de cada bloque C3/SPPF (no per-layer)
-- Beneficio secundario: 4× reducción de ancho de banda en weights (7.5 MB → ~1.9 MB)
+Host (PyTorch): calibrar con 100–200 imágenes COCO, exportar escalas por capa. Bare-metal:
+reemplazar `float32x4_t` por `int8x16_t` con `vmull_s8` + `vpaddlq_s16`; dequantize solo
+en salidas de bloque C3/SPPF. Beneficio secundario: weights 7.5 MB → ~1.9 MB.
 
 ### B2 — conv1x1 8-ch
 
-**Ganancia estimada:** ~10 ms
-**Esfuerzo:** Bajo
+**Ganancia estimada:** ~10 ms | **Esfuerzo:** Bajo
 
-Mismo patrón que `conv2d_partial_8ch()` ya implementado para K=3. Aplica a las detection-head layers 1×1 donde `C_out ≥ 32 && C_out % 8 == 0`. Cambio en `ops.cpp` + layout de pesos en `export_model.py`.
+Mismo patrón que `conv2d_partial_8ch()` para K=3. Aplica a detection-head 1×1 layers con
+`C_out ≥ 32 && C_out % 8 == 0`. Cambio en `ops.cpp` + layout en `export_model.py`.
 
 ### B3 — PRFM prefetch en weight loads
 
-**Ganancia estimada:** 5–15%
-**Esfuerzo:** Medio
+**Ganancia estimada:** 5–15% | **Esfuerzo:** Medio
 
-Insertar `prfm pldl1keep` 2–4 iteraciones adelante en el inner loop de weights de `conv2d_partial_8ch()`. La brecha entre speedup teórico 2× y medido 1.22× en el kernel 8-ch indica que el cuello de botella es el bandwidth LPDDR2 en weights de 7.5 MB — prefetch mitiga la latencia de cache miss sin cambiar el algoritmo.
-
-```cpp
-// En el inner loop, antes de usar w[pos*8]:
-__builtin_prefetch(&w[(pos+3)*8], 0, 1);
-```
+`__builtin_prefetch(&w[(pos+3)*8], 0, 1)` en el inner loop de `conv2d_partial_8ch()`.
+La brecha entre speedup teórico 2× y medido 1.22× indica bottleneck en bandwidth LPDDR2.
 
 ### B4 — L0 stem K=6 unroll especializado
 
-**Ganancia estimada:** ~5–10 ms
-**Esfuerzo:** Bajo
+**Ganancia estimada:** ~5–10 ms | **Esfuerzo:** Bajo
 
-El stem L0 tiene `C_in=3` fijo (RGB). Con `C_in` conocido en tiempo de compilación, el compilador puede hacer unroll completo del loop `ci` (3 iteraciones), eliminando el overhead de branch + contador. Crear una especialización:
-
-```cpp
-template<> void conv2d_partial<3, 6>(...)  // C_in=3, K=6
-```
-
----
-
-## Track C — Diagnóstico fallback *(solo si V93 falla en hardware)*
-
-Si después de flashear V93 `STA` sigue en 0, seguir este orden de investigación:
-
-### C1 — Volcar CTRL post-init
-
-Verificar que CPM (BIT(3)) sea 0 después del `CPR pulse + CTRL_BASE`:
-
-```
-CTRL esperado: 0x00080F03
-              [bits 20:12] OET=128  [bits 11:8] PFT=0xF  [bit 1] MEM  [bit 0] CPE
-```
-
-Si CPM=1, hay otro write posterior al CPR que está seteando BIT(3). Buscar en `camera_unicam.cpp` cualquier OR a CTRL después del paso de CPR.
-
-### C2 — IDI0 bypass completo
-
-Probar `IDI0 = 0x00` en modo loopback (acepta cualquier VC y DT). Si con IDI0=0x00 aparece STA>0 pero con IDI0=0x2B no, el sensor está enviando un data type diferente al esperado. Leer el valor de `0x0112/0x0113` por I2C después de `stream_on` para confirmar el DT activo.
-
-### C3 — Inspección física del FFC
-
-El FFC de la Pi Zero 2W para CSI es el componente más frágil del sistema. Un conector mal asentado pasa la prueba LP-11 (estados DC) pero falla en HS a 450 Mbps.
-
-Checklist físico:
-- [ ] FFC completamente insertado (click audible en ambos extremos)
-- [ ] Orientación correcta: contactos metálicos hacia abajo en el conector de la Pi Zero 2W
-- [ ] Ausencia de dobleces o marcas en el cable
-- [ ] Probar con un FFC de reemplazo si hay disponible
-
-### C4 — VPU mailbox UNICAM1 power-on
-
-Verificar que el SET_POWER_STATE se está enviando con los parámetros correctos:
-
-```
-device_id = 0x0D  (UNICAM1/CSI-1)  ← NO 0x0C (UNICAM0/CSI-0)
-state     = 0x01  (powered on)
-mbox[4]   = 0x00  (req_resp_indicator, NO el buffer size)
-```
-
-Y que el flush DC CIVAC del buffer del mailbox ocurre antes del call al VPU (V87).
+`C_in=3` fijo permite unroll completo del loop `ci`. Crear especialización
+`template<> void conv2d_partial<3, 6>(...)`.
 
 ---
 
@@ -215,27 +300,25 @@ Y que el flush DC CIVAC del buffer del mailbox ocurre antes del call al VPU (V87
 
 | ID | Archivo | Descripción | Prioridad |
 |:---|:--------|:------------|:----------|
-| T1 | `hardware_sim.h:59-64` | Comentarios de BIT(3)/BIT(4) describen modelo incorrecto de V90 ("lane enable bits"). Real = CPM/CCP2 bits | Alta |
-| T2 | `hardware_sim.h` | `UnicamSimState.clkgate_enabled` comment dice `0x3F802004` en lugar de `0x3F802000` | Media |
-| T3 | `camera_unicam.cpp` | Constante `FRAME_W` hardcodeada como RAW8. Parametrizar por data type (RAW8 vs RAW10) | Media |
-| T4 | `safety_config.h` | `CAMERA_DATA_TYPE` no existe como named constant — magic number en IDI0 write | Baja |
+| ~~T1~~ | ~~`hardware_sim.h:59-64`~~ | ~~Comentarios BIT(3)/BIT(4) incorrectos~~ | ~~Alta~~ — **RESUELTO V108**: comentarios actualizados |
+| ~~T2~~ | ~~`hardware_sim.h`~~ | ~~CLKGATE dirección~~ | ~~Media~~ — **RESUELTO V108**: `0x3F802004` correcto (CSI1) |
+| T3 | `camera_unicam.cpp` | `FRAME_W` hardcodeado como RAW8; parametrizar por data type | Media |
+| ~~T4~~ | ~~`imx708_regs.h`~~ | ~~`0x0901` binning type readback 0x34 vs esperado 0x22~~ | ~~Baja~~ — **RESUELTO V97**: bin_type=0x22 ✓ confirmado en hardware |
 
 ---
 
-## Tabla de métricas objetivo
+## Métricas objetivo
 
-| Métrica | Estado actual | Sin INT8 + cámara | Con INT8 + cámara |
-|:--------|:-------------:|:-----------------:|:-----------------:|
-| FPS (inferencia) | ~2 FPS | ~2 FPS | ~4.7 FPS |
-| Latencia P95 | ~511 ms | ~511 ms | ~215 ms |
+| Métrica | Actual | Sin INT8 + cámara | Con INT8 + cámara |
+|:--------|:------:|:-----------------:|:-----------------:|
+| FPS inferencia | ~2 FPS | ~2 FPS | ~4.7 FPS |
+| Latencia | ~511 ms | ~511 ms | ~215 ms |
 | Fuente de imagen | `test_image.bin` | Camera v3 live | Camera v3 live |
-| FPS pipeline total | — | ~1.8 FPS* | ~4.2 FPS* |
-
-*Estimado: captura IMX708 a 55 fps no es el bottleneck; la inferencia sí.
 
 ---
 
-## Precondición global
+## Regla de proceso
 
-> **Toda versión nueva debe validarse en QEMU sim antes de flashear.**
-> El simulador `hardware_sim.h` tiene cobertura de los bugs críticos (CPR ordering, ANA power-up, IDI0 filter, ICTL LIP). Un ALL PASS en QEMU no garantiza éxito en hardware, pero un FAIL en QEMU sí garantiza fallo en hardware.
+> **Toda versión nueva se valida en QEMU sim antes de flashear.**
+> Un FAIL en QEMU garantiza fallo en hardware.
+> Un PASS en QEMU no garantiza éxito, pero elimina bugs de secuencia de registros.

@@ -1,5 +1,5 @@
 /* File: src/hardware_sim.h
- * V76 — BCM2837 Unicam1 Hardware Simulator
+ * V108 — BCM2837 Unicam1 Hardware Simulator
  *
  * Provides a register-level software emulation of the BCM2837 Unicam1
  * CSI-2 receiver. In SIMULATION mode (-DSIMULATION), all MMIO reads/writes
@@ -105,9 +105,16 @@
 /* Tracks every hardware precondition in correct order.
  * If any step is missing/wrong, captures the first error as a string. */
 struct UnicamSimState {
+    /* Firmware interactions (V108) — required BEFORE any MMIO register setup.
+     * Without these, MMIO registers are readable/writable (fabric is always-on)
+     * and D-PHY analog shows HS activity, but the digital CSI-2 decoder is
+     * frozen: STA=0, ISTA=0, IBWP stuck. This matches V93–V107 HW behavior. */
+    bool domain_powered;        /* SET_DOMAIN_STATE(domain=14, on=1) via tag 0x00038030 */
+    bool core_clk_set;          /* SET_CLOCK_RATE(clock_id=4, rate>=250MHz) via tag 0x00038002 */
+
     /* Clocking */
     bool cam1clk_enabled;       /* CM_CAM1CTL at 0x3F101048 configured (ENAB=1) */
-    bool clkgate_enabled;       /* CLKGATE at 0x3F802000 written with password (0x5A000015 for 2-lane) */
+    bool clkgate_enabled;       /* CLKGATE at 0x3F802004 (CSI1!) written with password (0x5A000015 for 2-lane) */
 
     /* D-PHY power sequence */
     bool mem_bit_set;           /* CTRL: MEM=1 */

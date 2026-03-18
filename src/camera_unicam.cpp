@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V93 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V109 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -7,7 +7,7 @@
  *   [C] IBEA0 at 0x114 = IBSA0+frame_size — was COMPLETELY MISSING in V75!
  *   [D] IBLS at 0x118 = FRAME_W — was COMPLETELY MISSING in V75!
  *   [E] MISC at 0x400 = FL0|FL1 — was MISSING in V75!
- *   [F] CLKGATE at 0x3F802000 — was MISSING in V75! (V92: corrected from 0x3F802004)
+ *   [F] CLKGATE at 0x3F802004 (CSI1!) — was MISSING in V75! (V106: re-corrected from 0x3F802000)
  *   [G] ANA power-up before CPR — was MISSING in V75 (regression from V72)!
  *   [H] CLT/DLT timing registers — were MISSING in V75!
  *   [I] Removed incorrect U_CTRL_LSM = BIT(14) — BIT(14) is OET field, not LSM!
@@ -62,10 +62,9 @@
  *   Fix: 2-lane → 0x5A000015, 1-lane → 0x5A000005.
  *
  * ── V92 CHANGES ──────────────────────────────────────────────────────────────
- *   [AK] *** FIX: CLKGATE address corrected 0x3F802004 → 0x3F802000 ***
- *   Linux BCM2837 DT CSI1 second resource = 0x7e802000 = ARM 0x3F802000.
- *   Previous address was +4 into the resource block. CLKGATE register is
- *   write-only (readback=0 is normal, confirmed by Linux source).
+ *   [AK] *** FIX (WRONG): CLKGATE address changed 0x3F802004 → 0x3F802000 ***
+ *   This was WRONG. V106 discovered via bcm2835-peripherals.dtsi that CSI0=0x3F802000
+ *   and CSI1=0x3F802004. We need CSI1 (Unicam1) → 0x3F802004. V106 re-corrected.
  *
  * ── V91 CHANGES ──────────────────────────────────────────────────────────────
  *   [AJ] *** ROOT CAUSE FIX: IDI0=0x2A (RAW8) does NOT match sensor output ***
@@ -187,6 +186,37 @@
  *   Linux's usleep_range(1000, 2000) mandatory DDL lock wait.
  *   Simulator: updated to validate CLK/DAT0 configured after CPR, not before.
  *
+ * ── V105 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AN] IBSA0/IBEA0 bus address: 0x40000000 → 0xC0000000 (VideoCore bus alias).
+ *   Pi OS IBWP=0xCBD95000 confirms VC uses 0xC0000000|phys, not ARM L2-bypass.
+ *
+ * ── V106 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AO] *** FIX: CLKGATE address 0x3F802000 → 0x3F802004 (CSI1, not CSI0) ***
+ *   bcm2835-peripherals.dtsi: csi0=0x7e802000, csi1=0x7e802004.
+ *   V92 wrongly "corrected" to 0x3F802000 (CSI0). We need CSI1 → 0x3F802004.
+ *   HW confirmed: readback=0x15 (value retained at correct address).
+ *
+ * ── V107 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AP] CLKGATE write moved from Step 0B (before CPR) to Step 14B (after CPE).
+ *   Linux bcm2835-unicam.c clk_write() is called AFTER CPE in unicam_start_rx().
+ *   Order: CPR → registers → CPE → CLKGATE → MISC → LIP.
+ *
+ * ── V108 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AQ] *** ROOT CAUSE FIX: Replace SET_POWER_STATE with SET_DOMAIN_STATE + SET_CLOCK_RATE ***
+ *   Linux bcm2835-unicam.c uses pm_runtime → raspberrypi-genpd → SET_DOMAIN_STATE
+ *   (tag 0x00038030), NOT the old SET_POWER_STATE (tag 0x00028001).
+ *   domain=14 = RPI_POWER_DOMAIN_UNICAM1 (DT index 13 + 1).
+ *   SET_POWER_STATE always returned state=0x02 (wrong tag namespace).
+ *   Also: SET_CLOCK_RATE(clock_id=4, rate=250MHz) for CORE clock — Linux DT
+ *   specifies firmware_clocks = <4> for bcm2835-unicam node.
+ *
+ * ── V109 CHANGES ──────────────────────────────────────────────────────────────
+ *   [AR] *** FIX: Remove CPR-post-stream diagnostic that destroyed FE detection ***
+ *   V108 HW results: STA>0 for first time (SET_DOMAIN_STATE was root cause!).
+ *   STA_accum=0xD001 (FS + PI0) BEFORE CPR-post-stream. After CPR: PI0 gone,
+ *   FEI never fires. CPR mid-reception resets D-PHY → FE lost.
+ *   V109: no CPR in capture. Clear ISTA/STA before capture. Fast-poll for early FEI/PI0.
+ *
  * ── SIMULATOR (SIMULATION mode) ─────────────────────────────────────────────
  *   Register-level emulator validates exact Linux driver sequence.
  *   If ALL preconditions met → ISTA_FEI synthesized → capture succeeds.
@@ -241,7 +271,7 @@ static void mbox_flush_to_vc(unsigned int words) {
 
 /* ─── Hardware Base Addresses ─────────────────────────────────────────────── */
 #define UNICAM1_BASE        0x3F801000UL
-#define UNICAM1_CLKGATE     ((volatile uint32_t*)0x3F802000UL)  /* V92: was 0x3F802004 */
+#define UNICAM1_CLKGATE     ((volatile uint32_t*)0x3F802004UL)  /* V106: CSI1! (V92 wrongly changed to 0x3F802000=CSI0) */
 #define CM_PASSWD           0x5A000000u
 
 /* CM_CAM1CTL/DIV: BCM2837 Unicam1 digital backend clock (= BCM2835_CLOCK_CAM1)
@@ -648,7 +678,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     U_WRITE(U_IVWIN, 0x00u);
 
     /* STEP 7: ICTL interrupt enables + clear status registers */
-    U_WRITE(U_ICTL, U_ICTL_FSIE | U_ICTL_FEIE | U_ICTL_IBOB);  /* = 0x07 */
+    U_WRITE(U_ICTL, 0x00D80007u);  /* V103: Pi OS exact — FSIE|FEIE|IBOB + upper DMA enable bits */
     U_WRITE(U_STA,  0xFFFFFFFFu);
     U_WRITE(U_ISTA, 0x00000007u);    /* write 1 to FSI|FEI|LCI to clear */
 
@@ -686,13 +716,11 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      * CPR reset CLK/DAT0 to VPU boot default (0x02 = lane powered down).
      * We now configure lanes AFTER CPR so the configuration survives.
      *
-     * 0x1D = CLE|CLTRE|CLHSE|CLLPE:
+     * V103: Pi OS CLK/DAT = 0x0005 (CLE|CLLPE, no CLHSE/CLTRE).
      *   BIT(0) = CLE   = Clock Lane Enable
      *   BIT(2) = CLLPE = Clock Lane LP Receive Enable
-     *   BIT(3) = CLHSE = Clock Lane HS Receive Enable
-     *   BIT(4) = CLTRE = Clock Lane Termination Resistance Enable (100Ω)
-     * IMX708 uses continuous HS clock → all 4 bits needed.
-     * DAT1=0x00: 1-lane mode, data lane 1 disabled.
+     * IMX708 uses non-continuous HS clock (0x0310=0x00) → CLK=0x0005 matches Pi OS.
+     * No CLHSE/CLTRE: use_lp_clock=true in bcm2835-unicam.c skips HS bits on CLK lane.
      *
      * V82 diagnostic: print CLK value BEFORE our write to prove CPR reset it.
      * Expected: CLK=0x00000002 (power-down default) if CPR works correctly.
@@ -702,19 +730,20 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     uart_hex(U1[U_CLK/4]);
     uart_puts("\n");
 #endif
-    U_WRITE(U_CLK,  0x1Du);   /* CLE|CLTRE|CLHSE|CLLPE */
-    U_WRITE(U_DAT0, 0x1Du);   /* DLE|DLTRE|DLHSE|DLLPE */
-    U_WRITE(U_DAT1, 0x1Du);   /* V89: 2-lane test — enable D1 with full termination */
+    U_WRITE(U_CLK,  0x0005u);   /* V103: CLE|CLLPE — Pi OS exact (non-continuous HS clk) */
+    U_WRITE(U_DAT0, 0x0005u);   /* V103: DLE|DLLPE — Pi OS exact */
+    U_WRITE(U_DAT1, 0x0005u);   /* V103: 2-lane — Pi OS exact */
     U_WRITE(U_DAT2, 0x00u);
     U_WRITE(U_DAT3, 0x00u);
 
     /* STEP 11: DMA buffer addresses
-     * IBSA0: bus address with 0x40000000 L2-bypass alias (ARM AXI path)
+     * IBSA0: bus address with 0xC0000000 VideoCore bus alias.
+     * Pi OS IBWP=0xCBD95000 confirms VC DMA uses 0xC0000000|phys, not 0x40000000.
      * IBEA0: exclusive end = start + total_bytes
      * IBLS:  line stride in bytes
      */
     const uint32_t phys_addr = (uint32_t)(uintptr_t)g_raw_frame;
-    const uint32_t bus_addr  = 0x40000000u | phys_addr;   /* L2-bypass */
+    const uint32_t bus_addr  = 0xC0000000u | phys_addr;   /* V105: VC bus alias */
     U_WRITE(U_IBLS,  FRAME_W);              /* bytes per line — before IBSA0/IBEA0 */
     U_WRITE(U_IBSA0, bus_addr);
     U_WRITE(U_IBEA0, bus_addr + FRAME_SZ);
@@ -732,6 +761,26 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     /* STEP 14: CPE — enable the peripheral */
     U_SETBITS(U_CTRL, U_CTRL_CPE);   /* CTRL = CTRL_BASE | CPE = 0x080F03 */
 
+    /* STEP 14B: CLKGATE — write AFTER CPE (V107: matches Linux unicam_start_rx order)
+     * Linux: CPR → registers → CPE → clk_write() → MISC → LIP.
+     * V93 had this in Step 0B (before CPR) — wrong ordering.
+     * V106: address corrected to 0x3F802004 (CSI1, not CSI0).
+     * Value: 2-lane shift+OR = 0x5A000015. */
+    {
+        const uint32_t clkgate_val = 0x5A000015u;  /* 2-lane correct value */
+#ifndef SIMULATION
+        *UNICAM1_CLKGATE = clkgate_val;
+        asm volatile("dsb st" ::: "memory");
+        uint32_t cg_after = *UNICAM1_CLKGATE;
+        uart_puts("[UNICAM] CLKGATE post-CPE: wrote=0x5A000015 readback=");
+        uart_hex(cg_after); uart_puts("\n");
+#else
+        g_sim_state.clkgate_enabled = true;
+        g_sim_state.reg_clkgate = clkgate_val;
+        uart_puts("[UNICAM] CLKGATE=0x5A000015 (2-lane, post-CPE per Linux order)\n");
+#endif
+    }
+
     /* STEP 15: MISC again after CPE (Linux re-asserts FL0|FL1 after CPE) */
     U_SETBITS(U_MISC, (1u << 6) | (1u << 9));
 
@@ -739,9 +788,9 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      * LIP is BIT(5) in ICTL = 0x20. Self-clearing strobe.
      * Latches IBSA0/IBEA0 into active DMA address registers.
      */
-    U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x07 | 0x20 = 0x27 */
+    U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x00D80007 | 0x20 = 0x00D80027 */
 
-    uart_puts("[UNICAM] V93 init complete. CTRL=");
+    uart_puts("[UNICAM] V109 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -771,53 +820,61 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 /* ─── Public API ──────────────────────────────────────────────────────────── */
 
 void unicam_init() {
-#ifndef SIMULATION
-    /* ── Step 0: VPU firmware: power on Unicam1 domain (V85) ────────────────
-     * Linux calls pm_runtime_get_sync() → genpd_runtime_resume() → VPU firmware
-     * mailbox property SET_POWER_STATE (tag 0x00028001) for device 0x0d
-     * = RPI_POWER_DOMAIN_UNICAM1 (from bcm2835-pm.h line 43).
+#ifdef SIMULATION
+    /* V108: Set firmware state for simulation — these represent the mailbox
+     * interactions that happen before any MMIO register setup. */
+    g_sim_state.domain_powered = true;
+    g_sim_state.core_clk_set = true;
+    g_sim_state.cam1clk_enabled = true;
+    uart_puts("[SIM] Firmware: SET_DOMAIN_STATE(domain=14, on=1) — Unicam1 powered\n");
+    uart_puts("[SIM] Firmware: SET_CLOCK_RATE(clock=4, rate=250MHz) — CORE clock set\n");
+#else
+    /* ── Step 0: VPU firmware: power on Unicam1 domain (V108) ────────────────
+     * V108 FIX: Linux bcm2835-unicam.c uses pm_runtime → raspberrypi-genpd →
+     * SET_DOMAIN_STATE (tag 0x00038030), NOT the old SET_POWER_STATE (0x00028001).
+     * SET_POWER_STATE always returned state=0x02 — wrong tag namespace entirely.
      *
-     * Without this, the CSI-2 decoder hardware block may be power-gated:
+     * domain=14 = RPI_POWER_DOMAIN_UNICAM1 (DT index 13 + 1 in raspberrypi-power.h).
+     *
+     * Without this, the CSI-2 decoder hardware block is power-gated:
      *   - MMIO is readable/writable (register fabric is always-on)
      *   - D-PHY analog pads are active (D-PHY is separate power rail)
      *   - But the digital CSI-2 protocol decoder is frozen (no clock/power)
      *   → STA=0, ISTA=0, IBWP stuck even with perfect register sequence
      *
-     * State value: BIT(0)=on, BIT(1)=wait-for-power → 0x03.
-     * GET first, SET second. Response mbox[6] should be 0x03 = on.
+     * Also: SET_CLOCK_RATE(clock_id=4, rate=250MHz) for CORE clock.
+     * Linux DT specifies firmware_clocks = <4> for bcm2835-unicam node.
      */
     {
-        /* GET_POWER_STATE(device=0x0d) — diagnostic readback.
-         *
-         * V86 FORMAT FIX: Linux rpi_firmware_property() always sets
-         * req_resp_size (mbox[4]) = 0 for requests. The firmware uses
-         * buf_size (mbox[3]) to know the buffer length. We previously sent
-         * mbox[4]=8 which told the firmware "8 bytes of request data", but
-         * GET only has 4 bytes (device_id) — firmware returned parse error.
-         *
-         * Correct format (rpi_firmware_property_list in rpi-firmware.c):
-         *   [0] total size  [1] 0=request  [2] tag_id
-         *   [3] buf_size    [4] 0=req_resp_indicator  [5..] value buffer
-         *   [N] 0=end_tag
-         */
+        /* GET_DOMAIN_STATE(domain=14) — diagnostic readback */
         mbox[0] = 8 * 4; mbox[1] = 0;
-        mbox[2] = 0x00020001; mbox[3] = 8; mbox[4] = 0;
-        mbox[5] = 0x0000000d; mbox[6] = 0; mbox[7] = 0;
-        mbox_flush_to_vc(8);   /* V87: flush dirty D-cache lines to DRAM */
+        mbox[2] = 0x00030030; mbox[3] = 8; mbox[4] = 0;
+        mbox[5] = 14; mbox[6] = 0; mbox[7] = 0;
+        mbox_flush_to_vc(8);
         int get_ok = mbox_call(8);
-        uart_puts("[UNICAM] V87 PWR GET resp="); uart_hex(mbox[1]);
+        uart_puts("[UNICAM] V108 DOMAIN GET resp="); uart_hex(mbox[1]);
         uart_puts(" state="); uart_hex(mbox[6]);
         uart_puts(get_ok ? " OK\n" : " FAILED\n");
 
-        /* SET_POWER_STATE(device=0x0d, state=0x03=on+wait) */
+        /* SET_DOMAIN_STATE(domain=14, on=1) */
         mbox[0] = 8 * 4; mbox[1] = 0;
-        mbox[2] = 0x00028001; mbox[3] = 8; mbox[4] = 0;
-        mbox[5] = 0x0000000d; mbox[6] = 0x00000003; mbox[7] = 0;
-        mbox_flush_to_vc(8);   /* V87: flush dirty D-cache lines to DRAM */
+        mbox[2] = 0x00038030; mbox[3] = 8; mbox[4] = 0;
+        mbox[5] = 14; mbox[6] = 1; mbox[7] = 0;
+        mbox_flush_to_vc(8);
         int set_ok = mbox_call(8);
-        uart_puts("[UNICAM] V87 PWR SET resp="); uart_hex(mbox[1]);
+        uart_puts("[UNICAM] V108 DOMAIN SET resp="); uart_hex(mbox[1]);
         uart_puts(" state="); uart_hex(mbox[6]);
         uart_puts(set_ok ? " OK\n" : " FAILED\n");
+
+        /* SET_CLOCK_RATE(clock_id=4, rate=250MHz) — CORE clock */
+        mbox[0] = 9 * 4; mbox[1] = 0;
+        mbox[2] = 0x00038002; mbox[3] = 12; mbox[4] = 0;
+        mbox[5] = 4; mbox[6] = 250000000; mbox[7] = 0; mbox[8] = 0;
+        mbox_flush_to_vc(9);
+        int clk_ok = mbox_call(8);
+        uart_puts("[UNICAM] V108 CLK_RATE SET resp="); uart_hex(mbox[1]);
+        uart_puts(" rate="); uart_hex(mbox[6]);
+        uart_puts(clk_ok ? " OK\n" : " FAILED\n");
     }
 
     /* ── Step 0A: Configure CM_CAM1CTL (Unicam1 digital backend clock) ─────
@@ -844,37 +901,13 @@ void unicam_init() {
     uart_puts(")\n");
 #endif
 
-    /* ── Step 0B: Enable Unicam1 clock gate ─────────────────────────────── */
-    /* V93 FIX: CLKGATE uses shift+OR algorithm with 0x5A000000 password.
-     *
-     * Linux bcm2835-unicam.c clk_write():
-     *   static inline void clk_write(struct unicam_device *dev, u32 val) {
-     *       writel(val | 0x5a000000, dev->clk_gate_base);  // always ORs password
-     *   }
-     * val computed as: val=1; for each active_data_lane: val = (val<<2)|1
-     *   1-lane: val = (1<<2)|1 = 5         → write 0x5A000005
-     *   2-lane: val = ((1<<2)|1)<<2|1 = 21 → write 0x5A000015
-     *
-     * V83 wrote 0x5A000005 for 1-lane (accidentally correct!), then removed the
-     * password thinking it was wrong. V88 changed to lane count (0x01/0x02).
-     * Register is write-only — readback=0x00000000 is normal/expected.
-     */
-    {
-        /* 2-lane: val = 1 → (1<<2)|1=5 → (5<<2)|1=21=0x15 → | 0x5A000000 */
-        const uint32_t clkgate_val = 0x5A000015u;  /* V93: 2-lane correct value */
+    /* ── Step 0B: CLKGATE diagnostic pre-read (V107: actual write moved to Step 14B) */
 #ifndef SIMULATION
+    {
         uint32_t cg_before = *UNICAM1_CLKGATE;
-        *UNICAM1_CLKGATE = clkgate_val;
-        uint32_t cg_after  = *UNICAM1_CLKGATE;
-        uart_puts("[UNICAM] CLKGATE: before="); uart_hex(cg_before);
-        uart_puts(" wrote=0x5A000015 readback="); uart_hex(cg_after); uart_puts("\n");
-#else
-        g_sim_state.cam1clk_enabled = true;
-        g_sim_state.clkgate_enabled = true;
-        g_sim_state.reg_clkgate = clkgate_val;
-        uart_puts("[UNICAM] CLKGATE=0x5A000015 (2-lane, shift+OR algo with password)\n");
-#endif
+        uart_puts("[UNICAM] CLKGATE pre-read: "); uart_hex(cg_before); uart_puts("\n");
     }
+#endif
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
     setup_unicam_block(U1);
@@ -891,6 +924,18 @@ bool unicam_capture_frame() {
 
     /* Validate all preconditions */
     bool ok = true;
+
+    /* V108: Firmware interactions — top-level gates */
+    if (!g_sim_state.domain_powered) {
+        uart_puts("[SIM] FAIL: SET_DOMAIN_STATE(domain=14) never called — Unicam1 power-gated!\n");
+        uart_puts("[SIM]   HW symptom: all registers writable, D-PHY HS active, but STA=0 forever\n");
+        uart_puts("[SIM]   Fix: mailbox tag 0x00038030, domain=14, on=1 (NOT old SET_POWER_STATE)\n");
+        ok = false;
+    }
+    if (!g_sim_state.core_clk_set) {
+        uart_puts("[SIM] FAIL: SET_CLOCK_RATE(clock=4, 250MHz) never called — CORE clock may be too slow\n");
+        ok = false;
+    }
 
     if (!g_sim_state.cam1clk_enabled) {
         uart_puts("[SIM] FAIL: CM_CAM1CTL (0x3F101048) not configured — Unicam1 digital backend clock OFF\n");
@@ -1071,6 +1116,38 @@ bool unicam_capture_frame() {
 #else
     /* ── Hardware capture: poll ISTA_FEI or STA.PI0 ─────────────────────── */
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
+
+    /* V109: Clear stale status flags before this frame's capture.
+     * STA and ISTA are W1C (write-1-to-clear). Without clearing, residual
+     * FSI/LCI from the previous frame could mask new events. */
+    U1[U_STA/4]  = 0xFFFFFFFFu;
+    U1[U_ISTA/4] = 0xFFFFFFFFu;
+
+    /* V109: Quick 50ms fast-poll to accumulate initial STA/ISTA state.
+     * NO CPR (V108 had CPR-post-stream which destroyed FE detection). */
+    {
+        uint32_t sta_accum = 0, ista_accum = 0;
+        for (unsigned long j = 0; j < 5000000UL; j++) {
+            if (j % 100000 == 0) watchdog_kick();
+            sta_accum  |= U1[U_STA/4];
+            ista_accum |= U1[U_ISTA/4];
+        }
+        uart_puts("[UNICAM] V109 fast-poll (50ms): STA_accum="); uart_hex(sta_accum);
+        uart_puts(" ISTA_accum="); uart_hex(ista_accum); uart_puts("\n");
+        /* If FEI or PI0 already fired during fast-poll, capture succeeded! */
+        if (ista_accum & U_ISTA_FEI) {
+            U1[U_ISTA/4] = 0xFFFFFFFFu;
+            uart_puts("[UNICAM] V109: FEI detected in fast-poll!\n");
+            return true;
+        }
+        if (sta_accum & U_STA_PI0) {
+            U1[U_ISTA/4] = 0xFFFFFFFFu;
+            U1[U_STA/4]  = U_STA_PI0;
+            uart_puts("[UNICAM] V109: PI0 (CMP0 match) detected in fast-poll!\n");
+            return true;
+        }
+    }
+
     bool saw_fs = false;
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
