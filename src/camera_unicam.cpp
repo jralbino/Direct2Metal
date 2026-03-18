@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V111 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V116 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -748,8 +748,11 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     U_WRITE(U_CLT, 0x0602u);   /* CLT1=2, CLT2=6 (60ns settle — Linux exact) */
     U_WRITE(U_DLT, 0x0602u);   /* DLT1=2, DLT2=6, DLT3=0 */
 
-    /* STEP 9: CMP0 — secondary Frame End detection via STA.PI0=BIT(15) */
-    U_WRITE(U_CMP0, 0x80000301u);
+    /* STEP 9: CMP0 — DISABLED in V114.
+     * V113 proved CMP0=0x80000301 fires prematurely at line 704 (not real FE).
+     * DMA continues past PI0 and wraps buffer. Now using IBWP polling instead.
+     * CMP0=0 disables comparison → PI0 never fires. */
+    U_WRITE(U_CMP0, 0x00000000u);
 
     /* STEP 10: Lane configuration — *** MUST BE AFTER CPR ***
      *
@@ -1125,24 +1128,54 @@ bool unicam_capture_frame() {
     uart_puts("  IBEA0=");      uart_hex(g_sim_state.reg_ibea0);
     uart_puts("\n");
 
-    /* Fill frame buffer with synthetic RAW10-packed RGGB test pattern.
-     * CSI-2 RAW10 packed: every 5 bytes hold 4 pixels (8 MSBs in bytes 0-3,
-     * 2 LSBs packed into byte 4). Debayer sees: RGGB pattern at 1536x864. */
+    /* V112: Fill frame buffer with synthetic RAW10-packed data.
+     * If test pattern active → color bars (8 vertical bars across 1536 cols).
+     * Otherwise → RGGB gradient as before. */
     for (int y = 0; y < FRAME_H; y++) {
         uint8_t* row = g_raw_frame + y * FRAME_W;
-        /* Each group of 5 bytes covers 4 horizontal pixels */
         for (int grp = 0; grp < FRAME_W / 5; grp++) {
-            int px = grp * 4;  /* pixel column (0, 4, 8, ...) */
+            int px = grp * 4;
             uint16_t p[4];
             for (int k = 0; k < 4; k++) {
                 int col = px + k;
-                bool isR = ((y & 1) == 0) && ((col & 1) == 0);
-                bool isB = ((y & 1) == 1) && ((col & 1) == 1);
-                uint16_t v;
-                if (isR)      v = (200 + (col % 55)) << 2;
-                else if (isB) v = (50  + (y   % 50)) << 2;
-                else          v = (120 + ((col + y) % 30)) << 2;
-                p[k] = v;  /* 10-bit pixel value */
+                if (g_sim_state.sensor_test_pattern == 2) {
+                    /* Color bars: 8 bars across 1536 pixels = 192px/bar.
+                     * IMX708 color bar order (RAW10 Bayer):
+                     * Bar 0: White, 1: Yellow, 2: Cyan, 3: Green,
+                     * 4: Magenta, 5: Red, 6: Blue, 7: Black.
+                     * For RAW Bayer, each pixel is one color channel.
+                     * We encode the expected Bayer value for RGGB pattern. */
+                    int bar = (col * 8) / 1536;
+                    if (bar > 7) bar = 7;
+                    /* MSB8 values for each bar at each Bayer position:
+                     *        R    Gr   Gb   B    */
+                    static const uint8_t bars[8][4] = {
+                        { 255, 255, 255, 255 },  /* white */
+                        { 255, 255, 255,   0 },  /* yellow */
+                        {   0, 255, 255, 255 },  /* cyan */
+                        {   0, 255, 255,   0 },  /* green */
+                        { 255,   0,   0, 255 },  /* magenta */
+                        { 255,   0,   0,   0 },  /* red */
+                        {   0,   0,   0, 255 },  /* blue */
+                        {   0,   0,   0,   0 },  /* black */
+                    };
+                    bool even_row = ((y & 1) == 0);
+                    bool even_col = ((col & 1) == 0);
+                    int bayer_idx;
+                    if (even_row && even_col)       bayer_idx = 0;  /* R */
+                    else if (even_row && !even_col) bayer_idx = 1;  /* Gr */
+                    else if (!even_row && even_col)  bayer_idx = 2;  /* Gb */
+                    else                             bayer_idx = 3;  /* B */
+                    p[k] = (uint16_t)bars[bar][bayer_idx] << 2;
+                } else {
+                    bool isR = ((y & 1) == 0) && ((col & 1) == 0);
+                    bool isB = ((y & 1) == 1) && ((col & 1) == 1);
+                    uint16_t v;
+                    if (isR)      v = (200 + (col % 55)) << 2;
+                    else if (isB) v = (50  + (y   % 50)) << 2;
+                    else          v = (120 + ((col + y) % 30)) << 2;
+                    p[k] = v;
+                }
             }
             row[grp*5+0] = (uint8_t)(p[0] >> 2);
             row[grp*5+1] = (uint8_t)(p[1] >> 2);
@@ -1151,7 +1184,9 @@ bool unicam_capture_frame() {
             row[grp*5+4] = (uint8_t)(((p[0]&3)<<6)|((p[1]&3)<<4)|((p[2]&3)<<2)|(p[3]&3));
         }
     }
-    uart_puts("[SIM] Synthetic RAW10-packed RGGB frame written (1536x864).\n");
+    uart_puts("[SIM] Synthetic RAW10 frame written (");
+    uart_puts(g_sim_state.sensor_test_pattern == 2 ? "COLOR BARS" : "RGGB gradient");
+    uart_puts(").\n");
     return true;
 
 #else
@@ -1166,122 +1201,70 @@ bool unicam_capture_frame() {
     U1[U_STA/4]  = 0xFFFFFFFFu;
     U1[U_ISTA/4] = 0xFFFFFFFFu;
 
-    /* V110: Wait for Frame Start, then wait for Frame End.
-     * This ensures we capture one complete frame from FS to FE.
-     * At 52fps, FS→FE is ~19ms. Total wait ≤ ~40ms typical. */
+    /* V114: Wait for Frame Start, then poll IBWP for frame completion.
+     *
+     * V113 proved CMP0/PI0 fires prematurely at line 704 (not real FE).
+     * The sensor sends all 864 lines — DMA wraps past PI0.
+     * New approach: after FS, poll IBWP until it reaches near IBEA0,
+     * or detect wrap (IBWP < previous = new frame started = old frame complete).
+     * At 52fps, FS→full frame ≈ 19ms. Timeout at 100ms. */
     bool saw_fs = false;
+    uint32_t base = U1[U_IBSA0/4];
+    uint32_t prev_wp = base;
+    uint32_t target_bytes = FRAME_SZ - FRAME_W;  /* 863 lines = close enough */
+
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
 
         uint32_t ista = U1[U_ISTA/4];
-        uint32_t sta  = U1[U_STA/4];
 
         /* Wait for Frame Start first */
         if (!saw_fs) {
             if (ista & U_ISTA_FSI) {
                 saw_fs = true;
-                /* Clear all flags so we can detect THIS frame's end */
+                /* V115: Re-trigger LIP to reset IBWP to IBSA0.
+                 * Between restart_unicam_dma() and this FS, the sensor was mid-frame.
+                 * DMA wrote partial stale lines at IBSA0. Without LIP here, the new
+                 * frame appends AFTER the stale data → horizontal bars.
+                 * LIP reloads IBSA0 into the write pointer so THIS frame starts at
+                 * the buffer base. Same approach as Linux ISR (re-LIP on each FS). */
+                U1[U_ICTL/4] |= U_ICTL_LIP;
+                asm volatile("dsb st" ::: "memory");
                 U1[U_STA/4]  = 0xFFFFFFFFu;
                 U1[U_ISTA/4] = 0xFFFFFFFFu;
+                prev_wp = U1[U_IBSA0/4];  /* WP should now be at IBSA0 */
             }
             continue;
         }
 
-        /* After FS: poll for Frame End (FEI or PI0) */
-        if ((ista & U_ISTA_FEI) || (sta & U_STA_PI0)) {
-            stop_unicam_dma();         /* V110: freeze buffer IMMEDIATELY */
+        /* After FS: poll IBWP for frame completion */
+        uint32_t wp = U1[U_IBWP/4];
+        uint32_t progress = wp - base;
+
+        /* Method 1: IBWP reached near end of buffer (≥863 lines written) */
+        if (progress >= target_bytes && progress <= FRAME_SZ + FRAME_W) {
+            stop_unicam_dma();
             invalidate_frame_dcache();
-            uart_puts("[UNICAM] V111: ");
-            uart_puts((ista & U_ISTA_FEI) ? "FEI" : "PI0");
-            uart_puts(" captured, DMA stopped\n");
-
-            /* V111 diagnostics: verify frame data format */
-            uart_puts("[DIAG] IBWP=");
-            uart_hex(U1[U_IBWP/4]);
-            uart_puts(" IBSA0=");
-            uart_hex(U1[U_IBSA0/4]);
-            uart_puts(" delta=");
-            uart_dec((int)(U1[U_IBWP/4] - U1[U_IBSA0/4]));
-            uart_puts(" expected=");
-            uart_dec(FRAME_SZ);
-            uart_puts("\n");
-
-            /* Hex dump first 20 bytes of frame buffer */
-            uart_puts("[DIAG] raw[0..19]: ");
-            for (int b = 0; b < 20; b++) {
-                uart_hex(g_raw_frame[b]);
-                uart_puts(" ");
-            }
-            uart_puts("\n");
-
-            /* Hex dump bytes at row 100 offset 0..19 */
-            uart_puts("[DIAG] raw[row100,0..19]: ");
-            for (int b = 0; b < 20; b++) {
-                uart_hex(g_raw_frame[100 * FRAME_W + b]);
-                uart_puts(" ");
-            }
-            uart_puts("\n");
-
-            /* Check if frame is all zeros (cache invalidation didn't work) */
-            int nonzero = 0;
-            for (int b = 0; b < 100; b++)
-                if (g_raw_frame[b * FRAME_W + b] != 0) nonzero++;
-            uart_puts("[DIAG] nonzero_sample=");
-            uart_dec(nonzero);
-            uart_puts("/100\n");
-
-            /* Decode a few RGGB pixels to check color separation */
-            /* At pixel (336,0): should be R position in RGGB */
-            {
-                const uint8_t* row0 = g_raw_frame;
-                const uint8_t* row1 = g_raw_frame + FRAME_W;
-                int col = 336;  /* CROP_X from debayer */
-                int grp = col >> 2;
-                int pos = col & 3;
-                uint8_t R  = row0[grp * 5 + pos];
-                uint8_t Gr = row0[grp * 5 + (pos + 1)];
-                int grp1 = col >> 2;
-                int pos1 = col & 3;
-                uint8_t Gb = row1[grp1 * 5 + pos1];
-                uint8_t B  = row1[grp1 * 5 + (pos1 + 1)];
-                uart_puts("[DIAG] RGGB@(336,0): R=");
-                uart_dec(R);
-                uart_puts(" Gr="); uart_dec(Gr);
-                uart_puts(" Gb="); uart_dec(Gb);
-                uart_puts(" B="); uart_dec(B);
-                uart_puts("\n");
-            }
-            /* Another sample at (400,200) */
-            {
-                const uint8_t* row0 = g_raw_frame + 200 * FRAME_W;
-                const uint8_t* row1 = g_raw_frame + 201 * FRAME_W;
-                int col = 400;
-                int grp = col >> 2;
-                int pos = col & 3;
-                uint8_t R  = row0[grp * 5 + pos];
-                uint8_t Gr = row0[grp * 5 + (pos + 1)];
-                uint8_t Gb = row1[grp * 5 + pos];
-                uint8_t B  = row1[grp * 5 + (pos + 1)];
-                uart_puts("[DIAG] RGGB@(400,200): R=");
-                uart_dec(R);
-                uart_puts(" Gr="); uart_dec(Gr);
-                uart_puts(" Gb="); uart_dec(Gb);
-                uart_puts(" B="); uart_dec(B);
-                uart_puts("\n");
-            }
-
+            uart_puts("[CAM] frame OK (");
+            uart_dec((int)(progress / FRAME_W));
+            uart_puts(" lines)\n");
             return true;
         }
 
-        /* Periodic diagnostic every ~100ms */
-        if (i > 0 && i % 10000000 == 0) {
-            uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
-            uart_puts("00ms: STA="); uart_hex(sta);
-            uart_puts(" ISTA="); uart_hex(ista);
-            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
-            uart_puts(saw_fs ? " (post-FS)" : " (pre-FS)");
-            uart_puts("\n");
+        /* Method 2: IBWP wrapped (new frame started = old frame complete).
+         * Detect: WP jumped backwards by more than half the buffer.
+         * With V115 LIP-after-FS, wrap should only happen if method 1 missed
+         * the brief window. The frame is still complete in the buffer. */
+        if (wp < prev_wp && (prev_wp - base) > FRAME_SZ / 2) {
+            stop_unicam_dma();
+            invalidate_frame_dcache();
+            uint32_t overwritten = (wp - base) / FRAME_W;
+            uart_puts("[CAM] frame OK (wrap, ");
+            uart_dec((int)overwritten);
+            uart_puts(" lines overwritten)\n");
+            return true;
         }
+        prev_wp = wp;
     }
 
     uart_puts("[UNICAM] TIMEOUT — no complete frame in ~500ms\n");

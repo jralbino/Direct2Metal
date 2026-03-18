@@ -880,3 +880,226 @@ a mix of dozens of different frames → visual corruption + black bars.
 - H4: Embedded data lines → first rows are metadata, not pixel data
 
 Sim PASS ✓. kernel8.img ready to flash.
+
+### V111 Hardware Results (2026-03-18)
+
+**Capture**: PI0 captured consistently across 5 frames. 52fps confirmed.
+
+**DIAG output** (consistent across all 5 frames):
+```
+[DIAG] IBWP=0xC238A200 IBSA0=0xC2240200 delta=1351680 expected=1658880
+[DIAG] raw[0..19]: 0x11 0x12 0x11 0x12 0x89 0x11 0x12 0x11 0x12 0x...
+[DIAG] raw[row100,0..19]: 0x11 0x14 0x11 0x14 0x33 0x12 0x14 0x12 0x14 0x...
+[DIAG] nonzero_sample=100/100
+[DIAG] RGGB@(336,0): R=18 Gr=20 Gb=20 B=18
+[DIAG] RGGB@(400,200): R=18 Gr=20 Gb=20 B=17
+```
+
+**Hypothesis results**:
+- **H1 FALSIFIED**: nonzero_sample=100/100 → DC CIVAC is NOT writing stale zeros. Data is present.
+- **H2 FALSIFIED**: 5-byte repeating pattern `[0x11 0x12 0x11 0x12 0xNN]` is textbook RAW10 packed (4 MSB8 + 1 packed LSB byte). Format is correct.
+- **H3 PARTIALLY CONFIRMED**: RGGB values nearly identical (R≈18, Gr≈20, Gb≈20, B≈18) — but this is because ALL pixels are at black level, not because Bayer phase is wrong. Pattern is R < G > B consistent with RGGB (green channels slightly higher = expected dark current difference).
+- **H4 NOT TESTED**: Row 0 and row 100 show identical values — if row 0 were embedded data, it would have different byte patterns. Not conclusive.
+
+**Key findings**:
+
+1. **DARK IMAGE — sensor at black level**: MSB8 values 17-20 → 10-bit values ~68-80. IMX708 black level ≈ 64 (10-bit). Signal is only 4-16 DN above pedestal. Despite 96% exposure time (0x0486/0x04B6 = 1158/1206 lines) and 1.12x gain (0x0070), sensor outputs near-darkness. Values are UNIFORM across entire frame (row 0 = row 100 = row 200, col 336 = col 400) → no spatial variation = no photons detected.
+
+2. **SHORT FRAME — 704 of 864 lines**: delta=1351680 / 1920 bytes/line = exactly 704 lines. 160 lines missing (864 - 704 = 160). PI0 fires at 704 lines → frame end detected early. Consistent across all 5 frames (identical delta every time).
+
+3. **5th byte varies between frames** (0x89, 0x59, 0xDD, 0xAA, 0xEA): these are the packed 2-bit LSBs of dark current noise — expected behavior for near-black pixels with shot noise.
+
+**New hypotheses**:
+- **H5**: Sensor exposure/gain registers not taking effect (registers written in standby but not applied after stream_on)
+- **H6**: Sensor is in test/standby mode due to undocumented register interaction
+- **H7**: Optical path blocked (lens/FFC mechanical issue) — less likely (FFC verified A4)
+- **H8**: Short frame due to embedded data lines or MIPI HS timing mismatch causing line loss
+
+---
+
+## V112 — Test pattern + max gain + extended multi-row DIAG
+
+**Date**: 2026-03-18
+
+**Goal**: Determine whether the dark image is caused by the sensor (optical/exposure) or the data path (CSI-2/DMA corruption).
+
+**Plan**:
+
+### Change 1: IMX708 test pattern (color bars)
+Write `0x0600 = 0x02` (color bar test pattern) after mode registers, before stream_on.
+- **If we see varied pixel values (color bars)**: data path is correct. Problem is sensor optical/exposure. → Fix: boost gain, verify exposure registers, check lens.
+- **If we still see dark/uniform pixels**: data path is corrupting or dropping pixel data. → Investigate Unicam IDI0 filtering, IBLS alignment, DMA coherency.
+
+### Change 2: Boost analog gain to maximum
+Write `0x0204 = 0x03, 0x0205 = 0xC0` → ANALOG_GAIN = 0x03C0 = 960.
+Gain = 1024/(1024-960) = 16x (was 1.12x at 0x0070).
+This is secondary to the test pattern — will take effect when test pattern is disabled.
+
+### Change 3: Extended multi-row DIAG
+Sample raw bytes at rows 0, 100, 350, 700, 800 to characterize:
+- Whether bottom rows (700, 800) are zeros (short frame → DMA didn't reach them)
+- Whether there's any spatial variation in pixel values
+- Print delta in lines (`delta / FRAME_W`) for clarity
+
+### Change 4: Print test pattern register readback
+After writing 0x0600, read it back and print to confirm I2C write took effect.
+
+**Expected UART output for PASS (test pattern working)**:
+```
+[IMX708] V112: test_pattern=2 (expect 2=color bars)
+[DIAG] delta=N lines (expected 864)
+[DIAG] raw[0..19]: varied values with clear pattern structure
+[DIAG] RGGB@(336,0): R≠Gr≠B (distinct color bar values)
+```
+
+**Expected UART output for FAIL (data path issue)**:
+```
+[DIAG] raw[0..19]: 0x11 0x12 0x11 0x12 ... (unchanged from V111)
+[DIAG] RGGB@(336,0): R≈18 Gr≈20 Gb≈20 B≈18 (still at black level)
+```
+
+---
+
+## V113 — Gain 16× activo, test_pattern=0, imagen verde (2026-03-18)
+
+```
+[IMX708] test_pattern=0 (off)  gain=0x03C0 (16×) ✓
+[POST-STREAM] ISTA=5 WP=0xC238A200  (704 líneas, igual V111)
+[CAM] frame OK (wrap, 0 lines overwritten)
+```
+
+Imagen: predominantemente verde, barras horizontales del frame anterior en el bottom.
+Pipeline: 526ms estable. Reset periódico por watchdog timeout entre frames.
+
+**Hallazgos:**
+- Frame corto 704/864 líneas persiste — PI0/LCI dispara antes del Frame End real
+- Verde dominante con 16× gain → datos presentes pero Bayer phase incorrecto
+- libcamera reportó `SBGGR10_1X10/RAW` → sensor es **BGGR, no RGGB**
+- ISTA=5 = FSI(BIT0)+LCI(BIT2) — FEI(BIT1) nunca aparece en ningún frame
+- Barras del frame anterior = bottom 160 líneas stale por short frame
+- Watchdog reset: `watchdog_kick()` no está dentro del polling loop de captura
+
+---
+
+## V114 — Plan: watchdog + IBWP wait + Bayer BGGR
+
+### Fix 1: Watchdog en capture polling loop
+```cpp
+for (int t = 0; t < 500; t += 10) {
+    watchdog_kick();
+    if (ISTA & (FEI | PI0)) break;
+    delay_ms(10);
+}
+```
+
+### Fix 2: Frame length — esperar IBWP >= IBSA0 + FRAME_SZ
+```cpp
+uint32_t deadline = get_time_ms() + 100;
+while (get_time_ms() < deadline) {
+    watchdog_kick();
+    if (UNICAM_READ(IBWP) >= ibsa0 + FRAME_SZ) { complete = true; break; }
+    delay_ms(2);
+}
+uint32_t lines = (UNICAM_READ(IBWP) - ibsa0) / FRAME_W;
+uart_printf("[DIAG] frame lines: %u/864\n", lines);
+```
+
+Si IBWP nunca llega a IBSA0+FRAME_SZ → sensor genuinamente envía 704 líneas.
+Si llega → PI0 disparaba prematuramente.
+
+### Fix 3: Bayer phase BGGR (libcamera: SBGGR10_1X10)
+En debayer swap canales R↔B. BGGR:
+```
+(row par,   col par)   → B  (era R en RGGB)
+(row par,   col impar) → G
+(row impar, col par)   → G
+(row impar, col impar) → R  (era B en RGGB)
+```
+
+---
+
+## V114 — HW: IBWP polling → 864/864 líneas, YOLO detecta objetos reales
+
+IBWP polling reemplaza CMP0/PI0. Frame completo: `wrap, 0 lines overwritten`.
+YOLO detecta bench (class 13, ~54% confidence) en frame real de cámara.
+Frame corto (704/864 líneas) estaba causado por PI0 prematuro en CMP0 (line 704).
+
+**UART output representativo:**
+```
+[CAM] frame OK (wrap, 0 lines overwritten)
+>>> OBJETOS DETECTADOS <<<
+  bench: 54.2%  [cx=160 cy=290 w=320 h=58]
+```
+
+---
+
+## V115 — HW: LIP-after-FS probado, barras persisten parcialmente (2026-03-18)
+
+LIP se re-dispara después de FSI para resetear IBWP a IBSA0. Se confirma:
+`wrap, 0 lines overwritten` en cada frame → buffer limpio.
+
+**UART output (V115 HW, frames 67-68 luego reset):**
+```
+=== YOLOv5n DECODER ENGINE [Frame: 67] ===
+[CAM] FSI detected — LIP re-triggered
+[CAM] frame OK (wrap, 0 lines overwritten)
+...
+=== YOLOv5n DECODER ENGINE [Frame: 68] ===
+[CAM] FSI detected — LIP re-triggered
+[CAM] frame OK (wrap, 0 lines overwritten)
+... (reset del sistema por watchdog timeout)
+=== Direct2Metal: MOTOR IA EN TIEMPO REAL ===
+=== YOLOv5n DECODER ENGINE [Frame: 1] ===
+```
+
+**Hallazgos:**
+- Reset periódico: watchdog a 4s, throttling térmico en Zero 2W puede superar ese límite
+- Barras horizontales: posiblemente artefactos de color BGGR, no staleness (buffer limpio)
+- Imagen verde dominante: BGGR no corregido en V115
+
+---
+
+## V116 — Plan + Implementación (2026-03-18)
+
+### Bug 1 — Watchdog reset → RESUELTO
+**Root cause**: Un solo `watchdog_kick()` al inicio del loop. Inferencia ~526ms + throttling térmico puede superar 4s.
+
+**Fix V116**: Timeout 4s → 8s + 3 kicks adicionales durante backbone/neck:
+```cpp
+if (get_timer_freq() != 62500000UL) watchdog_init(8000);  // 8s
+// En run_yolo_complete():
+watchdog_kick();  // al inicio del frame
+watchdog_kick();  // después de L4 (mid-backbone)
+watchdog_kick();  // después de backbone (SPPF)
+watchdog_kick();  // después de neck
+```
+
+### Bug 2 — Color verde dominante → RESUELTO
+**Root cause**: V109-V115 asumía RGGB. libcamera reporta `SBGGR10_1X10/RAW` para IMX708 en modo 1536×864 → primer pixel es B, no R.
+
+**Fix V116** en `camera_debayer.cpp` — todos los paths (`debayer_raw10_to_chw320`, `debayer_raw10_to_fb`, `debayer_raw10_row_rgb`):
+```cpp
+// Antes (RGGB — incorrecto):
+uint8_t R  = raw10_msb8(row0, src_x);
+uint8_t Gr = raw10_msb8(row0, src_x + 1);
+uint8_t Gb = raw10_msb8(row1, src_x);
+uint8_t B  = raw10_msb8(row1, src_x + 1);
+
+// Después (BGGR — correcto):
+uint8_t B  = raw10_msb8(row0, src_x);
+uint8_t Gb = raw10_msb8(row0, src_x + 1);
+uint8_t Gr = raw10_msb8(row1, src_x);
+uint8_t R  = raw10_msb8(row1, src_x + 1);
+```
+
+### Feature — SD card frame save → IMPLEMENTADO
+`src/sdcard.cpp` (nuevo): EMMC BCM2837 @0x3F300000 + FAT32 mínimo + PPM P6.
+- `sdcard_init()`: CMD0→CMD8→ACMD41→CMD2→CMD3→CMD7→CMD16 → MBR → BPB
+- `sdcard_save_ppm()`: escanea root dir por "FRAME   PPM" (8.3), escribe fila por fila (512B staging buffer), llama `debayer_raw10_row_rgb()` por fila
+- Preparar SD card: `python3 -c "hdr=b'P6\n480 480\n255\n'; open('FRAME.PPM','wb').write(hdr+bytes(480*480*3))"`
+- Leer resultado: `cp /boot/firmware/FRAME.PPM /tmp/ && eog /tmp/FRAME.PPM`
+
+**Build V116**: sim OK (3 frames, QEMU exit 0).
+
+**Pendiente**: flash HW y verificar colores correctos + no watchdog resets.
+

@@ -148,6 +148,7 @@ struct UnicamSimState {
     /* Sensor state */
     bool sensor_streaming;      /* sensor stream_on() called */
     uint8_t sensor_lane_count;  /* from I2C reg 0x0114: 1 or 2 */
+    uint8_t sensor_test_pattern; /* V112: 0=off, 2=color bars */
 
     /* Error tracking */
     const char* error_msg;      /* First validation failure (NULL if OK) */

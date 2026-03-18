@@ -22,7 +22,7 @@ ASM_SRCS = src/start.s src/matmul_neon.s src/data.s src/conv2d_neon.s
 CPP_SRCS = src/kernel.cpp src/ops.cpp src/conv2d.cpp src/mmu.cpp src/multicore.cpp \
            src/mailbox.cpp src/video.cpp src/watchdog.cpp \
            src/camera.cpp src/camera_bsc.cpp src/camera_imx708.cpp \
-           src/camera_unicam.cpp src/camera_debayer.cpp
+           src/camera_unicam.cpp src/camera_debayer.cpp src/sdcard.cpp
 
 # --- HARDWARE OBJECTS ---
 HW_OBJS = $(ASM_SRCS:src/%.s=%.o) $(CPP_SRCS:src/%.cpp=%.o)
