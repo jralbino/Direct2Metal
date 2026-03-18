@@ -312,17 +312,44 @@ static void delay_nop(unsigned int n) {
     for (volatile unsigned int i = 0; i < n; i++) asm volatile("nop");
 }
 
-/* ─── DMA cache invalidation ─────────────────────────────────────────────── */
-/* V109/A5: After DMA completes, the frame data is in DRAM but ARM D-cache
- * may hold stale lines. DC IVAC invalidates without writeback (read-only buffer).
- * Must be called BEFORE reading g_raw_frame from ARM. */
+/* ─── DMA cache coherency ────────────────────────────────────────────────── */
+/* V110: After DMA completes, frame data is in DRAM but ARM D-cache may hold
+ * stale lines (BSS zeros or previous frame). DC CIVAC = Clean + Invalidate:
+ *   Clean = writeback dirty lines to DRAM (no-op if DMA already wrote)
+ *   Invalidate = mark lines invalid → next ARM read fetches fresh DRAM
+ * DC IVAC (invalidate-only) can be UNPREDICTABLE on dirty lines on some
+ * implementations. CIVAC is safe regardless of line state. */
 static void invalidate_frame_dcache() {
 #ifndef SIMULATION
     unsigned long addr = (unsigned long)(void*)g_raw_frame;
     unsigned long end  = addr + FRAME_SZ;
     for (unsigned long a = addr & ~63UL; a < end; a += 64)
-        asm volatile("dc ivac, %0" :: "r"(a) : "memory");
+        asm volatile("dc civac, %0" :: "r"(a) : "memory");
     asm volatile("dsb sy" ::: "memory");
+#endif
+}
+
+/* V110: Stop DMA after capture — freeze buffer contents.
+ * Clear CPE to disable Unicam peripheral. Without this, the sensor at 52fps
+ * overwrites the buffer during the ~1100ms debayer, corrupting the frame. */
+static void stop_unicam_dma() {
+#ifndef SIMULATION
+    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
+    U1[U_CTRL/4] &= ~U_CTRL_CPE;   /* CPE=0 → peripheral disabled, DMA stops */
+    asm volatile("dsb st" ::: "memory");
+#endif
+}
+
+/* V110: Restart DMA for next capture.
+ * Re-enable CPE, re-write CLKGATE, re-assert MISC FL bits, trigger LIP. */
+static void restart_unicam_dma() {
+#ifndef SIMULATION
+    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
+    U1[U_CTRL/4] |= U_CTRL_CPE;                    /* CPE=1 */
+    *UNICAM1_CLKGATE = 0x5A000015u;                 /* re-assert CLKGATE */
+    U1[U_MISC/4] |= (1u << 6) | (1u << 9);         /* MISC FL0|FL1 */
+    U1[U_ICTL/4] |= U_ICTL_LIP;                    /* LIP — latch addresses */
+    asm volatile("dsb st" ::: "memory");
 #endif
 }
 
@@ -1128,88 +1155,67 @@ bool unicam_capture_frame() {
     return true;
 
 #else
-    /* ── Hardware capture: poll ISTA_FEI or STA.PI0 ─────────────────────── */
+    /* ── Hardware capture: poll ISTA_FEI or STA.PI0, then freeze DMA ──── */
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
 
-    /* V109: Clear stale status flags before this frame's capture.
-     * STA and ISTA are W1C (write-1-to-clear). Without clearing, residual
-     * FSI/LCI from the previous frame could mask new events. */
+    /* V110: Re-enable DMA if it was stopped after previous capture.
+     * Must re-assert CPE, CLKGATE, MISC, and LIP to restart reception. */
+    restart_unicam_dma();
+
+    /* V109: Clear stale status flags before this frame's capture. */
     U1[U_STA/4]  = 0xFFFFFFFFu;
     U1[U_ISTA/4] = 0xFFFFFFFFu;
 
-    /* V109: Quick 50ms fast-poll to accumulate initial STA/ISTA state.
-     * NO CPR (V108 had CPR-post-stream which destroyed FE detection). */
-    {
-        uint32_t sta_accum = 0, ista_accum = 0;
-        for (unsigned long j = 0; j < 5000000UL; j++) {
-            if (j % 100000 == 0) watchdog_kick();
-            sta_accum  |= U1[U_STA/4];
-            ista_accum |= U1[U_ISTA/4];
-        }
-        uart_puts("[UNICAM] V109 fast-poll (50ms): STA_accum="); uart_hex(sta_accum);
-        uart_puts(" ISTA_accum="); uart_hex(ista_accum); uart_puts("\n");
-        /* If FEI or PI0 already fired during fast-poll, capture succeeded! */
-        if (ista_accum & U_ISTA_FEI) {
-            U1[U_ISTA/4] = 0xFFFFFFFFu;
-            uart_puts("[UNICAM] V109: FEI detected in fast-poll!\n");
-            invalidate_frame_dcache();
-            return true;
-        }
-        if (sta_accum & U_STA_PI0) {
-            U1[U_ISTA/4] = 0xFFFFFFFFu;
-            U1[U_STA/4]  = U_STA_PI0;
-            uart_puts("[UNICAM] V109: PI0 (CMP0 match) detected in fast-poll!\n");
-            invalidate_frame_dcache();
-            return true;
-        }
-    }
-
+    /* V110: Wait for Frame Start, then wait for Frame End.
+     * This ensures we capture one complete frame from FS to FE.
+     * At 52fps, FS→FE is ~19ms. Total wait ≤ ~40ms typical. */
     bool saw_fs = false;
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
 
-        /* Periodic STA/ISTA diagnostic: print every ~10M iterations (~100ms) */
-        if (i > 0 && i % 10000000 == 0) {
-            uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
-            uart_puts("00ms: STA="); uart_hex(U1[U_STA/4]);
-            uart_puts(" ISTA="); uart_hex(U1[U_ISTA/4]);
-            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
-            uart_puts(" CTRL="); uart_hex(U1[U_CTRL/4]); uart_puts("\n");
-        }
-
         uint32_t ista = U1[U_ISTA/4];
         uint32_t sta  = U1[U_STA/4];
 
-        /* Log first FS (Frame Start) as diagnostic — if FS fires but FE never does,
-         * the problem is inside the frame (data corruption/DMA issue), not protocol init */
-        if (!saw_fs && (ista & U_ISTA_FSI)) {
-            saw_fs = true;
-            uart_puts("[UNICAM] FS received (ISTA_FSI)! WP="); uart_hex(U1[U_IBWP/4]); uart_puts("\n");
+        /* Wait for Frame Start first */
+        if (!saw_fs) {
+            if (ista & U_ISTA_FSI) {
+                saw_fs = true;
+                /* Clear all flags so we can detect THIS frame's end */
+                U1[U_STA/4]  = 0xFFFFFFFFu;
+                U1[U_ISTA/4] = 0xFFFFFFFFu;
+            }
+            continue;
         }
 
+        /* After FS: poll for Frame End (FEI or PI0) */
         if (ista & U_ISTA_FEI) {
-            U1[U_ISTA/4] = 0xFFFFFFFFu;   /* clear all interrupt flags */
+            stop_unicam_dma();         /* V110: freeze buffer IMMEDIATELY */
             invalidate_frame_dcache();
+            uart_puts("[UNICAM] V110: FEI captured, DMA stopped\n");
             return true;
         }
         if (sta & U_STA_PI0) {
-            U1[U_ISTA/4] = 0xFFFFFFFFu;
-            U1[U_STA/4]  = U_STA_PI0;     /* clear CMP0 match flag */
+            stop_unicam_dma();         /* V110: freeze buffer IMMEDIATELY */
             invalidate_frame_dcache();
+            uart_puts("[UNICAM] V110: PI0 captured, DMA stopped\n");
             return true;
+        }
+
+        /* Periodic diagnostic every ~100ms */
+        if (i > 0 && i % 10000000 == 0) {
+            uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
+            uart_puts("00ms: STA="); uart_hex(sta);
+            uart_puts(" ISTA="); uart_hex(ista);
+            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
+            uart_puts(saw_fs ? " (post-FS)" : " (pre-FS)");
+            uart_puts("\n");
         }
     }
 
-    uart_puts("[UNICAM] TIMEOUT — ISTA_FEI never fired after ~500ms\n");
-    uart_puts("[UNICAM] CM_CAM1CTL="); uart_dec((int)*CM_CAM1CTL);
-    uart_puts(" CM_CAM1DIV="); uart_dec((int)*CM_CAM1DIV); uart_puts("\n");
+    uart_puts("[UNICAM] TIMEOUT — no complete frame in ~500ms\n");
     uart_puts("[UNICAM] IBWP="); uart_hex(U1[U_IBWP/4]);
     uart_puts("  STA="); uart_hex(U1[U_STA/4]);
     uart_puts("  ISTA="); uart_hex(U1[U_ISTA/4]); uart_puts("\n");
-    uart_puts("[UNICAM] ANA="); uart_hex(U1[U_ANA/4]);
-    uart_puts(" CLT="); uart_hex(U1[U_CLT/4]);
-    uart_puts(" DLT="); uart_hex(U1[U_DLT/4]); uart_puts("\n");
-    uart_puts("  (IBWP==IBSA0 + STA=0: CSI-2 not syncing — check ANA/DLT/lane mode)\n");
     dump_unicam_regs(U1);
     return false;
 #endif
