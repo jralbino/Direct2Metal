@@ -1,5 +1,5 @@
 /* File: src/camera_unicam.cpp
- * V109 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
+ * V111 — Complete BCM2837 Unicam1 CSI-2 Driver + Hardware-Faithful Simulator
  *
  * ── CRITICAL BUGS FIXED vs V75 ──────────────────────────────────────────────
  *   [A] IDI0 at 0x108 = 0x2A (RAW8, VC=0) — was COMPLETELY MISSING in V75!
@@ -831,7 +831,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x00D80007 | 0x20 = 0x00D80027 */
 
-    uart_puts("[UNICAM] V109 init complete. CTRL=");
+    uart_puts("[UNICAM] V111 init complete. CTRL=");
     uart_hex(U_READ(U_CTRL));
     uart_puts(" IDI0=");
     uart_hex(U_READ(U_IDI0));
@@ -1188,16 +1188,88 @@ bool unicam_capture_frame() {
         }
 
         /* After FS: poll for Frame End (FEI or PI0) */
-        if (ista & U_ISTA_FEI) {
+        if ((ista & U_ISTA_FEI) || (sta & U_STA_PI0)) {
             stop_unicam_dma();         /* V110: freeze buffer IMMEDIATELY */
             invalidate_frame_dcache();
-            uart_puts("[UNICAM] V110: FEI captured, DMA stopped\n");
-            return true;
-        }
-        if (sta & U_STA_PI0) {
-            stop_unicam_dma();         /* V110: freeze buffer IMMEDIATELY */
-            invalidate_frame_dcache();
-            uart_puts("[UNICAM] V110: PI0 captured, DMA stopped\n");
+            uart_puts("[UNICAM] V111: ");
+            uart_puts((ista & U_ISTA_FEI) ? "FEI" : "PI0");
+            uart_puts(" captured, DMA stopped\n");
+
+            /* V111 diagnostics: verify frame data format */
+            uart_puts("[DIAG] IBWP=");
+            uart_hex(U1[U_IBWP/4]);
+            uart_puts(" IBSA0=");
+            uart_hex(U1[U_IBSA0/4]);
+            uart_puts(" delta=");
+            uart_dec((int)(U1[U_IBWP/4] - U1[U_IBSA0/4]));
+            uart_puts(" expected=");
+            uart_dec(FRAME_SZ);
+            uart_puts("\n");
+
+            /* Hex dump first 20 bytes of frame buffer */
+            uart_puts("[DIAG] raw[0..19]: ");
+            for (int b = 0; b < 20; b++) {
+                uart_hex(g_raw_frame[b]);
+                uart_puts(" ");
+            }
+            uart_puts("\n");
+
+            /* Hex dump bytes at row 100 offset 0..19 */
+            uart_puts("[DIAG] raw[row100,0..19]: ");
+            for (int b = 0; b < 20; b++) {
+                uart_hex(g_raw_frame[100 * FRAME_W + b]);
+                uart_puts(" ");
+            }
+            uart_puts("\n");
+
+            /* Check if frame is all zeros (cache invalidation didn't work) */
+            int nonzero = 0;
+            for (int b = 0; b < 100; b++)
+                if (g_raw_frame[b * FRAME_W + b] != 0) nonzero++;
+            uart_puts("[DIAG] nonzero_sample=");
+            uart_dec(nonzero);
+            uart_puts("/100\n");
+
+            /* Decode a few RGGB pixels to check color separation */
+            /* At pixel (336,0): should be R position in RGGB */
+            {
+                const uint8_t* row0 = g_raw_frame;
+                const uint8_t* row1 = g_raw_frame + FRAME_W;
+                int col = 336;  /* CROP_X from debayer */
+                int grp = col >> 2;
+                int pos = col & 3;
+                uint8_t R  = row0[grp * 5 + pos];
+                uint8_t Gr = row0[grp * 5 + (pos + 1)];
+                int grp1 = col >> 2;
+                int pos1 = col & 3;
+                uint8_t Gb = row1[grp1 * 5 + pos1];
+                uint8_t B  = row1[grp1 * 5 + (pos1 + 1)];
+                uart_puts("[DIAG] RGGB@(336,0): R=");
+                uart_dec(R);
+                uart_puts(" Gr="); uart_dec(Gr);
+                uart_puts(" Gb="); uart_dec(Gb);
+                uart_puts(" B="); uart_dec(B);
+                uart_puts("\n");
+            }
+            /* Another sample at (400,200) */
+            {
+                const uint8_t* row0 = g_raw_frame + 200 * FRAME_W;
+                const uint8_t* row1 = g_raw_frame + 201 * FRAME_W;
+                int col = 400;
+                int grp = col >> 2;
+                int pos = col & 3;
+                uint8_t R  = row0[grp * 5 + pos];
+                uint8_t Gr = row0[grp * 5 + (pos + 1)];
+                uint8_t Gb = row1[grp * 5 + pos];
+                uint8_t B  = row1[grp * 5 + (pos + 1)];
+                uart_puts("[DIAG] RGGB@(400,200): R=");
+                uart_dec(R);
+                uart_puts(" Gr="); uart_dec(Gr);
+                uart_puts(" Gb="); uart_dec(Gb);
+                uart_puts(" B="); uart_dec(B);
+                uart_puts("\n");
+            }
+
             return true;
         }
 

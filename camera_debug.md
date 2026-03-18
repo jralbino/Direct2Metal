@@ -809,7 +809,74 @@ AFTER. The CPR mid-reception resets D-PHY → loses frame boundary → FEI never
 3. Fast-poll 50ms: if FEI or PI0 fires during fast-poll, return success immediately
 4. All V108 fixes preserved (SET_DOMAIN_STATE, SET_CLOCK_RATE, CLKGATE post-CPE, bus 0xC0000000)
 
-**Expected**: fast-poll detects FEI or PI0 within 50ms → capture succeeds → debayer runs.
-If FEI still missing: investigate why Frame End short packet not triggering ISTA BIT(1).
+**HW result**: PI0 captured consistently in fast-poll. Pipeline total ~1591ms.
+Debayer time ~1100ms due to DMA overwrite (sensor at 52fps continuously overwrites buffer during read).
+
+---
+
+## V110 — DMA stop/restart + RAW10 debayer (A5)
+
+**Date**: 2026-03-18
+
+**Root cause of 1100ms debayer**: DMA continuously streaming at 52fps. Each frame is ~19ms,
+so during the ~1100ms debayer read, the buffer is overwritten ~58 times. The debayer reads
+a mix of dozens of different frames → visual corruption + black bars.
+
+**Changes**:
+1. `stop_unicam_dma()`: clear CPE after PI0/FEI detection → freeze buffer immediately
+2. `restart_unicam_dma()`: re-enable CPE + CLKGATE + MISC FL + LIP before next capture
+3. `invalidate_frame_dcache()`: DC CIVAC (clean+invalidate) entire frame buffer after DMA stop
+4. `camera_debayer.cpp`: complete rewrite from RAW8 to RAW10 packed format
+   - `raw10_msb8()`: extract MSB 8 bits from RAW10 packed (group*5+pos)
+   - `debayer_raw10_to_chw320()`: RAW10 → float32 CHW 320×320 for YOLO (NEON)
+   - `debayer_raw10_to_fb()`: RAW10 → ARGB 480×480 letterboxed in 640×480
+   - Center-crop 864×864 from 1536×864, nearest-neighbor scale
+5. FS→FE capture protocol: wait FS, clear flags, wait FE/PI0, stop DMA
+
+**HW result**:
+- RGB time: **29ms** (down from 1100ms) ✓
+- Total pipeline: **526ms** ✓
+- PI0 captured consistently
+- Orientation: **correct** ✓
+- **Barras negras persisten** — horizontal black bands in the image
+- **Monocromático** — no color differentiation, grayscale-like output
+
+**Analysis of remaining issues**:
+- Black bars: possibly embedded data lines from sensor (first N lines are metadata, not pixels),
+  or incorrect byte stride calculation, or partial frame DMA.
+- Monochrome: possibly wrong Bayer pattern phase (IMX708 binned might not be RGGB),
+  or all RGGB channels reading similar values from same byte position.
+
+---
+
+## V111 — Diagnostic hex dump for black bars + monochrome
+
+**Date**: 2026-03-18
+
+**Changes**: Added post-capture diagnostics to `unicam_capture_frame()` after DMA stop + cache invalidation:
+
+1. **IBWP delta**: print `IBWP - IBSA0` vs expected `FRAME_SZ` (1658880 = 1920×864)
+   - If delta < FRAME_SZ: DMA didn't write a complete frame
+   - If delta > FRAME_SZ: buffer overflow / wrap-around
+
+2. **Hex dump raw[0..19]**: first 20 bytes of frame buffer
+   - Expected RAW10: varied non-zero values in groups of 5 (bytes 0-3 = MSB8, byte 4 = LSBs)
+   - If all zeros: cache invalidation failed (DC CIVAC wrote back stale BSS zeros)
+   - If all 0xFF or repeated: data format mismatch
+
+3. **Hex dump raw[row100,0..19]**: same at row 100 (skip possible embedded data lines)
+
+4. **nonzero_sample**: 100 diagonal samples — count non-zero bytes
+   - 0/100 = cache problem; 100/100 = data present
+
+5. **RGGB pixel decode** at (336,0) and (400,200):
+   - If R≈Gr≈Gb≈B: wrong Bayer phase or data not RGGB
+   - If values differ: Bayer pattern correct, color issue is in debayer/display
+
+**Hypotheses to falsify**:
+- H1: DC CIVAC writes back stale zeros over DMA data → nonzero_sample=0
+- H2: Data format is RAW10 unpacked (2 bytes/pixel), not packed (5 bytes/4 pixels) → hex dump shows pattern
+- H3: Bayer pattern phase wrong (not RGGB in binned mode) → RGGB values all similar
+- H4: Embedded data lines → first rows are metadata, not pixel data
 
 Sim PASS ✓. kernel8.img ready to flash.

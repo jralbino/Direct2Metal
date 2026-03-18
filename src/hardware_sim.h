@@ -1,5 +1,5 @@
 /* File: src/hardware_sim.h
- * V108 — BCM2837 Unicam1 Hardware Simulator
+ * V111 — BCM2837 Unicam1 Hardware Simulator
  *
  * Provides a register-level software emulation of the BCM2837 Unicam1
  * CSI-2 receiver. In SIMULATION mode (-DSIMULATION), all MMIO reads/writes

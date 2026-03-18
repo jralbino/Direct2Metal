@@ -1,7 +1,7 @@
 # Direct2Metal — Plan de Desarrollo
 
 > Última actualización: 2026-03-18
-> Estado: Phase 9 activa — V109 listo para flash. **STA>0 CONFIRMADO en V108** (primer Frame Start en 21 versiones). Root cause: SET_DOMAIN_STATE faltante. V109 elimina CPR-post-stream que destruía Frame End.
+> Estado: Phase 9 activa — V111 listo para flash. **Imagen visible desde V108.** V109: captura PI0 funcional. V110: DMA stop/restart (29ms debayer vs 1100ms). V111: diagnósticos hex dump para depurar barras negras + monocromático.
 
 ---
 
@@ -10,12 +10,15 @@
 El motor de inferencia (Phases 1–8) está completo: YOLOv5n 320×320 en bare-metal AArch64 a
 **511 ms / ~2 FPS** con 4 cores Cortex-A53, NEON SIMD, MMU + D-cache, e ISO 26262 safety hardening.
 
-Phase 9 (driver CSI-2 IMX708) — **ROOT CAUSE CONFIRMADO en V108: SET_DOMAIN_STATE faltante.**
-Tras 21 versiones con STA=0, V108 descubrió que Linux usa `SET_DOMAIN_STATE` (tag 0x00038030,
-domain=14) vía raspberrypi-genpd, NO el viejo `SET_POWER_STATE` (tag 0x00028001).
-Sin domain power, el decoder CSI-2 digital estaba congelado — MMIO funcional, D-PHY activo,
-pero STA=0 siempre. V108 HW: STA=0xD001 (FS + PI0), ISTA=0x05, IBWP avanza, ruido en HDMI.
-V109 elimina CPR diagnóstico que destruía detección de Frame End.
+Phase 9 (driver CSI-2 IMX708) — **Imagen visible desde V108. Captura funcional desde V109.**
+V108: ROOT CAUSE (SET_DOMAIN_STATE faltante) → primer STA>0 en 21 versiones.
+V109: PI0/FEI captura consistente (eliminado CPR-post-stream).
+V110: DMA stop/restart tras captura — debayer bajó de 1100ms a 29ms. Orientación correcta.
+V111: Diagnósticos hex dump (IBWP, raw bytes, RGGB pixel values) para depurar barras negras + monocromático.
+
+**Issues pendientes V111:** barras negras + imagen monocromática. Posibles causas:
+formato RAW10 packed vs unpacked, fase Bayer incorrecta, cache invalidation (DC CIVAC vs IVAC),
+embedded data lines del sensor.
 
 ---
 
@@ -40,7 +43,9 @@ V109 elimina CPR diagnóstico que destruía detección de Frame End.
 | V106 | CLKGATE @0x3F802004 (CSI1!) + 0x5A000015 | STA=0, readback=0x15 | Dirección corregida, pero no era suficiente solo |
 | V107 | CLKGATE write post-CPE (orden Linux) | STA=0 | Orden correcto, falta algo más |
 | **V108** | **SET_DOMAIN_STATE(14,1) + SET_CLOCK_RATE(4,250M)** | **STA=0xD001 ✓** | **ROOT CAUSE: firmware domain power faltante** |
-| V109 | Eliminar CPR-post-stream + clear ISTA/STA | PENDIENTE | Fix: CPR destruía FE; fast-poll para captura temprana |
+| V109 | Eliminar CPR-post-stream + clear ISTA/STA | **PI0 captura ✓** | CPR destruía FE; sin CPR, PI0 detectado consistentemente en fast-poll |
+| V110 | DMA stop/restart + DC CIVAC cache invalidation | **Orientación ✓, 29ms RGB** | DMA overwrite resuelto (CPE=0 tras captura). Barras negras + monocromático persisten |
+| V111 | Diagnósticos: IBWP, hex dump, RGGB pixel values | **PENDIENTE FLASH** | Para determinar: formato datos, fase Bayer, cache effectiveness |
 
 **ROOT CAUSE (V108): SET_DOMAIN_STATE faltante.**
 
@@ -71,8 +76,8 @@ Hallazgos acumulados de versiones anteriores:
 
 ## Track A — Desbloquear la cámara *(bloqueante)*
 
-> **Estado V109**: ROOT CAUSE confirmado en V108 (SET_DOMAIN_STATE). STA>0 por primera vez.
-> V109 elimina CPR diagnóstico que destruía Frame End. Si FEI/PI0 dispara → captura funciona → A5 debayer.
+> **Estado V111**: Captura funcional (PI0). Debayer RAW10 implementado (A5). DMA stop/restart funciona (29ms).
+> **Problema abierto:** barras negras + imagen monocromática. V111 agrega diagnósticos para identificar causa raíz.
 
 ---
 
@@ -204,16 +209,38 @@ Código V105–V108 regenerado manualmente desde contexto de conversación. `har
 
 ---
 
-### V109 — Eliminar CPR-post-stream + fast-poll ← LISTO PARA FLASH
+### ~~V109~~ — Eliminar CPR-post-stream + fast-poll ← COMPLETADO ✓
 
-V108 demostró que PI0 (Frame End vía CMP0) dispara ANTES del CPR diagnóstico, y desaparece
-DESPUÉS. El CPR mid-recepción resetea D-PHY → pierde frame boundary → FEI nunca llega.
+HW: PI0 capturado consistentemente en fast-poll. Pipeline total ~1591ms (debayer 1100ms por DMA overwrite).
 
-Cambios V109:
-1. **Sin CPR en captura** — eliminado completamente
-2. **Clear ISTA/STA** antes de cada frame (W1C, limpiar flags residuales)
-3. **Fast-poll 50ms** — si FEI o PI0 dispara durante fast-poll, retorna éxito inmediato
-4. Todos los fixes V108 conservados (SET_DOMAIN_STATE, SET_CLOCK_RATE, CLKGATE post-CPE, bus 0xC0000000)
+---
+
+### ~~V110~~ — DMA stop/restart + RAW10 debayer (A5) ← COMPLETADO (parcial)
+
+Cambios:
+1. **stop_unicam_dma()**: CPE=0 tras PI0/FEI → congela buffer inmediatamente
+2. **restart_unicam_dma()**: re-enable CPE + CLKGATE + MISC + LIP antes de cada captura
+3. **DC CIVAC**: cache clean+invalidate del buffer DMA completo
+4. **camera_debayer.cpp**: reescrito de RAW8 a RAW10 packed (5 bytes → 4 pixels)
+5. **debayer_raw10_to_fb()**: 480×480 letterboxed en 640×480, RGGB → ARGB
+
+HW resultado: RGB 29ms (de 1100ms). Orientación correcta. **Barras negras + monocromático persisten.**
+
+---
+
+### V111 — Diagnósticos hex dump ← LISTO PARA FLASH
+
+Agrega después de capture + cache invalidation:
+1. **IBWP print**: verifica `delta == FRAME_SZ (1658880)` — frame completo escrito
+2. **Hex dump raw[0..19]** y **raw[row100,0..19]**: verifica formato RAW10-packed
+3. **nonzero_sample**: 100 muestras diagonales — 0/100 = cache no funciona
+4. **RGGB pixel decode** en (336,0) y (400,200): verifica separación de color
+
+Hipótesis a falsificar:
+- **DC CIVAC escribe zeros sobre datos DMA**: BSS-zeroed cache lines → CIVAC write-back → overwrites
+- **Formato no es RAW10-packed**: sensor podría enviar RAW10 unpacked (2 bytes/pixel)
+- **Fase Bayer incorrecta**: IMX708 binned puede no ser RGGB
+- **Embedded data lines**: primeras líneas son metadata, no pixels
 
 Sim PASS ✓. kernel8.img listo.
 
