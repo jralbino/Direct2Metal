@@ -23,6 +23,8 @@ extern void video_flush();
 // Framebuffer pointer and pitch exported from video.cpp
 extern unsigned char* lfb;
 extern uint32_t pitch;
+extern void uart_hex(uint32_t d);
+extern const uint8_t* unicam_frame_ptr();
 
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
@@ -427,6 +429,23 @@ void run_yolo_complete() {
         }
     }
     if (valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
+
+    /* V117 DIAG: Bright magenta border every frame — visible even if image is black.
+     * If border is NOT visible on HDMI, framebuffer writes are not reaching display.
+     * Remove when display confirmed working. */
+    draw_rect(0, 0, 640, 480, 0xFFFF00FFu, 3);
+
+    /* V117 DIAG: First 3 frames — print framebuffer center pixel + raw sensor bytes. */
+    if (global_frame_counter <= 4 && lfb) {
+        uint32_t fb_pixel = ((volatile uint32_t*)lfb)[240 * 640 + 320]; /* center of image */
+        uart_puts("[DIAG] FB center pixel="); uart_hex(fb_pixel); uart_puts(" lfb="); uart_hex((uint32_t)(unsigned long)lfb); uart_puts("\n");
+        const uint8_t* raw = unicam_frame_ptr();
+        if (raw) {
+            uart_puts("[DIAG] raw[0..7]=");
+            for (int _d = 0; _d < 8; _d++) { uart_hex(raw[_d]); uart_putc(' '); }
+            uart_puts("\n");
+        }
+    }
 
     // Heartbeat indicator: bottom-right corner of the display area
     int hb_x = disp_xoff + (g_use_camera ? CAM_DISP_W : 640) - 50;
