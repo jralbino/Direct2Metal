@@ -1,24 +1,37 @@
 /* File: src/camera_debayer.cpp
- * RAW8 RGGB 1536×864 → float32 CHW 320×320 conversion.
+ * V109/A5 — RAW10-packed RGGB 1536×864 → float32 CHW 320×320 + framebuffer display.
+ *
+ * CSI-2 RAW10 packed format: every 5 bytes hold 4 pixels (10-bit each).
+ *   Byte layout per group:
+ *     byte[0] = P0 bits[9:2]  (MSB 8 bits)
+ *     byte[1] = P1 bits[9:2]
+ *     byte[2] = P2 bits[9:2]
+ *     byte[3] = P3 bits[9:2]
+ *     byte[4] = P3[1:0]<<6 | P2[1:0]<<4 | P1[1:0]<<2 | P0[1:0]<<0
+ *
+ * For 8-bit quality output (YOLO input / display), we only use the MSB 8 bits
+ * (byte[0..3]), ignoring byte[4]. This is equivalent to >> 2 on the 10-bit value.
+ * This simplifies the debayer to a stride-aware byte access pattern.
  *
  * Pipeline:
- *   1. Center-crop: x_start=336 (even), crop region = 864×864
+ *   1. Center-crop: x_start=336 pixels (even), crop region = 864×864 pixels
  *   2. Nearest-neighbor scale 864→320 using Q8 fixed-point step=691
  *   3. Simple bilinear RGGB demosaic: G = (Gr + Gb) / 2
  *   4. Normalise: divide by 255.0  (output range [0, 1])
  *   5. Pack into CHW: [R plane][G plane][B plane]
  *
- * NEON: the scalar gather (non-contiguous source pixels) is unavoidable for
- * nearest-neighbour; NEON accelerates the uint8→float32 conversion for 8
- * output pixels at a time (3× batched stores into R/G/B planes).
+ * RAW10 pixel access: pixel column `col` within a line of `stride` bytes:
+ *   group = col / 4;  pos_in_group = col % 4;
+ *   msb8 = row[group * 5 + pos_in_group];
  */
 #include <stdint.h>
 #include <arm_neon.h>
 
 // Provided by camera_unicam.cpp
 extern const uint8_t* unicam_frame_ptr();
-extern int            unicam_frame_w();
-extern int            unicam_frame_h();
+extern int            unicam_frame_w();   // byte stride (1920)
+extern int            unicam_frame_h();   // 864
+extern int            unicam_pixel_w();   // 1536
 
 // Output image dimensions (YOLO inference)
 #define OUT_W    320
@@ -41,8 +54,16 @@ extern int            unicam_frame_h();
 #define DISP_XOFF    80
 #define STEP_Q8_FB  461
 
+/* Read MSB 8 bits of a RAW10-packed pixel at column `col` in a row.
+ * row points to the start of the line (stride = unicam_frame_w() bytes).
+ * This extracts byte[group*5 + pos], which holds bits[9:2] of the 10-bit pixel. */
+static inline uint8_t raw10_msb8(const uint8_t* row, int col) {
+    int group = col >> 2;          /* col / 4 */
+    int pos   = col & 3;           /* col % 4 */
+    return row[group * 5 + pos];
+}
+
 // ---- Conversion of 8 gathered pixels using NEON ----
-// Converts uint8[8] arrays for R, G, B into float32 and stores into CHW planes.
 static inline void store8_to_chw(const uint8_t* r8, const uint8_t* g8, const uint8_t* b8,
                                   float* r_ptr, float* g_ptr, float* b_ptr) {
     const float32x4_t vscale = vdupq_n_f32(1.0f / 255.0f);
@@ -51,7 +72,6 @@ static inline void store8_to_chw(const uint8_t* r8, const uint8_t* g8, const uin
     uint8x8_t vg = vld1_u8(g8);
     uint8x8_t vb = vld1_u8(b8);
 
-    // Widen u8 → u16 → u32 → f32 for first 4 elements
     uint16x8_t vr16 = vmovl_u8(vr);
     uint16x8_t vg16 = vmovl_u8(vg);
     uint16x8_t vb16 = vmovl_u8(vb);
@@ -71,9 +91,9 @@ static inline void store8_to_chw(const uint8_t* r8, const uint8_t* g8, const uin
     vst1q_f32(b_ptr + 4, vmulq_f32(bf1, vscale));
 }
 
-void debayer_raw8_to_chw320(float* dst) {
+void debayer_raw10_to_chw320(float* dst) {
     const uint8_t* frame = unicam_frame_ptr();
-    const int src_stride = unicam_frame_w();   // = 1536
+    const int byte_stride = unicam_frame_w();   // = 1920 bytes per line
 
     float* r_plane = dst;
     float* g_plane = dst + OUT_H * OUT_W;
@@ -83,10 +103,10 @@ void debayer_raw8_to_chw320(float* dst) {
         // Map output row → source row, snap to even (RGGB boundary)
         int src_y = ((oy * STEP_Q8) >> 8);
         src_y &= ~1;   // round down to even
-        if (src_y + 1 >= CROP_SZ) src_y = CROP_SZ - 2;  // clamp
+        if (src_y + 1 >= CROP_SZ) src_y = CROP_SZ - 2;
 
-        const uint8_t* row0 = frame + src_y       * src_stride;
-        const uint8_t* row1 = frame + (src_y + 1) * src_stride;
+        const uint8_t* row0 = frame + src_y       * byte_stride;
+        const uint8_t* row1 = frame + (src_y + 1) * byte_stride;
 
         float* r_row = r_plane + oy * OUT_W;
         float* g_row = g_plane + oy * OUT_W;
@@ -97,16 +117,15 @@ void debayer_raw8_to_chw320(float* dst) {
         for (; ox <= OUT_W - 8; ox += 8) {
             uint8_t r8[8], g8[8], b8[8];
             for (int k = 0; k < 8; k++) {
-                int src_x = ((( ox + k) * STEP_Q8) >> 8) + CROP_X;
-                src_x &= ~1;                             // snap to even
-                if (src_x + 1 >= src_stride) src_x = src_stride - 2; // clamp
+                int src_x = (((ox + k) * STEP_Q8) >> 8) + CROP_X;
+                src_x &= ~1;   // snap to even RGGB
 
-                // RGGB 2×2 block:  R  Gr
-                //                  Gb  B
-                uint8_t R  = row0[src_x];
-                uint8_t Gr = row0[src_x + 1];
-                uint8_t Gb = row1[src_x];
-                uint8_t B  = row1[src_x + 1];
+                // RGGB 2×2 block:  R  Gr    (row0: src_x, src_x+1)
+                //                  Gb  B    (row1: src_x, src_x+1)
+                uint8_t R  = raw10_msb8(row0, src_x);
+                uint8_t Gr = raw10_msb8(row0, src_x + 1);
+                uint8_t Gb = raw10_msb8(row1, src_x);
+                uint8_t B  = raw10_msb8(row1, src_x + 1);
 
                 r8[k] = R;
                 g8[k] = (uint8_t)(((unsigned)Gr + Gb) >> 1);
@@ -119,12 +138,11 @@ void debayer_raw8_to_chw320(float* dst) {
         for (; ox < OUT_W; ox++) {
             int src_x = ((ox * STEP_Q8) >> 8) + CROP_X;
             src_x &= ~1;
-            if (src_x + 1 >= src_stride) src_x = src_stride - 2;
 
-            uint8_t R  = row0[src_x];
-            uint8_t Gr = row0[src_x + 1];
-            uint8_t Gb = row1[src_x];
-            uint8_t B  = row1[src_x + 1];
+            uint8_t R  = raw10_msb8(row0, src_x);
+            uint8_t Gr = raw10_msb8(row0, src_x + 1);
+            uint8_t Gb = raw10_msb8(row1, src_x);
+            uint8_t B  = raw10_msb8(row1, src_x + 1);
 
             r_row[ox] = R  * (1.0f / 255.0f);
             g_row[ox] = (uint8_t)(((unsigned)Gr + Gb) >> 1) * (1.0f / 255.0f);
@@ -133,22 +151,19 @@ void debayer_raw8_to_chw320(float* dst) {
     }
 }
 
-// Render the last captured RAW8 frame directly to the framebuffer at maximum resolution.
+// Render the last captured RAW10 frame directly to the framebuffer at maximum resolution.
 // Writes 480×480 pixels (center-crop of 864×864) to x=[80,560] in a 640×480 framebuffer.
-// Left/right 80-pixel letterbox columns are filled with black.
-// Pixel format: 0xFF_BB_GG_RR (matches draw_pixel convention in video.cpp).
-void debayer_raw8_to_fb(uint8_t* fb, uint32_t pitch) {
+void debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch) {
     const uint8_t* frame = unicam_frame_ptr();
-    const int src_stride = unicam_frame_w();   // = 1536
+    const int byte_stride = unicam_frame_w();   // = 1920 bytes per line
 
     for (int oy = 0; oy < DISP_H; oy++) {
-        // Map output row → source row, snap to even RGGB boundary
         int src_y = (oy * STEP_Q8_FB) >> 8;
         src_y &= ~1;
         if (src_y + 1 >= CROP_SZ) src_y = CROP_SZ - 2;
 
-        const uint8_t* row0 = frame + src_y       * src_stride;
-        const uint8_t* row1 = frame + (src_y + 1) * src_stride;
+        const uint8_t* row0 = frame + src_y       * byte_stride;
+        const uint8_t* row1 = frame + (src_y + 1) * byte_stride;
 
         uint32_t* fb_row = (uint32_t*)(fb + (uint32_t)oy * pitch);
 
@@ -159,13 +174,11 @@ void debayer_raw8_to_fb(uint8_t* fb, uint32_t pitch) {
         for (int ox = 0; ox < DISP_W; ox++) {
             int src_x = ((ox * STEP_Q8_FB) >> 8) + CROP_X;
             src_x &= ~1;
-            if (src_x + 1 >= src_stride) src_x = src_stride - 2;
 
-            // RGGB 2×2 block
-            uint8_t R  = row0[src_x];
-            uint8_t Gr = row0[src_x + 1];
-            uint8_t Gb = row1[src_x];
-            uint8_t B  = row1[src_x + 1];
+            uint8_t R  = raw10_msb8(row0, src_x);
+            uint8_t Gr = raw10_msb8(row0, src_x + 1);
+            uint8_t Gb = raw10_msb8(row1, src_x);
+            uint8_t B  = raw10_msb8(row1, src_x + 1);
             uint8_t G  = (uint8_t)(((unsigned)Gr + Gb) >> 1);
 
             fb_row[DISP_XOFF + ox] = 0xFF000000u | ((uint32_t)B << 16) | ((uint32_t)G << 8) | R;

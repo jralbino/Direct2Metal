@@ -10,8 +10,8 @@ extern uint8_t imx708_read_frame_count();
 extern void   unicam_init();
 extern bool   unicam_capture_frame();
 extern void   unicam_print_lane_state(const char* tag);
-extern void   debayer_raw8_to_chw320(float* dst);
-extern void   debayer_raw8_to_fb(uint8_t* fb, uint32_t pitch);
+extern void   debayer_raw10_to_chw320(float* dst);
+extern void   debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch);
 
 bool g_use_camera = false;
 
@@ -54,7 +54,7 @@ bool camera_init() {
 
 void camera_capture_frame(float* dst) {
     if (unicam_capture_frame()) {
-        debayer_raw8_to_chw320(dst);
+        debayer_raw10_to_chw320(dst);
     } else {
         uart_puts("[CAM] Capture failed — using zero tensor\n");
         for (int i = 0; i < (3 * 320 * 320); i++) dst[i] = 0.0f;
@@ -62,5 +62,5 @@ void camera_capture_frame(float* dst) {
 }
 
 void camera_render_fullres(uint8_t* fb, uint32_t pitch) {
-    debayer_raw8_to_fb(fb, pitch);
+    debayer_raw10_to_fb(fb, pitch);
 }

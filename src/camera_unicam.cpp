@@ -312,6 +312,20 @@ static void delay_nop(unsigned int n) {
     for (volatile unsigned int i = 0; i < n; i++) asm volatile("nop");
 }
 
+/* ─── DMA cache invalidation ─────────────────────────────────────────────── */
+/* V109/A5: After DMA completes, the frame data is in DRAM but ARM D-cache
+ * may hold stale lines. DC IVAC invalidates without writeback (read-only buffer).
+ * Must be called BEFORE reading g_raw_frame from ARM. */
+static void invalidate_frame_dcache() {
+#ifndef SIMULATION
+    unsigned long addr = (unsigned long)(void*)g_raw_frame;
+    unsigned long end  = addr + FRAME_SZ;
+    for (unsigned long a = addr & ~63UL; a < end; a += 64)
+        asm volatile("dc ivac, %0" :: "r"(a) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+#endif
+}
+
 /* ─── SIMULATION register file and emulation ─────────────────────────────── */
 #ifdef SIMULATION
 
@@ -1138,12 +1152,14 @@ bool unicam_capture_frame() {
         if (ista_accum & U_ISTA_FEI) {
             U1[U_ISTA/4] = 0xFFFFFFFFu;
             uart_puts("[UNICAM] V109: FEI detected in fast-poll!\n");
+            invalidate_frame_dcache();
             return true;
         }
         if (sta_accum & U_STA_PI0) {
             U1[U_ISTA/4] = 0xFFFFFFFFu;
             U1[U_STA/4]  = U_STA_PI0;
             uart_puts("[UNICAM] V109: PI0 (CMP0 match) detected in fast-poll!\n");
+            invalidate_frame_dcache();
             return true;
         }
     }
@@ -1173,11 +1189,13 @@ bool unicam_capture_frame() {
 
         if (ista & U_ISTA_FEI) {
             U1[U_ISTA/4] = 0xFFFFFFFFu;   /* clear all interrupt flags */
+            invalidate_frame_dcache();
             return true;
         }
         if (sta & U_STA_PI0) {
             U1[U_ISTA/4] = 0xFFFFFFFFu;
             U1[U_STA/4]  = U_STA_PI0;     /* clear CMP0 match flag */
+            invalidate_frame_dcache();
             return true;
         }
     }
@@ -1211,5 +1229,6 @@ void unicam_print_lane_state(const char* tag) {
 }
 
 const uint8_t* unicam_frame_ptr() { return g_raw_frame; }
-int unicam_frame_w() { return FRAME_W; }
-int unicam_frame_h() { return FRAME_H; }
+int unicam_frame_w() { return FRAME_W; }      /* byte stride (1920) */
+int unicam_frame_h() { return FRAME_H; }      /* 864 */
+int unicam_pixel_w() { return 1536; }         /* actual pixel columns */
