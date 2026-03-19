@@ -9,7 +9,6 @@
 #include "watchdog.h"
 #include "camera.h"
 #include "mailbox.h"
-#include "sdcard.h"
 
 #ifndef NULL
 #define NULL 0
@@ -23,8 +22,6 @@ extern void video_flush();
 // Framebuffer pointer and pitch exported from video.cpp
 extern unsigned char* lfb;
 extern uint32_t pitch;
-extern void uart_hex(uint32_t d);
-extern const uint8_t* unicam_frame_ptr();
 
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
@@ -108,21 +105,6 @@ struct WeightStream {
 
 struct Box { float x, y, w, h, conf; int cls; };
 static Box preds[MAX_PREDS]; static int num_preds = 0;
-
-/* COCO 80-class names (YOLOv5n output indices 0-79) */
-static const char* const coco_names[80] = {
-    "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat",
-    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
-    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
-    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
-    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
-    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
-    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake",
-    "chair","couch","potted plant","bed","dining table","toilet","tv","laptop",
-    "mouse","keyboard","cell phone","microwave","oven","toaster","sink",
-    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
-    "toothbrush"
-};
 
 static float calculate_iou(const Box& a, const Box& b) {
     float x1_int = (a.x - a.w/2) > (b.x - b.w/2) ? (a.x - a.w/2) : (b.x - b.w/2);
@@ -300,7 +282,6 @@ void run_yolo_complete() {
     const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
     parallel_conv2d(buf_A, 80, 80, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 40, 40, 64, 64, 2, true, ws, "L4"); copy_tensor(buf_A, save_L4, 64*40*40);
-    watchdog_kick();  /* V116: kick mid-backbone (thermal throttle on Zero 2W can slow inference) */
 
     const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
     parallel_conv2d(buf_A, 40, 40, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
@@ -310,7 +291,6 @@ void run_yolo_complete() {
     parallel_conv2d(buf_A, 20, 20, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
     c3_real_inference(buf_B, buf_A, scratch, 10, 10, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, 10, 10, 256, ws);
-    watchdog_kick();  /* V116: kick after backbone */
 
     unsigned long t_backbone = get_timer_count();
 
@@ -343,7 +323,6 @@ void run_yolo_complete() {
     concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, 10*10);
     c3_real_inference(scratch, buf_B, buf_A, 10, 10, 256, 256, 1, false, ws, "L23");
 
-    watchdog_kick();  /* V116: kick after neck */
     unsigned long t_neck = get_timer_count();
 
     const float* w_det_p3 = ws.next(255*64, "Det_P3_W"); const float* b_det_p3 = ws.next(255, "Det_P3_B");
@@ -383,6 +362,7 @@ void run_yolo_complete() {
     // Test mode: upscale 320×320 float tensor to 640×480.
     if (g_use_camera) {
         camera_render_fullres((uint8_t*)lfb, pitch);
+        video_flush();  /* V118: flush immediately after render to reduce tearing */
     } else {
         draw_fill(0xFF222222);
         draw_tensor_image_fullscreen(input_img);
@@ -402,12 +382,8 @@ void run_yolo_complete() {
     for (int ii = 0; ii < num_preds; ii++) {
         if (preds[ii].conf > CONF_THRESH) {
             valid_boxes++;
-            int cls = preds[ii].cls;
-            const char* name = (cls >= 0 && cls < 80) ? coco_names[cls] : "?";
-            uart_puts("[DET] "); uart_puts(name);
-            uart_puts(" "); uart_dec((int)(preds[ii].conf * 100));
-            uart_puts("% ["); uart_dec((int)preds[ii].x);
-            uart_puts(","); uart_dec((int)preds[ii].y); uart_puts("]\n");
+            uart_puts("Clase: "); uart_dec(preds[ii].cls); uart_puts(" | Conf: "); uart_dec((int)(preds[ii].conf * 100));
+            uart_puts(" | Pos: ["); uart_dec((int)preds[ii].x); uart_puts(","); uart_dec((int)preds[ii].y); uart_puts("]\n");
 
             int box_w = (int)(preds[ii].w * disp_scale);
             int box_h = (int)(preds[ii].h * disp_scaleY);
@@ -429,23 +405,6 @@ void run_yolo_complete() {
         }
     }
     if (valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
-
-    /* V117 DIAG: Bright magenta border every frame — visible even if image is black.
-     * If border is NOT visible on HDMI, framebuffer writes are not reaching display.
-     * Remove when display confirmed working. */
-    draw_rect(0, 0, 640, 480, 0xFFFF00FFu, 3);
-
-    /* V117 DIAG: First 3 frames — print framebuffer center pixel + raw sensor bytes. */
-    if (global_frame_counter <= 4 && lfb) {
-        uint32_t fb_pixel = ((volatile uint32_t*)lfb)[240 * 640 + 320]; /* center of image */
-        uart_puts("[DIAG] FB center pixel="); uart_hex(fb_pixel); uart_puts(" lfb="); uart_hex((uint32_t)(unsigned long)lfb); uart_puts("\n");
-        const uint8_t* raw = unicam_frame_ptr();
-        if (raw) {
-            uart_puts("[DIAG] raw[0..7]=");
-            for (int _d = 0; _d < 8; _d++) { uart_hex(raw[_d]); uart_putc(' '); }
-            uart_puts("\n");
-        }
-    }
 
     // Heartbeat indicator: bottom-right corner of the display area
     int hb_x = disp_xoff + (g_use_camera ? CAM_DISP_W : 640) - 50;
@@ -496,22 +455,10 @@ extern "C" void kernel_main() {
     asm volatile("sev");
     extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4);
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
-    video_init(); draw_fill(0xFF00FF00); video_flush(); uart_puts("Hardware de Video Listo.\n");
+    video_init(); draw_fill(0xFF000000); video_flush(); uart_puts("Hardware de Video Listo.\n");
     init_mmu();
     if (!camera_init()) uart_puts("[CAM] No camera found, using test_image\r\n");
-    if (get_timer_freq() != 62500000UL) watchdog_init(8000);  /* V116: 8s (was 4s) — thermal throttle on Zero 2W can slow inference */
-#ifndef SIMULATION
-    if (g_use_camera) {
-        /* V116: Save first live frame to FRAME.PPM on SD card boot partition for visual verification */
-        if (sdcard_init()) {
-            camera_capture_frame(cam_frame);   // warm-up capture before YOLO loop
-            if (sdcard_save_ppm()) uart_puts("[SD] FRAME.PPM saved — cp /boot/firmware/FRAME.PPM /tmp/ && eog /tmp/FRAME.PPM\r\n");
-            else                   uart_puts("[SD] FRAME.PPM write failed\r\n");
-        } else {
-            uart_puts("[SD] sdcard_init failed — skipping frame save\r\n");
-        }
-    }
-#endif
+    if (get_timer_freq() != 62500000UL) watchdog_init(4000);
 #ifdef SIMULATION
     /* In simulation mode: run 3 frames to verify the pipeline, then exit QEMU
      * cleanly via AArch64 semihosting HLT #0xF000 (QEMU processes this as

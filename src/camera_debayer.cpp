@@ -1,13 +1,11 @@
 /* File: src/camera_debayer.cpp
- * V116 — RAW10-packed BGGR 1536×864 → float32 CHW 320×320 + framebuffer display.
+ * V111+BGGR — RAW10-packed BGGR 1536×864 → float32 CHW 320×320 + framebuffer display.
  *
- * V116 FIX: Bayer pattern corrected RGGB → BGGR.
- *   libcamera reports SBGGR10_1X10/RAW for IMX708 in 1536×864 mode.
+ * BGGR fix: IMX708 reports SBGGR10_1X10/RAW (libcamera confirmed).
  *   BGGR layout:  (even row, even col) = B
  *                 (even row, odd  col) = Gb
  *                 (odd  row, even col) = Gr
  *                 (odd  row, odd  col) = R
- *   V109–V115 had R↔B swapped → image appeared green-dominant with wrong hue.
  *
  * CSI-2 RAW10 packed format: every 5 bytes hold 4 pixels (10-bit each).
  *   Byte layout per group:
@@ -190,37 +188,15 @@ void debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch) {
             uint8_t R  = raw10_msb8(row1, src_x + 1);
             uint8_t G  = (uint8_t)(((unsigned)Gr + Gb) >> 1);
 
-            fb_row[DISP_XOFF + ox] = 0xFF000000u | ((uint32_t)B << 16) | ((uint32_t)G << 8) | R;
+            // Brightness stretch: subtract black level (16) and apply 4x gain, clamp to 255
+            int rb = ((int)R - 16) * 4; if (rb < 0) rb = 0; if (rb > 255) rb = 255;
+            int gb = ((int)G - 16) * 4; if (gb < 0) gb = 0; if (gb > 255) gb = 255;
+            int bb = ((int)B - 16) * 4; if (bb < 0) bb = 0; if (bb > 255) bb = 255;
+
+            fb_row[DISP_XOFF + ox] = 0xFF000000u | ((uint32_t)bb << 16) | ((uint32_t)gb << 8) | (uint32_t)rb;
         }
 
         // Right letterbox (black)
         for (int x = DISP_XOFF + DISP_W; x < FB_W; x++) fb_row[x] = 0xFF000000u;
-    }
-}
-
-/* Debayer one row of the 480×480 crop to packed RGB888 into dst (dst must hold 480*3 bytes).
- * Used by sdcard module to write PPM sector-by-sector without a large intermediate buffer. */
-void debayer_raw10_row_rgb(uint8_t* dst, int out_row) {
-    const uint8_t* frame = unicam_frame_ptr();
-    const int byte_stride = unicam_frame_w();
-
-    int src_y = (out_row * STEP_Q8_FB) >> 8;
-    src_y &= ~1;
-    if (src_y + 1 >= CROP_SZ) src_y = CROP_SZ - 2;
-
-    const uint8_t* row0 = frame + src_y       * byte_stride;
-    const uint8_t* row1 = frame + (src_y + 1) * byte_stride;
-
-    for (int ox = 0; ox < DISP_W; ox++) {
-        int src_x = ((ox * STEP_Q8_FB) >> 8) + CROP_X;
-        src_x &= ~1;
-        uint8_t B  = raw10_msb8(row0, src_x);
-        uint8_t Gb = raw10_msb8(row0, src_x + 1);
-        uint8_t Gr = raw10_msb8(row1, src_x);
-        uint8_t R  = raw10_msb8(row1, src_x + 1);
-        uint8_t G  = (uint8_t)(((unsigned)Gr + Gb) >> 1);
-        dst[ox * 3 + 0] = R;
-        dst[ox * 3 + 1] = G;
-        dst[ox * 3 + 2] = B;
     }
 }

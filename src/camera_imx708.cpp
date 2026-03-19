@@ -1,5 +1,5 @@
 /* File: src/camera_imx708.cpp
- * V115 — IMX708 Sensor Initialization
+ * V104 — IMX708 Sensor Initialization
  *
  * ── LANE MODE HISTORY ────────────────────────────────────────────────────────
  * V72: 1-lane (0x0114=0x00) — D0hi oscillates HS↔LP-11 (sensor transmits).
@@ -44,7 +44,6 @@ bool imx708_init() {
 #ifdef SIMULATION
     uart_puts("[SIM] Bypass I2C: IMX708 simulated present (ID=0x0708)\n");
     g_sim_state.sensor_lane_count = 2;   /* V104: 2-lane, non-continuous HS clock */
-    g_sim_state.sensor_test_pattern = 0; /* V113: test pattern off (V112 confirmed data path) */
     return true;
 #endif
 
@@ -68,19 +67,6 @@ bool imx708_init() {
     /* V91: Use native RAW10 — k_imx708_common already sets 0x0114=0x01 (2-lane)
      * and 0x0112=0x0A (RAW10). IDI0=0x2B, IBLS=1920 match this format. */
 
-    /* V113: Test pattern disabled — V112 confirmed data path works (color bars OK).
-     * Dark image = H7 (optical obstruction). Keeping test pattern OFF for real capture.
-     * To re-enable: 0x0600=0x00, 0x0601=0x02 (color bars). */
-    i2c_write_reg16(IMX708_ADDR, 0x0600, 0x00);  /* high byte = 0 */
-    i2c_write_reg16(IMX708_ADDR, 0x0601, 0x00);  /* low byte = 0 = off */
-
-    /* V112: Boost analog gain to maximum.
-     * 0x0204/0x0205 = ANALOG_GAIN. Was 0x0070 (1.12x). Now 0x03C0 (16x).
-     * Gain = 1024/(1024-960) = 16x. Will amplify any real signal significantly.
-     * (Test pattern ignores gain, so this only matters for future real captures.) */
-    i2c_write_reg16(IMX708_ADDR, 0x0204, 0x03);  /* gain high byte */
-    i2c_write_reg16(IMX708_ADDR, 0x0205, 0xC0);  /* gain low byte */
-
     /* V103: Restore 2-lane mode — Pi OS uses 2-lane (0x0114=0x01).
      * k_imx708_common sets 0x0114=0x01 (2-lane) — no override needed.
      * V94 forced 1-lane (0x0114=0x00) as diagnostic — falsified, reverting.
@@ -89,24 +75,26 @@ bool imx708_init() {
 
     uint8_t lane_mode    = i2c_read_reg16(IMX708_ADDR, 0x0114);
     uint8_t pixel_fmt    = i2c_read_reg16(IMX708_ADDR, 0x0112);
-    uart_puts("[IMX708] V113: 0x0114="); uart_dec((int)lane_mode);
-    uart_puts(" (1=2lane)  0x0112="); uart_dec((int)pixel_fmt);
-    uart_puts(" (10=RAW10)\n");
+    uart_puts("[IMX708] V104: 0x0114="); uart_dec((int)lane_mode);
+    uart_puts(" (1=2lane expected)  0x0112="); uart_dec((int)pixel_fmt);
+    uart_puts(" (10=RAW10 expected)\n");
 
-    /* V113: Readback gain + test pattern to confirm I2C writes */
+    /* V97 A3 / V104: Extended register readback to verify sensor configuration.
+     * 0x0900 = binning enable (expect 0x01=on), 0x0901 = binning type (expect 0x22).
+     * 0x0310 = MIPI clock mode: 0x00=non-continuous (expect), 0x01=continuous (WRONG). */
     {
-        uint8_t tp_hi      = i2c_read_reg16(IMX708_ADDR, 0x0600);
-        uint8_t tp_lo      = i2c_read_reg16(IMX708_ADDR, 0x0601);
-        uint8_t gain_hi    = i2c_read_reg16(IMX708_ADDR, 0x0204);
-        uint8_t gain_lo    = i2c_read_reg16(IMX708_ADDR, 0x0205);
+        uint8_t mode_sel   = i2c_read_reg16(IMX708_ADDR, 0x0100);
+        uint8_t bin_en     = i2c_read_reg16(IMX708_ADDR, 0x0900);
+        uint8_t bin_type   = i2c_read_reg16(IMX708_ADDR, 0x0901);
+        uint8_t fmt_hi     = i2c_read_reg16(IMX708_ADDR, 0x0112);
+        uint8_t fmt_lo     = i2c_read_reg16(IMX708_ADDR, 0x0113);
         uint8_t clk_mode   = i2c_read_reg16(IMX708_ADDR, 0x0310);
-        uart_puts("[IMX708] V113: test_pattern=");
-        uart_dec((int)((tp_hi << 8) | tp_lo));
-        uart_puts(" (expect 0=off)  gain=");
-        uart_hex(((uint32_t)gain_hi << 8) | gain_lo);
-        uart_puts(" (expect 0x03C0=16x)\n");
-        uart_puts("[IMX708] V113: 0x0310(clk_mode)="); uart_dec((int)clk_mode);
-        uart_puts(" (expect 0=non-continuous)\n");
+        uart_puts("[IMX708] V97 A3: mode="); uart_dec((int)mode_sel);
+        uart_puts(" fmt="); uart_hex(((uint32_t)fmt_hi << 8) | fmt_lo);
+        uart_puts(" bin_en="); uart_dec((int)bin_en);
+        uart_puts(" bin_type="); uart_hex(bin_type);
+        uart_puts("\n[IMX708] V104: 0x0310(clk_mode)="); uart_dec((int)clk_mode);
+        uart_puts(" (expect 0=non-continuous; 1=continuous=WRONG)\n");
     }
     return true;
 }
