@@ -1,4 +1,4 @@
-/* File: src/camera.cpp - V76: Unified camera pipeline */
+/* File: src/camera.cpp - V124: RGGB Bayer fix (blue-skin → correct skin tone) */
 #include "camera.h"
 
 extern void uart_puts(const char* s);
@@ -12,7 +12,7 @@ extern bool   unicam_capture_frame();
 extern void   unicam_print_lane_state(const char* tag);
 extern void   debayer_raw10_to_chw320(float* dst);
 extern void   debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch);
-
+extern void watchdog_kick();
 bool g_use_camera = false;
 
 static void cam_delay_ms(int ms) {
@@ -60,6 +60,7 @@ void camera_capture_frame(float* dst) {
         for (int i = 0; i < (3 * 320 * 320); i++) dst[i] = 0.0f;
     }
 }
+
 
 void camera_render_fullres(uint8_t* fb, uint32_t pitch) {
     debayer_raw10_to_fb(fb, pitch);

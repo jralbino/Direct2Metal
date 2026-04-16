@@ -3,6 +3,11 @@
 *.elf
 *.img
 *.pt
+*.jpg
+*.png
+*.html
+*.txt
+*.ppm
 
 # Python env 
 tools/env/

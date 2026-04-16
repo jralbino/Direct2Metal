@@ -10,16 +10,19 @@ bool camera_init();
 // Output values are in [0.0, 1.0] (already divided by 255).
 void camera_capture_frame(float* dst);
 
-// Render the last captured RAW8 frame directly to the framebuffer at maximum resolution.
-// Writes a 480×480 debayered image centered (x=80) in a 640×480 framebuffer.
-// Left/right 80-pixel letterbox columns are filled with black.
-// Must be called after camera_capture_frame() for the same frame.
+// Render the last captured RAW10 frame directly to the framebuffer at native 16:9.
+// V124: Debayers the full 1536×864 sensor frame into a 640×360 image centered
+// vertically in the 640×480 framebuffer. Top/bottom 60-pixel rows are black
+// letterbox bars. Must be called after camera_capture_frame() for the same frame.
 void camera_render_fullres(uint8_t* fb, uint32_t pitch);
 
-// Letterbox geometry constants (camera display region within the 640×480 framebuffer)
-#define CAM_DISP_W     480
-#define CAM_DISP_H     480
-#define CAM_DISP_XOFF   80    // x offset of camera image in framebuffer
-#define CAM_DISP_YOFF    0    // y offset of camera image in framebuffer
+// V124: Display geometry (YOLO bounding-box overlay region).
+// YOLO input is the 864×864 center crop of the 1536×864 sensor frame,
+// scaled to 320×320. On the framebuffer that square crop is shown at x=140..500,
+// y=60..420 — a 360×360 region inside the 640×360 full-FoV image.
+#define CAM_DISP_W     360    // YOLO crop displayed as 360×360 (864/1536 * 640)
+#define CAM_DISP_H     360
+#define CAM_DISP_XOFF  140    // (640 - 360) / 2
+#define CAM_DISP_YOFF   60    // (480 - 360) / 2  — 16:9 vertical letterbox
 
 extern bool g_use_camera;

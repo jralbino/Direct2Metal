@@ -1125,24 +1125,27 @@ bool unicam_capture_frame() {
     uart_puts("  IBEA0=");      uart_hex(g_sim_state.reg_ibea0);
     uart_puts("\n");
 
-    /* Fill frame buffer with synthetic RAW10-packed RGGB test pattern.
-     * CSI-2 RAW10 packed: every 5 bytes hold 4 pixels (8 MSBs in bytes 0-3,
-     * 2 LSBs packed into byte 4). Debayer sees: RGGB pattern at 1536x864. */
+    /* Fill frame buffer with synthetic RAW10-packed BGGR test pattern.
+     * BGGR layout (matching IMX708 SBGGR10_1X10):
+     *   (even row, even col) = B
+     *   (even row, odd  col) = Gb
+     *   (odd  row, even col) = Gr
+     *   (odd  row, odd  col) = R
+     * CSI-2 RAW10 packed: every 5 bytes hold 4 pixels (MSB 8 bits in bytes 0-3). */
     for (int y = 0; y < FRAME_H; y++) {
         uint8_t* row = g_raw_frame + y * FRAME_W;
-        /* Each group of 5 bytes covers 4 horizontal pixels */
         for (int grp = 0; grp < FRAME_W / 5; grp++) {
-            int px = grp * 4;  /* pixel column (0, 4, 8, ...) */
+            int px = grp * 4;
             uint16_t p[4];
             for (int k = 0; k < 4; k++) {
                 int col = px + k;
-                bool isR = ((y & 1) == 0) && ((col & 1) == 0);
-                bool isB = ((y & 1) == 1) && ((col & 1) == 1);
+                bool isB = ((y & 1) == 0) && ((col & 1) == 0);
+                bool isR = ((y & 1) == 1) && ((col & 1) == 1);
                 uint16_t v;
                 if (isR)      v = (200 + (col % 55)) << 2;
                 else if (isB) v = (50  + (y   % 50)) << 2;
                 else          v = (120 + ((col + y) % 30)) << 2;
-                p[k] = v;  /* 10-bit pixel value */
+                p[k] = v;
             }
             row[grp*5+0] = (uint8_t)(p[0] >> 2);
             row[grp*5+1] = (uint8_t)(p[1] >> 2);
@@ -1151,25 +1154,21 @@ bool unicam_capture_frame() {
             row[grp*5+4] = (uint8_t)(((p[0]&3)<<6)|((p[1]&3)<<4)|((p[2]&3)<<2)|(p[3]&3));
         }
     }
-    uart_puts("[SIM] Synthetic RAW10-packed RGGB frame written (1536x864).\n");
+    uart_puts("[SIM] Synthetic RAW10-packed BGGR frame written (1536x864).\n");
     return true;
 
 #else
-    /* ── Hardware capture: poll ISTA_FEI or STA.PI0, then freeze DMA ──── */
+    /* ── Hardware capture: V121 FS-to-FS (restored from proven V118) ──── */
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
 
-    /* V110: Re-enable DMA if it was stopped after previous capture.
-     * Must re-assert CPE, CLKGATE, MISC, and LIP to restart reception. */
     restart_unicam_dma();
 
-    /* V109: Clear stale status flags before this frame's capture. */
     U1[U_STA/4]  = 0xFFFFFFFFu;
     U1[U_ISTA/4] = 0xFFFFFFFFu;
 
-    /* V118: Two-FS capture — wait for FS1 (frame start), trigger LIP to reset
-     * write pointer, then wait for FS2 (next frame start). Between FS1 and FS2,
-     * exactly 864 lines were written = one complete frame. Stop DMA at FS2.
-     * This eliminates horizontal bars (mixed frame data) and left-right shift. */
+    /* Wait for FS1 (frame start), trigger LIP to reset write pointer,
+     * then wait for FS2 (next frame start). Between FS1 and FS2,
+     * exactly one complete frame was written. Stop DMA at FS2. */
     int fs_count = 0;
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
@@ -1187,93 +1186,23 @@ bool unicam_capture_frame() {
                 /* Second FS: complete frame in buffer, stop NOW */
                 stop_unicam_dma();
                 invalidate_frame_dcache();
-                uart_puts("[UNICAM] V118: FS-to-FS capture, DMA stopped\n");
 
-            /* V111 diagnostics: verify frame data format */
-            uart_puts("[DIAG] IBWP=");
-            uart_hex(U1[U_IBWP/4]);
-            uart_puts(" IBSA0=");
-            uart_hex(U1[U_IBSA0/4]);
-            uart_puts(" delta=");
-            uart_dec((int)(U1[U_IBWP/4] - U1[U_IBSA0/4]));
-            uart_puts(" expected=");
-            uart_dec(FRAME_SZ);
-            uart_puts("\n");
-
-            /* Hex dump first 20 bytes of frame buffer */
-            uart_puts("[DIAG] raw[0..19]: ");
-            for (int b = 0; b < 20; b++) {
-                uart_hex(g_raw_frame[b]);
-                uart_puts(" ");
-            }
-            uart_puts("\n");
-
-            /* Hex dump bytes at row 100 offset 0..19 */
-            uart_puts("[DIAG] raw[row100,0..19]: ");
-            for (int b = 0; b < 20; b++) {
-                uart_hex(g_raw_frame[100 * FRAME_W + b]);
-                uart_puts(" ");
-            }
-            uart_puts("\n");
-
-            /* Check if frame is all zeros (cache invalidation didn't work) */
-            int nonzero = 0;
-            for (int b = 0; b < 100; b++)
-                if (g_raw_frame[b * FRAME_W + b] != 0) nonzero++;
-            uart_puts("[DIAG] nonzero_sample=");
-            uart_dec(nonzero);
-            uart_puts("/100\n");
-
-            /* Decode a few RGGB pixels to check color separation */
-            /* At pixel (336,0): should be R position in RGGB */
-            {
-                const uint8_t* row0 = g_raw_frame;
-                const uint8_t* row1 = g_raw_frame + FRAME_W;
-                int col = 336;  /* CROP_X from debayer */
-                int grp = col >> 2;
-                int pos = col & 3;
-                uint8_t R  = row0[grp * 5 + pos];
-                uint8_t Gr = row0[grp * 5 + (pos + 1)];
-                int grp1 = col >> 2;
-                int pos1 = col & 3;
-                uint8_t Gb = row1[grp1 * 5 + pos1];
-                uint8_t B  = row1[grp1 * 5 + (pos1 + 1)];
-                uart_puts("[DIAG] RGGB@(336,0): R=");
-                uart_dec(R);
-                uart_puts(" Gr="); uart_dec(Gr);
-                uart_puts(" Gb="); uart_dec(Gb);
-                uart_puts(" B="); uart_dec(B);
+                uint32_t ibwp  = U1[U_IBWP/4];
+                uint32_t ibsa0 = U1[U_IBSA0/4];
+                uart_puts("[UNICAM] V121: FS-to-FS capture OK\n");
+                uart_puts("[DIAG] IBWP="); uart_hex(ibwp);
+                uart_puts(" delta="); uart_dec((int)(ibwp - ibsa0));
+                uart_puts(" lines="); uart_dec((int)((ibwp - ibsa0) / FRAME_W));
                 uart_puts("\n");
-            }
-            /* Another sample at (400,200) */
-            {
-                const uint8_t* row0 = g_raw_frame + 200 * FRAME_W;
-                const uint8_t* row1 = g_raw_frame + 201 * FRAME_W;
-                int col = 400;
-                int grp = col >> 2;
-                int pos = col & 3;
-                uint8_t R  = row0[grp * 5 + pos];
-                uint8_t Gr = row0[grp * 5 + (pos + 1)];
-                uint8_t Gb = row1[grp * 5 + pos];
-                uint8_t B  = row1[grp * 5 + (pos + 1)];
-                uart_puts("[DIAG] RGGB@(400,200): R=");
-                uart_dec(R);
-                uart_puts(" Gr="); uart_dec(Gr);
-                uart_puts(" Gb="); uart_dec(Gb);
-                uart_puts(" B="); uart_dec(B);
-                uart_puts("\n");
-            }
-
-            return true;
+                return true;
             }
         }
 
-        /* Periodic diagnostic every ~100ms */
         if (i > 0 && i % 10000000 == 0) {
             uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
             uart_puts("00ms: ISTA="); uart_hex(ista);
             uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
-            uart_puts(" fs_count="); uart_dec(fs_count);
+            uart_puts(" fs="); uart_dec(fs_count);
             uart_puts("\n");
         }
     }
@@ -1282,7 +1211,6 @@ bool unicam_capture_frame() {
     uart_puts("[UNICAM] IBWP="); uart_hex(U1[U_IBWP/4]);
     uart_puts("  STA="); uart_hex(U1[U_STA/4]);
     uart_puts("  ISTA="); uart_hex(U1[U_ISTA/4]); uart_puts("\n");
-    dump_unicam_regs(U1);
     return false;
 #endif
 }

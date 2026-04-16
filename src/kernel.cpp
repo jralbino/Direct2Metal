@@ -358,7 +358,8 @@ void run_yolo_complete() {
     }
 
     // Render frame at maximum resolution.
-    // Camera mode: debayer RAW8 → 480×480 directly to framebuffer (letterbox at x=80).
+    // V124 camera mode: debayer RAW10 RGGB 1536×864 → 640×360 centered vertically
+    //   (60-px top/bottom black letterbox) for native 16:9 full FoV display.
     // Test mode: upscale 320×320 float tensor to 640×480.
     if (g_use_camera) {
         camera_render_fullres((uint8_t*)lfb, pitch);
@@ -369,13 +370,15 @@ void run_yolo_complete() {
     }
 
     // Scale factors and offsets for mapping YOLO coords (320×320) to framebuffer coords.
-    // Camera mode: uniform 1.5× scale, image at x=[80,560] y=[0,480].
+    // V124 camera mode: YOLO square (864×864 center crop of sensor) is displayed
+    // as 360×360 at x=[140,500] y=[60,420] inside the 640×360 16:9 image.
     // Test mode: non-uniform 2.0×H / 1.5×V, image at x=[0,640] y=[0,480].
     const float disp_scale  = g_use_camera ? (CAM_DISP_W / 320.0f) : (640.0f / 320.0f);
     const float disp_scaleY = g_use_camera ? (CAM_DISP_H / 320.0f) : (480.0f / 320.0f);
     const int   disp_xoff   = g_use_camera ? CAM_DISP_XOFF : 0;
+    const int   disp_yoff   = g_use_camera ? CAM_DISP_YOFF : 0;
     const int   disp_right  = disp_xoff + (g_use_camera ? CAM_DISP_W : 640);
-    const int   disp_bottom = g_use_camera ? CAM_DISP_H : 480;
+    const int   disp_bottom = disp_yoff + (g_use_camera ? CAM_DISP_H : 480);
 
     uart_puts("\n>>> OBJETOS DETECTADOS <<<\n"); int valid_boxes = 0;
 
@@ -387,14 +390,14 @@ void run_yolo_complete() {
 
             int box_w = (int)(preds[ii].w * disp_scale);
             int box_h = (int)(preds[ii].h * disp_scaleY);
-            int cx    = (int)(preds[ii].x * disp_scale) + disp_xoff;
-            int cy    = (int)(preds[ii].y * disp_scaleY);
+            int cx    = (int)(preds[ii].x * disp_scale)  + disp_xoff;
+            int cy    = (int)(preds[ii].y * disp_scaleY) + disp_yoff;
 
             int left = cx - (box_w / 2);
             int top  = cy - (box_h / 2);
 
             if (left < disp_xoff) { left = disp_xoff; }
-            if (top  < 0)         { top  = 0; }
+            if (top  < disp_yoff) { top  = disp_yoff; }
             if (left + box_w > disp_right)  { box_w = disp_right  - left; }
             if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
 
@@ -406,8 +409,8 @@ void run_yolo_complete() {
     }
     if (valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
 
-    // Heartbeat indicator: bottom-right corner of the display area
-    int hb_x = disp_xoff + (g_use_camera ? CAM_DISP_W : 640) - 50;
+    // Heartbeat indicator: bottom-right corner of the framebuffer (always visible).
+    int hb_x = 640 - 50;
     uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF;
     draw_rect(hb_x, 430, 40, 40, heartbeat_color, 40); heartbeat_counter++;
 
@@ -455,7 +458,7 @@ extern "C" void kernel_main() {
     asm volatile("sev");
     extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4);
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
-    video_init(); draw_fill(0xFF000000); video_flush(); uart_puts("Hardware de Video Listo.\n");
+    video_init(); draw_fill(0xFF00FF00); video_flush(); uart_puts("Hardware de Video Listo (V124 verde).\n");
     init_mmu();
     if (!camera_init()) uart_puts("[CAM] No camera found, using test_image\r\n");
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
