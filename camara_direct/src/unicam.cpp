@@ -377,31 +377,60 @@ void unicam_stage_dma_buffer(void* buf) {
 }
 
 uint32_t unicam_wait_fs_and_lip() {
-    /* Belt-and-braces: re-assert CPE/CLKGATE/MISC in case anything cleared
-     * them (matches V154's pattern). Idempotent if already running. */
+    /* The IMX708 emits *two* FSIs per real frame (V158 HW: wait between
+     * consecutive FSIs is ~63 ms, but the sensor period from FLL × LLP is
+     * 117 ms — so two FSIs span one frame). Most likely one FSI is the
+     * image-data start and the other the embedded-data start. To capture
+     * exactly one image frame per LIP cycle we mirror V154's FS-to-FS
+     * protocol: LIP at the FIRST FSI to commit the staged buffer, then
+     * wait for the SECOND FSI before returning. The active buffer's
+     * contents between two consecutive LIPs (separated by 2 FSIs each)
+     * therefore cover exactly one full sensor period — image data is
+     * captured (DT=0x2B matches IDI0), embedded data is filtered out
+     * (DT=0x12 doesn't match IDI0, so DMA writes nothing during that
+     * window). The buffer ends up with one clean image frame.
+     *
+     * Single-FSI version (V158 initial) caused fast-motion brincos:
+     * each buffer received only half a frame, so consecutive iterations
+     * rendered alternating phases of the same physical frame.
+     *
+     * CPE stays on the entire time (libcamera-aligned). */
     U_SETBITS(U_CTRL, U_CTRL_CPE);
     UNICAM1_CLKGATE = 0x5A000015u;
     U_SETBITS(U_MISC, U_MISC_FLBITS);
     __asm__ volatile("dsb st" ::: "memory");
 
-    /* W1C: clear any pending FSI from before so we wait for a *fresh* FS. */
+    /* W1C: clear any pending FSI from before so we wait for *fresh* FSes. */
     U_WRITE(U_ISTA, 0xFFFFFFFFu);
 
-    /* Poll. Frame period at full mode is ~117 ms = ~780k MMIO reads at
-     * 150 ns each, so 20M iters is a generous 3 s ceiling for first-call
-     * sensor-not-streaming-yet. */
+    int      fs_count    = 0;
+    uint32_t ibwp_pre_lip = 0u;
+    /* Poll. Two FSes per real frame at ~63 ms apart → ~117 ms total wait
+     * in steady state. 20M iters at ~150 ns/read = 3 s ceiling for cold
+     * start when sensor isn't yet delivering FS. */
     const uint32_t kMaxIters = 20000000u;
     for (uint32_t i = 0; i < kMaxIters; i++) {
         if (U_READ(U_ISTA) & U_ISTA_FSI) {
-            U_WRITE(U_ISTA, 0xFFFFFFFFu);     /* clear the FSI we just consumed */
-            /* Sample IBWP BEFORE LIP — LIP resets IBWP to the new IBSA0,
-             * losing the just-completed frame's byte count. The return
-             * value is what the caller uses to compute rows_max for
-             * coverage diagnostics. */
-            uint32_t ibwp_pre_lip = U_READ(U_IBWP);
-            U_SETBITS(U_ICTL, U_ICTL_LIP);    /* commit staged IBSA0/IBEA0 */
-            __asm__ volatile("dsb sy" ::: "memory");
-            return ibwp_pre_lip;
+            U_WRITE(U_ISTA, 0xFFFFFFFFu);
+            fs_count++;
+            if (fs_count == 1) {
+                /* FS1: sample IBWP BEFORE LIP (LIP resets IBWP to the new
+                 * IBSA0, losing the just-completed frame's byte count),
+                 * then strobe LIP to commit the staged IBSA0/IBEA0. From
+                 * this moment DMA writes the new frame's image data into
+                 * the staged buffer; embedded data between FS1 and FS2 is
+                 * filtered out by IDI0. */
+                ibwp_pre_lip = U_READ(U_IBWP);
+                U_SETBITS(U_ICTL, U_ICTL_LIP);
+                __asm__ volatile("dsb sy" ::: "memory");
+            } else {
+                /* FS2: one full image frame is now captured into the
+                 * (post-LIP) active buffer. Return without LIPing — the
+                 * caller will pre-stage another buffer for the next call,
+                 * which LIPs at the FS1 of the NEXT real frame. */
+                __asm__ volatile("dsb sy" ::: "memory");
+                return ibwp_pre_lip;
+            }
         }
     }
     /* Timeout fallback — sensor not delivering FS. Caller will see stale

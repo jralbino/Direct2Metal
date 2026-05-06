@@ -539,62 +539,61 @@ extern "C" void kernel_main() {
         uart_puts("IMX708_END\n");
     }
 
-    /* Steady-state loop. Two-buffer rotation with continuous DMA:
+    /* Steady-state loop. Two-buffer rotation with continuous DMA, two
+     * FSIs per LIP cycle (one full sensor frame per buffer):
      *
      *   active_buf  = the buffer DMA is currently writing into.
      *   prev_buf    = the buffer that holds the just-completed frame.
      *
      * Each iteration:
-     *   (1) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
-     *   (2) wait for FS, strobe LIP — DMA now writes upcoming frame to OTHER.
-     *       The frame that just finished (in active_buf at the time of the
-     *       FS) becomes prev_buf for this iteration.
-     *   (3) sync any in-flight debayer from the previous iteration; cores
-     *       1-3 must finish reading their buffer before we expose it as the
-     *       new prev_buf for THIS iteration's debayer.
-     *   (4) invalidate the prev_buf cache lines so debayer reads fresh
+     *   (1) sync any in-flight debayer from the previous iteration BEFORE
+     *       we re-stage that buffer as the next DMA target — ensures
+     *       cores 1-3 are done reading it. In steady state ~0 ms because
+     *       debayer (~32 ms) finishes well inside the 117 ms wait.
+     *   (2) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
+     *   (3) wait for two FSIs (= one full sensor period). The FIRST FSI
+     *       triggers LIP (commits next_buf as the new DMA target); the
+     *       SECOND FSI confirms one image frame has been written.
+     *   (4) swap state: prev_buf = active_buf; active_buf = next_buf.
+     *   (5) invalidate the prev_buf cache lines so debayer reads fresh
      *       SDRAM data (DMA bypasses CPU caches).
-     *   (5) dispatch debayer of prev_buf → FB, async on cores 1-3.
+     *   (6) dispatch debayer of prev_buf → FB, async on cores 1-3.
      *
      * The debayer overlaps with the next wait_FS, hiding 32 ms inside
      * the 117 ms sensor frame period. Per-frame total ≈ 117 ms = 8.55 fps. */
-    uint8_t* active_buf       = raw_a;
+    uint8_t* active_buf        = raw_a;
     bool     debayer_in_flight = false;
     uint32_t cycle             = 0u;
     while (1) {
-        uint8_t* next_buf = (active_buf == raw_a) ? raw_b : raw_a;
-
         uint64_t t0 = cnt_now();
 
-        /* Step 1: pre-stage IBSA0 = next_buf. The register write doesn't
-         * affect the active DMA shadow until the LIP that follows the FS. */
-        unicam_stage_dma_buffer(next_buf);
-
-        /* Step 2: wait for next FS, strobe LIP. After this returns, DMA
-         * is writing the upcoming frame into next_buf, and the previous
-         * frame is complete in active_buf. The returned IBWP value was
-         * sampled at FS *before* LIP reset it, so it equals the byte
-         * count of the just-completed frame inside active_buf. */
-        uint32_t ibwp_pre_lip = unicam_wait_fs_and_lip();
-        uint64_t t1 = cnt_now();
-
-        uint8_t* prev_buf = active_buf;
-        active_buf        = next_buf;
-
-        /* Step 3: sync with the in-flight debayer from the previous
-         * iteration (it's reading the old prev_buf, which we're about to
-         * either invalidate or — two iterations from now — reuse as DMA
-         * target). Healthy: 0 ms because debayer of ~32 ms finished long
-         * inside the 117 ms wait. */
+        /* Step 1: sync with previous iteration's debayer. After this,
+         * cores 1-3 are no longer reading prev_buf-of-prev-iter (which
+         * we're about to stage as the next DMA target). */
         if (debayer_in_flight) {
             mc_wait_debayer_done();
         }
+        uint64_t t1 = cnt_now();
+
+        /* Step 2: pre-stage IBSA0 = next_buf. The register write doesn't
+         * affect the active DMA shadow until the LIP that fires inside
+         * wait_fs_and_lip below. */
+        uint8_t* next_buf = (active_buf == raw_a) ? raw_b : raw_a;
+        unicam_stage_dma_buffer(next_buf);
+
+        /* Step 3: wait for two FSIs (one full sensor period). LIP fires
+         * at the 1st FSI to commit next_buf; we return after the 2nd
+         * FSI when one full image frame is in next_buf. The returned
+         * value is IBWP sampled BEFORE the LIP — i.e. the byte count of
+         * the just-completed frame inside active_buf. */
+        uint32_t ibwp_pre_lip = unicam_wait_fs_and_lip();
         uint64_t t2 = cnt_now();
 
-        /* One-shot rows_max diagnostic on the first real captured frame.
-         * ibwp_pre_lip was sampled at FS, when DMA had finished writing
-         * the just-completed frame into prev_buf. The buffer's bus alias
-         * is 0xC0000000 | phys, matching what unicam_init programmed. */
+        /* Step 4: swap state. */
+        uint8_t* prev_buf = active_buf;
+        active_buf        = next_buf;
+
+        /* One-shot rows_max diagnostic on the first real captured frame. */
         if (cycle == 0u) {
             uint32_t prev_bus = 0xC0000000u | (uint32_t)(uintptr_t)prev_buf;
             uint32_t ibls     = unicam_get_ibls();
@@ -605,25 +604,25 @@ extern "C" void kernel_main() {
             cycle = 1u;
         }
 
-        /* Step 4: invalidate prev_buf cache lines. DMA wrote there bypass-
-         * ing CPU caches, so without this debayer reads stale data. */
+        /* Step 5: invalidate prev_buf cache lines. DMA wrote there
+         * bypassing CPU caches, so without this debayer reads stale data. */
         dcache_invalidate_range(prev_buf, FRAME_BYTES);
         uint64_t t3 = cnt_now();
 
-        /* Step 5: dispatch debayer of prev_buf, async on cores 1-3. */
+        /* Step 6: dispatch debayer of prev_buf, async on cores 1-3. */
         mc_dispatch_debayer_async(prev_buf, fb, fb_stride_px);
         debayer_in_flight = true;
         uint64_t t4 = cnt_now();
 
-        uint32_t ms_wait      = cnt_to_ms(t1 - t0);   /* incl. stage_buf */
-        uint32_t ms_sync_prev = cnt_to_ms(t2 - t1);
-        uint32_t ms_inval     = cnt_to_ms(t3 - t2);
-        uint32_t ms_dispatch  = cnt_to_ms(t4 - t3);
-        uint32_t ms_total     = cnt_to_ms(t4 - t0);
-        uint32_t fps_x100     = ms_total ? (100000u / ms_total) : 0u;
+        uint32_t ms_sync     = cnt_to_ms(t1 - t0);
+        uint32_t ms_wait     = cnt_to_ms(t2 - t1);   /* incl. stage_buf */
+        uint32_t ms_inval    = cnt_to_ms(t3 - t2);
+        uint32_t ms_dispatch = cnt_to_ms(t4 - t3);
+        uint32_t ms_total    = cnt_to_ms(t4 - t0);
+        uint32_t fps_x100    = ms_total ? (100000u / ms_total) : 0u;
 
-        uart_puts("TIMING wait=");  uart_dec(ms_wait);
-        uart_puts(" sync=");        uart_dec(ms_sync_prev);
+        uart_puts("TIMING sync=");  uart_dec(ms_sync);
+        uart_puts(" wait=");        uart_dec(ms_wait);
         uart_puts(" inval=");       uart_dec(ms_inval);
         uart_puts(" disp=");        uart_dec(ms_dispatch);
         uart_puts(" total=");       uart_dec(ms_total);
