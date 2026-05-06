@@ -546,52 +546,60 @@ extern "C" void kernel_main() {
      *   prev_buf    = the buffer that holds the just-completed frame.
      *
      * Each iteration:
-     *   (1) sync any in-flight debayer from the previous iteration BEFORE
-     *       we re-stage that buffer as the next DMA target — ensures
-     *       cores 1-3 are done reading it. In steady state ~0 ms because
-     *       debayer (~32 ms) finishes well inside the 117 ms wait.
-     *   (2) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
-     *   (3) wait for two FSIs (= one full sensor period). The FIRST FSI
+     *   (1) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
+     *   (2) wait for two FSIs (= one full sensor period). The FIRST FSI
      *       triggers LIP (commits next_buf as the new DMA target); the
      *       SECOND FSI confirms one image frame has been written.
-     *   (4) swap state: prev_buf = active_buf; active_buf = next_buf.
-     *   (5) invalidate the prev_buf cache lines so debayer reads fresh
-     *       SDRAM data (DMA bypasses CPU caches).
+     *   (3) swap state: prev_buf = active_buf; active_buf = next_buf.
+     *   (4) sync with previous iteration's debayer. In steady state this
+     *       is ~0 ms because cores 1-3 finished ~70 ms ago (32 ms work
+     *       running concurrently with the 105 ms wait above).
+     *   (5) invalidate prev_buf cache lines.
      *   (6) dispatch debayer of prev_buf → FB, async on cores 1-3.
      *
-     * The debayer overlaps with the next wait_FS, hiding 32 ms inside
-     * the 117 ms sensor frame period. Per-frame total ≈ 117 ms = 8.55 fps. */
+     * Why sync AFTER wait (not before): cores 1-3 dispatch happens at
+     * step (6) of iter K. By the time iter K+1's LIP fires inside step
+     * (2) of iter K+1, cores have had the entire wait_fs window minus
+     * loop overhead (~63 ms FS1 offset minus a few ms) to finish their
+     * 32 ms debayer. They're done well before LIP, so there's no DMA-vs-
+     * core race on prev_buf-of-prev-iter (which is next_buf of THIS iter).
+     * Putting sync BEFORE wait_fs serialises the 32 ms debayer with the
+     * wait — see V158 commit b3d0f29's measured sync=28ms regression.
+     *
+     * Per-frame total ≈ 117 ms = 8.55 fps. */
     uint8_t* active_buf        = raw_a;
     bool     debayer_in_flight = false;
     uint32_t cycle             = 0u;
     while (1) {
         uint64_t t0 = cnt_now();
 
-        /* Step 1: sync with previous iteration's debayer. After this,
-         * cores 1-3 are no longer reading prev_buf-of-prev-iter (which
-         * we're about to stage as the next DMA target). */
-        if (debayer_in_flight) {
-            mc_wait_debayer_done();
-        }
-        uint64_t t1 = cnt_now();
-
-        /* Step 2: pre-stage IBSA0 = next_buf. The register write doesn't
+        /* Step 1: pre-stage IBSA0 = next_buf. The register write doesn't
          * affect the active DMA shadow until the LIP that fires inside
          * wait_fs_and_lip below. */
         uint8_t* next_buf = (active_buf == raw_a) ? raw_b : raw_a;
         unicam_stage_dma_buffer(next_buf);
 
-        /* Step 3: wait for two FSIs (one full sensor period). LIP fires
+        /* Step 2: wait for two FSIs (one full sensor period). LIP fires
          * at the 1st FSI to commit next_buf; we return after the 2nd
          * FSI when one full image frame is in next_buf. The returned
          * value is IBWP sampled BEFORE the LIP — i.e. the byte count of
          * the just-completed frame inside active_buf. */
         uint32_t ibwp_pre_lip = unicam_wait_fs_and_lip();
-        uint64_t t2 = cnt_now();
+        uint64_t t1 = cnt_now();
 
-        /* Step 4: swap state. */
+        /* Step 3: swap state. */
         uint8_t* prev_buf = active_buf;
         active_buf        = next_buf;
+
+        /* Step 4: sync with previous iteration's debayer. Healthy: ~0 ms
+         * because cores 1-3 finished during the wait above. If sync > 0
+         * grows persistently, debayer is running longer than the wait,
+         * which means we're starving the next frame — symptom would be
+         * sensor frames being dropped (rows_max diagnostic would warn). */
+        if (debayer_in_flight) {
+            mc_wait_debayer_done();
+        }
+        uint64_t t2 = cnt_now();
 
         /* One-shot rows_max diagnostic on the first real captured frame. */
         if (cycle == 0u) {
@@ -614,15 +622,15 @@ extern "C" void kernel_main() {
         debayer_in_flight = true;
         uint64_t t4 = cnt_now();
 
-        uint32_t ms_sync     = cnt_to_ms(t1 - t0);
-        uint32_t ms_wait     = cnt_to_ms(t2 - t1);   /* incl. stage_buf */
+        uint32_t ms_wait     = cnt_to_ms(t1 - t0);   /* incl. stage_buf */
+        uint32_t ms_sync     = cnt_to_ms(t2 - t1);
         uint32_t ms_inval    = cnt_to_ms(t3 - t2);
         uint32_t ms_dispatch = cnt_to_ms(t4 - t3);
         uint32_t ms_total    = cnt_to_ms(t4 - t0);
         uint32_t fps_x100    = ms_total ? (100000u / ms_total) : 0u;
 
-        uart_puts("TIMING sync=");  uart_dec(ms_sync);
-        uart_puts(" wait=");        uart_dec(ms_wait);
+        uart_puts("TIMING wait=");  uart_dec(ms_wait);
+        uart_puts(" sync=");        uart_dec(ms_sync);
         uart_puts(" inval=");       uart_dec(ms_inval);
         uart_puts(" disp=");        uart_dec(ms_dispatch);
         uart_puts(" total=");       uart_dec(ms_total);
