@@ -2,12 +2,17 @@
 
 **Plataforma:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53). Bare-metal AArch64, sin sistema operativo.
 **Cámara:** Pi Camera v3 (Sony IMX708), CSI-2 a 2 lanes.
-**Estado actual:** V159 — captura **binned 1536×864** → HDMI 1920×1080, continuous DMA via IBSA0 rotation (V158), multi-core debayer (cores 1-3, async). En validación HW.
+**Estado actual:** V159 — captura **binned 1536×864** → HDMI 1920×1080. Throughput **~38-45 fps medido en HW** (5-6× sobre V158), pero **REGRESIÓN VISUAL: lane swap bug volvió** (ver §"V159 lane-swap regression").
 
-**Throughput esperado:** ~24 fps (techo del sensor en binned a `FLL=0x046D`/`LLP=0x1460`). Versiones previas en full mode 4608×2592 estaban capadas a 7.4 fps por el período físico del sensor (117 ms) + memcpy DMA→snap; V159 elimina ambos cuellos:
-- Período sensor binned ~41 ms (vs 117 ms full).
-- Buffer DMA 1.58 MB (vs 14.93 MB) → contención de memoria casi inexistente.
-- IBSA0 rotation eliminó el snap memcpy en V158.
+**Throughput medido:**
+```
+TIMING wait=20 sync=0 inval=1 disp=0 total=22 ms  fps=45.45   ← iter 1
+TIMING wait=14 sync=9 inval=0 disp=0 total=25 ms  fps=40.00
+TIMING wait=18 sync=7 inval=0 disp=0 total=26 ms  fps=38.46
+```
+Bottleneck pasó del sensor (V158: 117 ms cap) al debayer (V159: ~25 ms = 38-45 fps cap). El sensor en binned a `FLL=0x046D` da ~24 fps teóricos pero medimos 40+ fps porque cada iteración corresponde a 1 frame físico y el wait queda en ~14-21 ms por la asimetría del 2-FSI window. Buffer DMA pasó de 14.93 MB → 1.58 MB → contención prácticamente eliminada (el `wait` ya no crece como en V157/V158).
+
+⚠ **V159 lane-swap regression:** la imagen muestra el "lane swap" característico (escenas reales con bytes mezclados; test patterns uniformes no lo revelan) que V150 había resuelto en full mode. **Origen identificado, fix NO aplicado** — ver §"V159 lane-swap regression" abajo.
 
 ---
 
@@ -76,6 +81,51 @@ NEON `vmul_n_u16` truncaba al multiplicar `R(255) × WB_R(535) = 127865`, que ex
 NEON aplicado: gather scalar (no hay gather en ARMv8-A), pero pedestal subtract + WB + CCM (3×SMLAL chains) + clamp en vectores 4-wide. Gamma escalar (LUT 256 no cabe en `tbl`).
 
 Las mediciones "15 fps" tempranas (V152) fueron tomadas con polling IBWP-stable que paraba DMA antes del frame end, por lo que el wait era artificialmente bajo. El throughput sostenido con FS-a-FS y captura completa es 7.40 fps; ver §"Período del sensor — finding V157".
+
+### V159 lane-swap regression — origen identificado (fix pendiente)
+
+V159 introduce una regresión visual: el "lane swap" — escenas reales muestran bytes mezclados a nivel de línea (test patterns uniformes no lo revelan). Es exactamente el bug que **V150 había resuelto en full mode** mediante el descubrimiento de `DAT1 = 0x06000005` (clock-pattern HS termination, vs `0xC0000005` data-pattern de DAT0).
+
+**Origen identificado:** `0x0310 = 0x00` en `k_imx708_binned[]` (`src/imx708_regs.h`).
+
+**Análisis:**
+
+El registro `0x0310` controla la continuidad del HS clock del IMX708:
+- `0x00` = no-continuo: el clock lane cae a LP (low-power) entre bursts de líneas.
+- `0x01` = continuo: el clock lane se queda en HS todo el tiempo.
+
+Los dumps libcamera (`linux_extract/registers/imx708_writes_*_unique_final.txt`) muestran `0x0310 = 0x01` en **AMBOS modos**:
+
+```
+$ grep "0x0310" linux_extract/registers/imx708_writes_*_final.txt
+imx708_writes_binned_1536x864_unique_final.txt:0x0310 = 0x01
+imx708_writes_full_4608x2592_unique_final.txt:0x0310 = 0x01
+```
+
+camara_direct V158 full-mode usaba `0x01` (libcamera default) y funcionaba limpio. **V159 heredó el override `0x00` del proyecto padre** al portar sus tablas binned (`Direct2Metal/src/imx708_regs.h:k_imx708_init[]`), donde el override está marcado como "V104 HW-verified" — pero ese flag corresponde al contexto de debug del padre en V104, NO a una validación libcamera.
+
+**Cross-check con readback Unicam:**
+
+| Reg | V158 (full, OK) | V159 (binned, lane swap) |
+|------|----------------|--------------------------|
+| `0x0310` | `0x01` (continuous) | `0x00` (non-continuous) |
+| Unicam `DAT0` readback | `0xC0000005` | `0x06000005` |
+| Unicam `DAT1` readback | `0xC0000005` | `0x02000005` ← **bit 26 perdido** |
+
+`DAT1` perdió bit 26 (lane HS-active status). Mecanismo plausible: con `0x0310=0x00` el clock lane oscila entre HS y LP entre bursts; la auto-termination del BCM2837 en lane 1 (configurada como clock-pattern HS termination = `0x06000005`) no consigue re-engancharse limpiamente en cada burst, perdiendo sincronía. Lane 0 (data-pattern termination = `0xC0000005`) sí re-engancha. Resultado: lane 1 entrega bytes desincronizados respecto a lane 0 → "lane swap" visible.
+
+**Fix propuesto (no aplicado):**
+
+```c
+// src/imx708_regs.h, dentro de k_imx708_binned[]:
+{ 0x0310, 0x01 },   // libcamera default; era 0x00 (V104 padre)
+```
+
+Misma corrección que V158 ya tenía en su `k_imx708_full[]`. La regresión es un copy-paste del padre sin filtrar overrides.
+
+**Por qué no aplicado todavía:** queremos confirmar primero que el cambio resuelve el lane swap sin introducir otra regresión (e.g. timing margin del CSI-2). El override del padre puede haber tenido razones legítimas en SU plataforma; vale la pena verificar contra el HW antes de marcarlo como "muerto".
+
+---
 
 ### Período del sensor — finding V157
 

@@ -10,7 +10,8 @@
  * which is itself a port of the official raspberrypi/linux
  * imx708.c mode_2x2binned_720p_regs[] sequence with these overrides
  * proven on hardware:
- *   - 0x0310=0x00 non-continuous HS clock (V104 HW-verified, official is 0x01)
+ *   - 0x0310=0x00 non-continuous HS clock (V104 from parent — ⚠ SUSPECT, see
+ *     V159 lane-swap regression note inline; libcamera default is 0x01)
  *   - 0x0204/05=0x03C0 ANA_GAIN=16x (V122; libcamera default 0x0070=1.12x is too dim)
  *   - 0x020E/0F=0x0200 DIG_GAIN=2x (V122)
  *   - 0x0220=0x00 + secondary-exposure regs zeroed (V150, HDR/DOL fully OFF)
@@ -112,7 +113,26 @@ static const RegVal k_imx708_binned[] = {
     { 0x0305, 0x02 }, { 0x0306, 0x00 },
     { 0x0307, 0x76 },
     { 0x030B, 0x02 }, { 0x030D, 0x04 },
-    /* V104 override: 0x0310=0x00 non-continuous HS clock (HW-verified) */
+    /* ⚠ V159 LANE-SWAP REGRESSION SUSPECT — DO NOT KEEP AT 0x00.
+     *
+     * 0x0310 controls IMX708's HS clock continuity:
+     *   0x00 = non-continuous (clock lane goes to LP between line bursts)
+     *   0x01 = continuous (clock lane stays in HS the whole time)
+     *
+     * camara_direct V158 full-mode used 0x01 (libcamera default) and worked
+     * cleanly. V159 inherited the parent project's V104 override (0x00) when
+     * porting parent's binned tables; that override was for parent-project
+     * specific debug context, NOT a libcamera-validated value.
+     *
+     * Both libcamera dumps (linux_extract/registers/imx708_writes_*) show
+     * 0x0310 = 0x01 in BOTH modes (full and binned). Setting 0x00 here is
+     * what brought back the "lane swap" appearance — DAT1 readback in V159
+     * (0x02000005) is missing bit 26 vs V158's lane-1 readback, consistent
+     * with lane-1 losing HS sync because the BCM2837's auto-termination
+     * cannot re-engage cleanly when the clock drops to LP between bursts.
+     *
+     * Fix: change to 0x01. Keep 0x00 ONLY if a future debug session proves
+     * 0x01 introduces a different regression. */
     { 0x0310, 0x00 },
     /* 3CA0-3CBF timing block (per official binned sequence) */
     { 0x3CA0, 0x00 }, { 0x3CA1, 0x3C },
