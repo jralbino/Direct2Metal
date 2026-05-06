@@ -137,25 +137,59 @@ V155 intentó esto vía crop+stretch asumiendo que la cobertura DMA estaba limit
 
 Reemplazo del polling IBWP-stable por protocolo de interrupciones del sensor (FS1 → LIP → FS2 → CPE=0). Eliminó las líneas magenta y la variabilidad de `rows_max`.
 
-### 3. Hardware double-buffer DMA (IBSA1/IBEA1) — siguiente paso recomendado
+### 3. Continuous DMA via IBSA0 rotation — IMPLEMENTADO en V158
 
-**Ganancia esperada: 7.40 → ~8.55 fps (+15%).** Es la mejora más limpia de las que quedan.
+**Ganancia esperada: 7.40 → ~8.55 fps (+15%).** En implementación / pendiente de medir HW.
 
-El snapshot actual copia 14.93 MB raw_buffer → snap (~18 ms con DMA pausada). Pi OS / libcamera evitan ese copy programando dos buffers en hardware: la DMA alterna entre `IBSA0/IBEA0` e `IBSA1/IBEA1` automáticamente en el frame boundary. Lectura del buffer "inactivo" en paralelo con la escritura del "activo" → snap = 0 ms. Ciclo nuevo:
+#### Por qué IBSA0 rotation y NO el "hardware double-buffer" via IBSA1/IBEA1
+
+La inspección de `linux_capture_linux/unicam_run.txt` y `unicam_run2.txt` (dos snapshots reales del Unicam mientras libcamera capturaba a 4608×2592) reveló que **`bcm2835-unicam.c` NO programa IBSA1/IBEA1**:
 
 ```
-wait_FS-to-FS (117 ms)   ← período del sensor, inalterable
-debayer del buffer pasivo (24 ms, 4 cores, oculto en el wait)
-swap activo↔pasivo (atómico vía LIP / register write)
+unicam_run.txt    (frame N):    IBSA0=0xCC300000   IBEA0=0xCCC95000
+unicam_run2.txt  (frame N+ε):   IBSA0=0xCC500000   IBEA0=0xCC695000   ← distinto!
 ```
 
-Tareas concretas:
-1. Reservar `0x03000000..0x03E3D000` como buffer B (sigue dentro de Normal Inner Shareable cacheable).
-2. En `unicam.cpp`: programar `IBSA1`/`IBEA1` (offsets `0x130`/`0x134` según el dump runtime de libcamera, **verificar con `tools/diff_runtime_full.py`**).
-3. Cambiar `unicam_wait_frame_end_stop` para no parar `CPE` al FE: dejar la DMA correr y reportar qué buffer es el "recién terminado" leyendo el bit de "buffer-in-use" del Unicam (campo a identificar — probablemente en `STA` o `IBWP`).
-4. En `main.cpp`: leer del buffer pasivo (sin snap), debayer directo, sync vía FE bit.
+IBSA1/IBEA1 (offsets 0x304/0x308 según `parent/src/hardware_sim.h`) no aparecen en ningún dump. **Las direcciones de IBSA0 cambian entre frames** → libcamera está rotando el IBSA0 cada frame, no usando ping-pong hardware.
 
-Riesgos: el latch de IBSA1 al FE no está documentado en el TRM del BCM2837; hay que inferirlo del runtime dump de libcamera. Si el swap no es atómico, habrá tearing en líneas exactas del frame.
+El `Double-buffer section (single-buffer: do NOT write these)` en hardware_sim.h del padre era una conjetura: el TRM del BCM2837 no es público y la interpretación más plausible dado el comportamiento de libcamera es que **IBSA1/IBEA1 son para un segundo canal DMA independiente** (e.g. embedded data / PDAF en otro VC/DT con su propio IDI1 — no programado en nuestro pipeline). Usarlos como ping-pong tiene riesgo alto de comportamiento indefinido.
+
+V158 sigue la receta libcamera-aligned: dos raw buffers físicos, IBSA0 reescrito + LIP en cada FS.
+
+#### Diseño V158
+
+Memoria:
+```
+RAW_A  0x01000000 .. 0x01E3D000   (14.24 MB ping)
+RAW_B  0x02000000 .. 0x02E3D000   (14.24 MB pong)
+```
+
+API nueva en `unicam.{h,cpp}`:
+```cpp
+void     unicam_stage_dma_buffer(void* buf);      // escribe IBSA0/IBEA0; no LIPea
+uint32_t unicam_wait_fs_and_lip();                // espera 1 FSI, captura IBWP, LIPea
+                                                  // retorna IBWP pre-LIP (rows_max diag)
+```
+
+Loop steady-state:
+```
+1. unicam_stage_dma_buffer(next_buf)              // pre-stage: IBSA0 = OTRO buffer
+2. unicam_wait_fs_and_lip()                       // 117 ms = período sensor
+3. swap: prev_buf = active_buf; active_buf = next_buf
+4. mc_wait_debayer_done()                         // sync con dispatch del iter anterior
+5. dcache_invalidate_range(prev_buf, FRAME_BYTES) // DMA escribió bypassing cache
+6. mc_dispatch_debayer_async(prev_buf, fb, ...)   // 32 ms en cores 1-3, oculto en el wait
+```
+
+CPE nunca se apaga. snap memcpy eliminado (18 ms). Per-frame: `max(117, 32) = 117 ms = 8.55 fps`.
+
+Cores: 1, 2, 3 corren `secondary_main` con bandas `BAND_COUNT=3` (FB_H/3 = 360 rows/core exactos). Core 0 hace toda la I/O. El antiguo `mc_dispatch_debayer` bloqueante se reemplazó por `mc_dispatch_debayer_async` + `mc_wait_debayer_done` (mismo split que V157 que era el correcto, sólo que aquí sí da ganancia porque elimina el snap, no sólo reordena).
+
+#### Riesgos a vigilar en HW
+
+- **IBWP wraparound entre LIPs**: si DMA sigue corriendo durante el snap, antes IBWP llegaba a IBEA0 y wrappeaba a IBSA0 → over-escribía el comienzo del frame. Aquí el FS dispara LIP inmediatamente, por lo que IBWP se resetea ANTES de over-escribir. Pero si `wait_fs_and_lip` se atrasa (debayer-induced contention) podría haber wrap. La medición `ibwp_pre_lip` lo expone: si > FRAME_BYTES, pasó.
+- **Memory contention durante el debayer**: V157 mostró que cores 1-3 leyendo 14.93 MB + escribiendo 8.3 MB durante 32 ms saturan el bus SDRAM. El DMA del Unicam es modesto (~128 MB/s) pero podría rezagarse. La medición `wait` lo detecta — si crece de ~117 ms a ~141 ms, hay que mitigar (reducir bandas a 4 cores con core 0 esperando, o pasar a binned).
+- **Cache invalidation timing**: el `dc ivac` sobre 14.93 MB toma varios ms. Si pasa al mismo tiempo que un acceso de cores 1-3 al buffer recién terminado (no debería — la sync espera primero), puede haber tearing visual. Mitigación: el `mc_wait_debayer_done` antes de invalidate garantiza que cores no estén leyendo prev_buf.
 
 ### 4. Modo binned 1536×864 — saltar a 30+ fps
 
@@ -312,13 +346,15 @@ isb
 
 ```
 0x00000000 .. 0x00FFFFFF  Kernel + BSS + stack (≈ 11 KB)
-0x01000000 .. 0x01E3D000  RAW DMA target (14.93 MB raw_buffer)
-0x02000000 .. 0x02E3D000  CPU snapshot (14.93 MB snap)
+0x01000000 .. 0x01E3D000  RAW_A DMA target (14.93 MB ping)            ← V158
+0x02000000 .. 0x02E3D000  RAW_B DMA target (14.93 MB pong)            ← V158
 0x1C000000 .. 0x20000000  VPU heap (gpu_mem=128 → últimos 128 MB)
 0x1E402000 ..             Framebuffer (asignado por el VPU vía mailbox)
 0x3F000000 .. 0x40000000  MMIO peripherals (Device-nGnRnE en MMU)
 0xC0000000 | phys         Bus alias VideoCore para DMA writes
 ```
+
+(En V156 había sólo `RAW` y un `SNAP` separado para el memcpy CPU-stable; V158 elimina el snap y usa los dos slots como ping-pong DMA.)
 
 MMU identity-mapea 1 GB con bloques de 2 MB. El rango VPU está mapeado **Normal Non-cacheable** + Inner Shareable para que la VPU vea los pixels sin caché ARM por encima.
 
@@ -334,10 +370,10 @@ python3 tools/diff_runtime_full.py uart.log linux_capture_linux/
 # (todos los registros deben coincidir excepto IBSA0/IBEA0/IBLS marcados EXPECTED)
 ```
 
-UART log esperado tras boot (V156 baseline, captura 2026-05-06):
+UART log esperado tras boot (V158, en validación HW):
 
 ```
-camara_direct V156: IMX708 4608x2592 -> HDMI 1920x1080 (16:9 native, full FOV)
+camara_direct V158: IMX708 4608x2592 -> HDMI 1920x1080 (continuous DMA, IBSA0 rotation)
 CORES alive=[1,1,1,1]
 Mailbox: domain 14 ON
 BSC1: init
@@ -347,15 +383,23 @@ Unicam: init OK. IBSA0=0xC1000000 IBEA0=0xC1E3D000 IBLS=0x00001680
 IMX708: Probe OK
 IMX708: stream ON
 Unicam: CPE + LIP re-armed after sensor stream_on
-FRAME rows_max=0x00000A20 / 0xA20      ← cobertura 100% (V154 FS-a-FS lo desbloqueó)
-UNICAM_BEGIN ... UNICAM_END             ← 19 regs Linux-comparable
-IMX708_BEGIN ... IMX708_END             ← 19 regs Linux-comparable
-TIMING wait=93 snap=18 debayer=24 total=135 ms  fps=7.40
-TIMING wait=93 snap=18 debayer=23 total=135 ms  fps=7.40
-TIMING wait=93 snap=18 debayer=24 total=136 ms  fps=7.35
+UNICAM_BEGIN ... UNICAM_END             ← 19 regs Linux-comparable (pre-loop)
+IMX708_BEGIN ... IMX708_END             ← 19 regs Linux-comparable (pre-loop)
+FRAME rows_max=0x00000A20 / 0xA20       ← primer iter: cobertura del primer frame en RAW_A
+TIMING wait=117 sync=0 inval=2 disp=0 total=119 ms  fps=8.40   ← objetivo
+TIMING wait=117 sync=0 inval=2 disp=0 total=120 ms  fps=8.33
+...
 ```
 
-`wait=93` es el período del sensor (117 ms) menos los 24 ms de debayer que corren entre rearm y wait — ver §"Período del sensor — finding V157" para por qué este número es engañoso.
+Si en HW se observa `wait` creciendo a ~141 ms (memory contention del debayer concurrente), o `sync` > 0 (debayer no terminó dentro del frame period), hay que reducir el debayer a 4 cores con core 0 ayudando o pasar a binned mode.
+
+Para referencia, baseline V156 (uart.log committed 2026-05-06):
+
+```
+TIMING wait=93 snap=18 debayer=24 total=135 ms  fps=7.40       ← V156 (revertido tras V157)
+```
+
+`wait=93` allí es el período del sensor (117 ms) menos los 24 ms de debayer que corrían entre rearm y wait — ver §"Período del sensor — finding V157" para por qué ese número era engañoso.
 
 ---
 

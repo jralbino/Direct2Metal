@@ -1,32 +1,44 @@
-/* camara_direct V156 — IMX708 4608x2592 full-mode → HDMI 1920x1080.
+/* camara_direct V158 — continuous DMA via IBSA0 rotation, snap eliminated.
  *
- * V157 was tried (software double-buffer, async debayer dispatch, 3-core
- * bands) and confirmed there is no software-only fps win at this sensor
- * configuration: V157 measured `wait=117 snap=18 sync=0 total=135 ms`,
- * exactly the same 7.4 fps as V156. The `wait=93` we saw in V156 was
- * misleading — the IMX708 frame period at FLL=0x0A5A / LLP=0x3D20 / 2-lane
- * is actually **117 ms**, and V156's debayer running between rearm and
- * wait was absorbing 24 ms of that period before the wait function was
- * even called. Conservation: cycle = frame_period(117) + snap(18) = 135 ms
- * regardless of how the dispatch is reordered. To improve fps further:
- *   (a) hardware double-buffer via IBSA1/IBEA1 → eliminates snap → 8.55 fps
- *   (b) reduce FLL/LLP (sensor reconfiguration, risky)
- *   (c) switch to binned 1536×864 mode → ~52 fps native
- * V157 was reverted; V156 is the simpler baseline to build (a) on top of.
+ * Path chosen vs the V156 baseline:
+ *   V156: wait_FS-to-FS stops CPE → memcpy raw_buffer→snap (18 ms) → rearm →
+ *         debayer. Cycle = frame_period(117) + snap(18) = 135 ms = 7.4 fps.
+ *   V158: two raw buffers (raw_a, raw_b). At each FS, software pre-stages
+ *         IBSA0/IBEA0 to point at the OTHER buffer; LIP at FS commits the
+ *         new address; the previous buffer is read directly (no memcpy)
+ *         while DMA fills the new one. CPE never stops. Cycle =
+ *         max(frame_period(117), debayer3) = 117 ms = 8.55 fps.
+ *
+ * Why IBSA0 rotation instead of IBSA1/IBEA1 hardware ping-pong:
+ *   The libcamera runtime dumps (linux_capture_linux/unicam_run*.txt) show
+ *   that bcm2835-unicam.c never programs IBSA1/IBEA1 — instead it rewrites
+ *   IBSA0 between frames (the two dumps captured at different times have
+ *   *different* IBSA0 values). The "double-buffer section" comment in the
+ *   parent's hardware_sim.h appears to be the parent project's guess; the
+ *   BCM2837 TRM is not public, and the most plausible interpretation given
+ *   libcamera's behaviour is that IBSA1/IBEA1 belong to a *second* DMA
+ *   channel (e.g. embedded-data on a different VC/DT) rather than a
+ *   ping-pong of the same image stream. We follow the proven libcamera
+ *   pattern.
+ *
+ * Async debayer (cores 1-3, 3 bands of 360 rows = ~32 ms) runs concurrently
+ * with the wait_FS for the next frame on core 0. The debayer's memory
+ * footprint (read 14.93 MB + write 8.3 MB) overlaps with DMA's writes
+ * (~128 MB/s steady-state) and with core 0's MMIO polling. The 117 ms
+ * frame period leaves ~85 ms idle on cores 1-3 after the debayer finishes,
+ * so contention is bounded to the debayer window.
+ *
+ * Memory layout:
+ *   RAW_A 0x01000000 .. 0x01E3D000   (14.24 MB DMA target, ping)
+ *   RAW_B 0x02000000 .. 0x02E3D000   (14.24 MB DMA target, pong)
+ * Both are inside the Normal Inner-Shareable cacheable region built by
+ * mmu.cpp. A `dc ivac` over the just-completed buffer is required before
+ * the debayer reads it because DMA writes bypass the CPU cache.
  *
  * Sensor: Pi Camera v3 in full readout (no binning), Bayer is BGGR after the
- * 0x0101=0x03 H+V flip Linux applies.
- * Pipeline per frame (~7.4 fps = 1 / 135 ms):
- *   1. wait_frame_end_stop  — Unicam DMA finishes a frame, CPE=0 (frozen)
- *   2. dcache_invalidate    — kick stale L2 lines so the snap reads SDRAM
- *   3. snapshot_raw         — copy 14.24 MB DMA buffer → snap (race-free)
- *   4. unicam_rearm         — DMA resumes filling raw_buffer
- *   5. debayer_to_fb        — 4608x2592 BGGR → 1920x1080 with WB+CCM+gamma
- *
- * ISP constants (BLC, WB, CCM, gamma) are taken from the Linux libcamera
- * tuning file (linux_extract/tuning/imx708.json) and the actual DNG that
- * libcamera produced for the daylight scene we extracted from
- * (linux_extract/binned_1536x864/binned.dng):
+ * 0x0101=0x03 H+V flip Linux applies. ISP constants (BLC, WB, CCM, gamma)
+ * are taken from the Linux libcamera tuning file
+ * (linux_extract/tuning/imx708.json) and the actual DNG:
  *   BlackLevel = 64 (10-bit)
  *   AsShotNeutral = [0.4784, 1.0, 0.5629]
  *   CCM (4640K) = the daylight matrix from imx708.json
@@ -92,32 +104,45 @@ extern uint32_t fb_pitch;
 #define RAW_STRIDE 5760u             /* 4608 px * 10 bit / 8 */
 #define FRAME_BYTES (RAW_STRIDE * SENSOR_H)   /* 14,929,920 = 0xE3D000 */
 
-/* ── Multi-core task pool ───────────────────────────────────────────────────
- * Core 0 publishes one debayer task per frame:
- *   1. snapshot_raw fills `g_task_snap` (already happens in main loop).
- *   2. Reset `g_task_done = 0`, increment `g_task_epoch`, dsb + sev.
- * Cores 1-3 (spinning in WFE) wake up, see new epoch, run their band of
- * the debayer, atomically increment `g_task_done`, sev.
- * Core 0 runs its own band concurrently, then wfe-waits until done==3.
+/* ── Multi-core task pool (V158: cores 1-3 only) ───────────────────────────
+ * Core 0 owns the Unicam state machine (stage IBSA0, wait FS+LIP, swap,
+ * cache invalidate). Cores 1, 2, 3 run debayer bands. Per-frame split:
+ *   core 0:    stage_buf + wait_FS_LIP + invalidate + dispatch  (~117 ms)
+ *   cores 1-3: debayer 360 rows each (BAND_COUNT=3, FB_H/3 = exact 360)
  *
- * Memory model: snap is in Inner Shareable Normal cacheable memory →
- * SCU snooping makes core 0's snapshot writes visible to secondaries
- * automatically (no explicit flush). FB is Normal Non-cacheable → writes
- * land in SDRAM directly; cores writing different rows don't collide.
+ * Sequencing per frame:
+ *   1. core 0 calls mc_dispatch_debayer_async, which sets g_task_*
+ *      and bumps g_task_epoch with RELEASE + sev.
+ *   2. core 0 immediately moves on to wait_FS_LIP for the next frame.
+ *   3. cores 1-3 wake from WFE, ACQUIRE the new epoch, run their band,
+ *      RELEASE-increment g_task_done.
+ *   4. before the *next* dispatch, core 0 calls mc_wait_debayer_done so
+ *      we don't tear g_task_* on top of an in-flight task.
+ *
+ * Memory model: both raw buffers (raw_a, raw_b) are in Inner Shareable
+ * Normal cacheable memory. SCU snooping makes any cacheable accesses
+ * coherent across cores; the explicit dc ivac before debayer is the
+ * piece that handles DMA's writes (which bypass the cache). FB is Normal
+ * Non-cacheable → writes land in SDRAM directly; cores writing different
+ * rows don't collide.
  *
  * Cache-line align the two atomics to avoid false sharing between the
  * publish (g_task_epoch) and completion (g_task_done) traffic. */
 __attribute__((aligned(64))) static volatile uint32_t g_task_epoch = 0;
 __attribute__((aligned(64))) static volatile uint32_t g_task_done  = 0;
-static const uint8_t* g_task_snap = nullptr;
+static const uint8_t* g_task_raw = nullptr;
 static volatile uint32_t* g_task_fb = nullptr;
 static uint32_t g_task_fb_stride = 0;
 
-#define BAND_H (FB_H / 4u)            /* 270 rows per core */
+#define BAND_COUNT 3u                 /* secondary cores 1, 2, 3 */
+#define BAND_H (FB_H / BAND_COUNT)    /* 360 rows per core (1080/3 exact) */
 
-static inline void band_for_core(uint32_t core_id, uint32_t* vy_start, uint32_t* vy_end) {
-    *vy_start = core_id * BAND_H;
-    *vy_end   = (core_id == 3u) ? FB_H : ((core_id + 1u) * BAND_H);
+static inline void band_for_secondary(uint32_t core_id,
+                                      uint32_t* vy_start, uint32_t* vy_end) {
+    /* core_id ∈ {1,2,3}; band index = core_id - 1. */
+    uint32_t band_idx = core_id - 1u;
+    *vy_start = band_idx * BAND_H;
+    *vy_end   = (band_idx == BAND_COUNT - 1u) ? FB_H : ((band_idx + 1u) * BAND_H);
 }
 
 extern "C" void secondary_main(uint32_t core_id) {
@@ -130,10 +155,10 @@ extern "C" void secondary_main(uint32_t core_id) {
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("sev");
 
-    /* Task work loop — cores 1, 2, 3 each get rows [core_id*270, ...). */
+    /* Task work loop — cores 1, 2, 3 cover 3 bands of 360 rows each. */
     uint32_t local_epoch = 0;
     uint32_t vy_start, vy_end;
-    band_for_core(core_id, &vy_start, &vy_end);
+    band_for_secondary(core_id, &vy_start, &vy_end);
     while (1) {
         /* Wait for new task. WFE clears the local event after consuming it,
          * so we re-check the epoch each wakeup; spurious SEVs just iterate. */
@@ -143,7 +168,7 @@ extern "C" void secondary_main(uint32_t core_id) {
         local_epoch = g_task_epoch;
 
         debayer_band(vy_start, vy_end,
-                     g_task_snap, g_task_fb, g_task_fb_stride);
+                     g_task_raw, g_task_fb, g_task_fb_stride);
 
         /* Signal completion. RELEASE so the FB writes happen-before the
          * counter bump observed by core 0. */
@@ -153,30 +178,34 @@ extern "C" void secondary_main(uint32_t core_id) {
     }
 }
 
-static void mc_dispatch_debayer(const uint8_t* snap, volatile uint32_t* fb,
-                                uint32_t fb_stride_px) {
+static void mc_dispatch_debayer_async(const uint8_t* raw, volatile uint32_t* fb,
+                                      uint32_t fb_stride_px) {
     /* Publish task data — set globals first, then bump epoch with RELEASE.
-     * Secondaries reading epoch with ACQUIRE see consistent g_task_snap etc. */
-    g_task_snap      = snap;
+     * Secondaries reading epoch with ACQUIRE see consistent g_task_raw etc.
+     * Returns immediately; core 0 moves on to wait_FS for the next frame
+     * while cores 1-3 process this debayer task in the background.
+     *
+     * Caller must mc_wait_debayer_done() before any subsequent dispatch
+     * (so secondaries don't tear on overwritten globals) and before
+     * reusing this raw buffer as the DMA target (so we don't have DMA
+     * write to a buffer cores 1-3 are still reading). */
+    g_task_raw       = raw;
     g_task_fb        = fb;
     g_task_fb_stride = fb_stride_px;
     __atomic_store_n(&g_task_done, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&g_task_epoch, g_task_epoch + 1u, __ATOMIC_RELEASE);
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("sev");
+}
 
-    /* Core 0 does its own band (rows 0..269) in parallel with cores 1-3. */
-    uint32_t vy_start, vy_end;
-    band_for_core(0u, &vy_start, &vy_end);
-    debayer_band(vy_start, vy_end, snap, fb, fb_stride_px);
-
-    /* Wait for cores 1, 2, 3 to finish their bands. Polling (not WFE) so we
-     * don't deadlock if a secondary hangs. */
-    const uint32_t timeout_iters = 200000000u;     /* ~1 s on Cortex-A53 */
+static void mc_wait_debayer_done() {
+    /* Polling (not WFE) so we don't deadlock if a secondary hangs.
+     * Healthy 3-core debayer is ~32 ms; timeout is generous (~1 s). */
+    const uint32_t timeout_iters = 200000000u;
     uint32_t spins = 0;
-    while (__atomic_load_n(&g_task_done, __ATOMIC_ACQUIRE) < 3u) {
+    while (__atomic_load_n(&g_task_done, __ATOMIC_ACQUIRE) < BAND_COUNT) {
         if (++spins > timeout_iters) {
-            uart_puts("WARN: dispatch timeout, done=");
+            uart_puts("WARN: debayer sync timeout, done=");
             uart_dec(__atomic_load_n(&g_task_done, __ATOMIC_RELAXED));
             uart_puts("\n");
             break;
@@ -185,12 +214,12 @@ static void mc_dispatch_debayer(const uint8_t* snap, volatile uint32_t* fb,
 }
 
 /* Memory layout (RAM is identity-mapped Normal WB, Inner Shareable):
- *   RAW_BUFFER  0x01000000 .. 0x01E3D000   (14.24 MB Unicam DMA target)
- *   SNAP        0x02000000 .. 0x02E3D000   (14.24 MB CPU-stable copy)
+ *   RAW_A  0x01000000 .. 0x01E3D000   (14.24 MB Unicam DMA target, ping)
+ *   RAW_B  0x02000000 .. 0x02E3D000   (14.24 MB Unicam DMA target, pong)
  * Both are well below the VPU heap (0x1C000000) and the framebuffer
  * (0x1E402000). */
-#define RAW_BUFFER_ADDR  0x01000000UL
-#define SNAP_ADDR        0x02000000UL
+#define RAW_A_ADDR  0x01000000UL
+#define RAW_B_ADDR  0x02000000UL
 
 /* WB extracted from libcamera DNG (AsShotNeutral = [0.4784, 1.0, 0.5629]):
  *   R*=1/0.4784 = 2.090,  G*=1.000,  B*=1/0.5629 = 1.778. Q8 fixed-point. */
@@ -251,12 +280,6 @@ static inline void dcache_clean_range(void* addr, uint32_t len) {
     for (uintptr_t p = start; p < end; p += line)
         __asm__ volatile("dc civac, %0" :: "r"((void*)p));
     __asm__ volatile("dsb ish\nisb\n");
-}
-
-static void snapshot_raw(const uint8_t* src, uint8_t* dst) {
-    const uint64_t* s = (const uint64_t*)src;
-    uint64_t* d = (uint64_t*)dst;
-    for (uint32_t i = 0; i < FRAME_BYTES / 8u; i++) d[i] = s[i];
 }
 
 /* ── Debayer 4608x2592 BGGR → 1920x1080 ─────────────────────────────────────
@@ -394,7 +417,7 @@ static inline uint32_t cnt_to_ms(uint64_t delta) {
 
 extern "C" void kernel_main() {
     uart_init();
-    uart_puts("camara_direct V156: IMX708 4608x2592 -> HDMI 1920x1080 (16:9 native, full FOV)\n");
+    uart_puts("camara_direct V158: IMX708 4608x2592 -> HDMI 1920x1080 (continuous DMA, IBSA0 rotation)\n");
 
     {
         uint64_t freq;
@@ -406,7 +429,7 @@ extern "C" void kernel_main() {
 
     /* Wake cores 1-3 — each runs mmu_enable_this_core(), reports alive,
      * then enters its task-pool work loop waiting on g_task_epoch. The
-     * main loop's mc_dispatch_debayer publishes a task per frame. */
+     * main loop's mc_dispatch_debayer_async publishes a task per frame. */
     wake_secondary_cores();
     /* Brief poll loop: each core takes microseconds to reach the alive flag,
      * but we wait up to ~50 ms to be safe across QEMU and real hardware. */
@@ -445,15 +468,20 @@ extern "C" void kernel_main() {
     uart_puts("BSC1: init\n");
     bsc_init();
 
-    uint8_t* raw_buffer = (uint8_t*)RAW_BUFFER_ADDR;
-    uint8_t* snap       = (uint8_t*)SNAP_ADDR;
+    uint8_t* raw_a = (uint8_t*)RAW_A_ADDR;
+    uint8_t* raw_b = (uint8_t*)RAW_B_ADDR;
 
-    /* Canary fill BEFORE Unicam init — DMA isn't writing yet. dc civac
-     * pushes the canary into RAM and invalidates cache lines so the dc
-     * ivac inside the main loop won't discard them. */
-    for (uint32_t i = 0; i < FRAME_BYTES; i++) raw_buffer[i] = (uint8_t)CANARY_BYTE;
-    dcache_clean_range(raw_buffer, FRAME_BYTES);
-    unicam_init(raw_buffer);
+    /* Canary fill BOTH buffers BEFORE Unicam init — DMA isn't writing yet.
+     * dc civac pushes the canary into RAM and invalidates cache lines so
+     * the dc ivac in the main loop won't discard live DMA-written data. */
+    for (uint32_t i = 0; i < FRAME_BYTES; i++) raw_a[i] = (uint8_t)CANARY_BYTE;
+    for (uint32_t i = 0; i < FRAME_BYTES; i++) raw_b[i] = (uint8_t)CANARY_BYTE;
+    dcache_clean_range(raw_a, FRAME_BYTES);
+    dcache_clean_range(raw_b, FRAME_BYTES);
+
+    /* Unicam init programs IBSA0/IBEA0 = raw_a and strobes LIP. After this
+     * the active DMA shadow points at raw_a. */
+    unicam_init(raw_a);
 
     if (!imx708_probe()) {
         uart_puts("ERR: IMX708 not found\n");
@@ -465,104 +493,141 @@ extern "C" void kernel_main() {
     uart_puts("IMX708: stream ON\n");
     unicam_capture_start();
 
-    uint32_t cycle = 0;
+    /* One-shot Linux-comparable register snapshot. Done before entering the
+     * steady-state loop so the values reflect the post-init / pre-stream
+     * state and can be diff'd against linux_capture_linux/. After the first
+     * iteration's wait_FS_LIP runs, the rows_max value will reflect a real
+     * captured frame's coverage. */
+    {
+        uart_puts("UNICAM_BEGIN\n");
+        uart_puts("  CTRL  = 0x"); uart_hex(unicam_get_ctrl()); uart_puts("\n");
+        uart_puts("  ANA   = 0x"); uart_hex(unicam_get_ana());  uart_puts("\n");
+        uart_puts("  PRI   = 0x"); uart_hex(unicam_get_pri());  uart_puts("\n");
+        uart_puts("  CLK   = 0x"); uart_hex(unicam_get_clk());  uart_puts("\n");
+        uart_puts("  CLT   = 0x"); uart_hex(unicam_get_clt());  uart_puts("\n");
+        uart_puts("  DAT0  = 0x"); uart_hex(unicam_get_dat0()); uart_puts("\n");
+        uart_puts("  DAT1  = 0x"); uart_hex(unicam_get_dat1()); uart_puts("\n");
+        uart_puts("  DAT2  = 0x"); uart_hex(unicam_get_dat2()); uart_puts("\n");
+        uart_puts("  DAT3  = 0x"); uart_hex(unicam_get_dat3()); uart_puts("\n");
+        uart_puts("  DLT   = 0x"); uart_hex(unicam_get_dlt());  uart_puts("\n");
+        uart_puts("  CMP0  = 0x"); uart_hex(unicam_get_cmp0()); uart_puts("\n");
+        uart_puts("  ICTL  = 0x"); uart_hex(unicam_get_ictl()); uart_puts("\n");
+        uart_puts("  IDI0  = 0x"); uart_hex(unicam_get_idi0()); uart_puts("\n");
+        uart_puts("  IPIPE = 0x"); uart_hex(unicam_get_ipipe());uart_puts("\n");
+        uart_puts("  IBSA0 = 0x"); uart_hex(unicam_get_ibsa0());uart_puts("\n");
+        uart_puts("  IBEA0 = 0x"); uart_hex(unicam_get_ibea0());uart_puts("\n");
+        uart_puts("  IBLS  = 0x"); uart_hex(unicam_get_ibls()); uart_puts("\n");
+        uart_puts("  IHWIN = 0x"); uart_hex(unicam_get_ihwin());uart_puts("\n");
+        uart_puts("  IVWIN = 0x"); uart_hex(unicam_get_ivwin());uart_puts("\n");
+        uart_puts("UNICAM_END\n");
+
+        uart_puts("IMX708_BEGIN\n");
+        static const uint16_t kReadback[] = {
+            0x0100, 0x0101, 0x0114,
+            0x0202, 0x0203, 0x0204, 0x0205, 0x020E, 0x020F,
+            0x0310,
+            0x0340, 0x0341, 0x0342, 0x0343,
+            0x034C, 0x034D, 0x034E, 0x034F,
+            0x0900,
+        };
+        for (uint32_t i = 0; i < sizeof(kReadback)/sizeof(uint16_t); i++) {
+            uint16_t r = kReadback[i];
+            uint8_t v = imx708_read(r);
+            uart_puts("  reg=0x"); uart_hex((uint32_t)r);
+            uart_puts(" val=0x"); uart_hex((uint32_t)v); uart_puts("\n");
+        }
+        uart_puts("IMX708_END\n");
+    }
+
+    /* Steady-state loop. Two-buffer rotation with continuous DMA:
+     *
+     *   active_buf  = the buffer DMA is currently writing into.
+     *   prev_buf    = the buffer that holds the just-completed frame.
+     *
+     * Each iteration:
+     *   (1) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
+     *   (2) wait for FS, strobe LIP — DMA now writes upcoming frame to OTHER.
+     *       The frame that just finished (in active_buf at the time of the
+     *       FS) becomes prev_buf for this iteration.
+     *   (3) sync any in-flight debayer from the previous iteration; cores
+     *       1-3 must finish reading their buffer before we expose it as the
+     *       new prev_buf for THIS iteration's debayer.
+     *   (4) invalidate the prev_buf cache lines so debayer reads fresh
+     *       SDRAM data (DMA bypasses CPU caches).
+     *   (5) dispatch debayer of prev_buf → FB, async on cores 1-3.
+     *
+     * The debayer overlaps with the next wait_FS, hiding 32 ms inside
+     * the 117 ms sensor frame period. Per-frame total ≈ 117 ms = 8.55 fps. */
+    uint8_t* active_buf       = raw_a;
+    bool     debayer_in_flight = false;
+    uint32_t cycle             = 0u;
     while (1) {
+        uint8_t* next_buf = (active_buf == raw_a) ? raw_b : raw_a;
+
         uint64_t t0 = cnt_now();
-        unicam_wait_frame_end_stop();
+
+        /* Step 1: pre-stage IBSA0 = next_buf. The register write doesn't
+         * affect the active DMA shadow until the LIP that follows the FS. */
+        unicam_stage_dma_buffer(next_buf);
+
+        /* Step 2: wait for next FS, strobe LIP. After this returns, DMA
+         * is writing the upcoming frame into next_buf, and the previous
+         * frame is complete in active_buf. The returned IBWP value was
+         * sampled at FS *before* LIP reset it, so it equals the byte
+         * count of the just-completed frame inside active_buf. */
+        uint32_t ibwp_pre_lip = unicam_wait_fs_and_lip();
         uint64_t t1 = cnt_now();
 
-        dcache_invalidate_range(raw_buffer, FRAME_BYTES);
-        snapshot_raw(raw_buffer, snap);
+        uint8_t* prev_buf = active_buf;
+        active_buf        = next_buf;
 
-        /* BCM2837 Unicam has a pre-existing ~81% line-coverage limit
-         * (V146/V147): some PDAF/embedded short packets count against the
-         * line counter without filling the buffer, so the tail of every
-         * frame stays unwritten regardless of CMP0 / lane count. Without
-         * this zero-pass that tail would show stale frame-N-1 data; with
-         * it, the bottom of HDMI is cleanly black. */
-        {
-            uint32_t ibwp_max = unicam_get_ibwp_max();
-            uint32_t ibsa0    = unicam_get_ibsa0();
-            uint32_t bytes_valid = (ibwp_max > ibsa0) ? (ibwp_max - ibsa0) : 0u;
-            if (bytes_valid > FRAME_BYTES) bytes_valid = FRAME_BYTES;
-            if (bytes_valid < FRAME_BYTES) {
-                uint64_t* z = (uint64_t*)(snap + bytes_valid);
-                uint64_t* zend = (uint64_t*)(snap + FRAME_BYTES);
-                while (z < zend) *z++ = 0;
-            }
+        /* Step 3: sync with the in-flight debayer from the previous
+         * iteration (it's reading the old prev_buf, which we're about to
+         * either invalidate or — two iterations from now — reuse as DMA
+         * target). Healthy: 0 ms because debayer of ~32 ms finished long
+         * inside the 117 ms wait. */
+        if (debayer_in_flight) {
+            mc_wait_debayer_done();
         }
         uint64_t t2 = cnt_now();
 
-        unicam_rearm();
-
+        /* One-shot rows_max diagnostic on the first real captured frame.
+         * ibwp_pre_lip was sampled at FS, when DMA had finished writing
+         * the just-completed frame into prev_buf. The buffer's bus alias
+         * is 0xC0000000 | phys, matching what unicam_init programmed. */
         if (cycle == 0u) {
-            /* One-shot Linux-comparable register snapshot. Diff against
-             * linux_capture_linux/{unicam_run.txt, imx708_run_full_synth.txt}
-             * with: python3 tools/diff_runtime_full.py uart.log */
-            uint32_t ibwp_max  = unicam_get_ibwp_max();
-            uint32_t ibsa0     = unicam_get_ibsa0();
-            uint32_t ibea0     = unicam_get_ibea0();
-            uint32_t ibls      = unicam_get_ibls();
-            uint32_t rows_max  = ibls ? ((ibwp_max - ibsa0) / ibls) : 0u;
-
+            uint32_t prev_bus = 0xC0000000u | (uint32_t)(uintptr_t)prev_buf;
+            uint32_t ibls     = unicam_get_ibls();
+            uint32_t bytes_seen = (ibwp_pre_lip > prev_bus) ? (ibwp_pre_lip - prev_bus) : 0u;
+            uint32_t rows_max = ibls ? (bytes_seen / ibls) : 0u;
             uart_puts("FRAME rows_max=0x"); uart_hex(rows_max);
             uart_puts(" / 0xA20\n");
-
-            uart_puts("UNICAM_BEGIN\n");
-            uart_puts("  CTRL  = 0x"); uart_hex(unicam_get_ctrl()); uart_puts("\n");
-            uart_puts("  ANA   = 0x"); uart_hex(unicam_get_ana());  uart_puts("\n");
-            uart_puts("  PRI   = 0x"); uart_hex(unicam_get_pri());  uart_puts("\n");
-            uart_puts("  CLK   = 0x"); uart_hex(unicam_get_clk());  uart_puts("\n");
-            uart_puts("  CLT   = 0x"); uart_hex(unicam_get_clt());  uart_puts("\n");
-            uart_puts("  DAT0  = 0x"); uart_hex(unicam_get_dat0()); uart_puts("\n");
-            uart_puts("  DAT1  = 0x"); uart_hex(unicam_get_dat1()); uart_puts("\n");
-            uart_puts("  DAT2  = 0x"); uart_hex(unicam_get_dat2()); uart_puts("\n");
-            uart_puts("  DAT3  = 0x"); uart_hex(unicam_get_dat3()); uart_puts("\n");
-            uart_puts("  DLT   = 0x"); uart_hex(unicam_get_dlt());  uart_puts("\n");
-            uart_puts("  CMP0  = 0x"); uart_hex(unicam_get_cmp0()); uart_puts("\n");
-            uart_puts("  ICTL  = 0x"); uart_hex(unicam_get_ictl()); uart_puts("\n");
-            uart_puts("  IDI0  = 0x"); uart_hex(unicam_get_idi0()); uart_puts("\n");
-            uart_puts("  IPIPE = 0x"); uart_hex(unicam_get_ipipe());uart_puts("\n");
-            uart_puts("  IBSA0 = 0x"); uart_hex(ibsa0);             uart_puts("\n");
-            uart_puts("  IBEA0 = 0x"); uart_hex(ibea0);             uart_puts("\n");
-            uart_puts("  IBLS  = 0x"); uart_hex(ibls);              uart_puts("\n");
-            uart_puts("  IHWIN = 0x"); uart_hex(unicam_get_ihwin());uart_puts("\n");
-            uart_puts("  IVWIN = 0x"); uart_hex(unicam_get_ivwin());uart_puts("\n");
-            uart_puts("UNICAM_END\n");
-
-            uart_puts("IMX708_BEGIN\n");
-            static const uint16_t kReadback[] = {
-                0x0100, 0x0101, 0x0114,
-                0x0202, 0x0203, 0x0204, 0x0205, 0x020E, 0x020F,
-                0x0310,
-                0x0340, 0x0341, 0x0342, 0x0343,
-                0x034C, 0x034D, 0x034E, 0x034F,
-                0x0900,
-            };
-            for (uint32_t i = 0; i < sizeof(kReadback)/sizeof(uint16_t); i++) {
-                uint16_t r = kReadback[i];
-                uint8_t v = imx708_read(r);
-                uart_puts("  reg=0x"); uart_hex((uint32_t)r);
-                uart_puts(" val=0x"); uart_hex((uint32_t)v); uart_puts("\n");
-            }
-            uart_puts("IMX708_END\n");
             cycle = 1u;
         }
 
-        mc_dispatch_debayer(snap, fb, fb_stride_px);
+        /* Step 4: invalidate prev_buf cache lines. DMA wrote there bypass-
+         * ing CPU caches, so without this debayer reads stale data. */
+        dcache_invalidate_range(prev_buf, FRAME_BYTES);
         uint64_t t3 = cnt_now();
 
-        uint32_t ms_wait    = cnt_to_ms(t1 - t0);
-        uint32_t ms_snap    = cnt_to_ms(t2 - t1);
-        uint32_t ms_debayer = cnt_to_ms(t3 - t2);
-        uint32_t ms_total   = cnt_to_ms(t3 - t0);
-        uint32_t fps_x100   = ms_total ? (100000u / ms_total) : 0u;
+        /* Step 5: dispatch debayer of prev_buf, async on cores 1-3. */
+        mc_dispatch_debayer_async(prev_buf, fb, fb_stride_px);
+        debayer_in_flight = true;
+        uint64_t t4 = cnt_now();
 
-        uart_puts("TIMING wait=");    uart_dec(ms_wait);
-        uart_puts(" snap=");          uart_dec(ms_snap);
-        uart_puts(" debayer=");       uart_dec(ms_debayer);
-        uart_puts(" total=");         uart_dec(ms_total);
-        uart_puts(" ms  fps=");       uart_dec(fps_x100 / 100u);
+        uint32_t ms_wait      = cnt_to_ms(t1 - t0);   /* incl. stage_buf */
+        uint32_t ms_sync_prev = cnt_to_ms(t2 - t1);
+        uint32_t ms_inval     = cnt_to_ms(t3 - t2);
+        uint32_t ms_dispatch  = cnt_to_ms(t4 - t3);
+        uint32_t ms_total     = cnt_to_ms(t4 - t0);
+        uint32_t fps_x100     = ms_total ? (100000u / ms_total) : 0u;
+
+        uart_puts("TIMING wait=");  uart_dec(ms_wait);
+        uart_puts(" sync=");        uart_dec(ms_sync_prev);
+        uart_puts(" inval=");       uart_dec(ms_inval);
+        uart_puts(" disp=");        uart_dec(ms_dispatch);
+        uart_puts(" total=");       uart_dec(ms_total);
+        uart_puts(" ms  fps=");     uart_dec(fps_x100 / 100u);
         uart_putc('.');
         uint32_t frac = fps_x100 % 100u;
         if (frac < 10u) uart_putc('0');
