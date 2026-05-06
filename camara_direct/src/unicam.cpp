@@ -69,10 +69,10 @@
 /* MISC FL0|FL1 = BIT(6)|BIT(9) */
 #define U_MISC_FLBITS (((1u << 6) | (1u << 9)))
 
-/* Full mode 4608x2592 RAW10 packed: 4608 * 10 / 8 = 5760 bytes/line.
- * Total frame = 5760 * 2592 = 14,929,920 bytes (0xE3D000 ≈ 14.24 MB). */
-#define FRAME_W  5760u
-#define FRAME_H  2592u
+/* V159 binned mode 1536×864 RAW10 packed: 1536 * 10 / 8 = 1920 bytes/line.
+ * Total frame = 1920 * 864 = 1,658,880 bytes (0x195000 ≈ 1.58 MB). */
+#define FRAME_W  1920u
+#define FRAME_H  864u
 #define FRAME_SZ (FRAME_W * FRAME_H)
 
 static volatile uint32_t* const U1 = (volatile uint32_t*)UNICAM1_BASE;
@@ -103,7 +103,7 @@ static void cm_cam1_enable_100mhz() {
 }
 
 void unicam_init(void* buffer) {
-    uart_puts("Unicam: V150 full-mode init (4608x2592)\n");
+    uart_puts("Unicam: V159 binned-mode init (1536x864)\n");
 
     /* STEP 0A: CM_CAM1CTL — digital backend clock (100MHz from PLLD) */
     cm_cam1_enable_100mhz();

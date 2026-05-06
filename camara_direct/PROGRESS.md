@@ -2,9 +2,12 @@
 
 **Plataforma:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53). Bare-metal AArch64, sin sistema operativo.
 **Cámara:** Pi Camera v3 (Sony IMX708), CSI-2 a 2 lanes.
-**Estado actual:** V156 — captura full mode 4608×2592 → HDMI 1920×1080 a aspecto nativo 16:9, FOV completo del sensor, multi-core debayer (4×Cortex-A53), FS-a-FS frame-end. **Cobertura DMA al 100%** (`rows_max=0xA20=2592`) confirmada con FS-a-FS — la "limitación del 67%" que vimos en V148–V153 era sólo el polling IBWP-stable parando DMA en falsos positivos de VBLANK.
+**Estado actual:** V159 — captura **binned 1536×864** → HDMI 1920×1080, continuous DMA via IBSA0 rotation (V158), multi-core debayer (cores 1-3, async). En validación HW.
 
-**Throughput sostenido medido:** `wait=93/117 snap=18 debayer=24 total=135 ms → 7.40 fps`. El cuello es el **período físico del sensor (117 ms a la configuración actual) más los 18 ms de memcpy DMA→snap**: `1 / (117+18) = 7.4 fps`. Ver §"Período del sensor — finding V157" para los detalles.
+**Throughput esperado:** ~24 fps (techo del sensor en binned a `FLL=0x046D`/`LLP=0x1460`). Versiones previas en full mode 4608×2592 estaban capadas a 7.4 fps por el período físico del sensor (117 ms) + memcpy DMA→snap; V159 elimina ambos cuellos:
+- Período sensor binned ~41 ms (vs 117 ms full).
+- Buffer DMA 1.58 MB (vs 14.93 MB) → contención de memoria casi inexistente.
+- IBSA0 rotation eliminó el snap memcpy en V158.
 
 ---
 
@@ -191,15 +194,19 @@ Cores: 1, 2, 3 corren `secondary_main` con bandas `BAND_COUNT=3` (FB_H/3 = 360 r
 - **Memory contention durante el debayer**: V157 mostró que cores 1-3 leyendo 14.93 MB + escribiendo 8.3 MB durante 32 ms saturan el bus SDRAM. El DMA del Unicam es modesto (~128 MB/s) pero podría rezagarse. La medición `wait` lo detecta — si crece de ~117 ms a ~141 ms, hay que mitigar (reducir bandas a 4 cores con core 0 esperando, o pasar a binned).
 - **Cache invalidation timing**: el `dc ivac` sobre 14.93 MB toma varios ms. Si pasa al mismo tiempo que un acceso de cores 1-3 al buffer recién terminado (no debería — la sync espera primero), puede haber tearing visual. Mitigación: el `mc_wait_debayer_done` antes de invalidate garantiza que cores no estén leyendo prev_buf.
 
-### 4. Modo binned 1536×864 — saltar a 30+ fps
+### 4. Modo binned 1536×864 — IMPLEMENTADO en V159
 
-**Ganancia esperada: 7.40 → ~25-30 fps** (limitado por debayer + presentación HDMI, no por sensor).
+**Ganancia esperada: 7.40 → ~24 fps** a `FLL=0x046D`. Pendiente de validar en HW.
 
-Cambio arquitectónico mayor pero válido si necesitamos fps alto (YOLO realtime, etc.). Requiere:
-- Nueva tabla `k_imx708_full[]` con regs binned (similar a la que usa el padre).
-- Buffer raw 1.66 MB en lugar de 14.24 MB (snap → ~2 ms).
-- Debayer con upscale 1536×864 → 1920×1080 (en lugar del downscale actual 4608×2592 → 1920×1080), o cambiar la salida HDMI a la resolución nativa del sensor.
-- Revalidar `DAT0/DAT1` y `CLT/DLT` para el link clock distinto del modo binned.
+Cambios aplicados:
+- `imx708_regs.h`: nueva tabla `k_imx708_common[]` (común) + `k_imx708_binned[]` (mode-specific). Sensor lee crop 3072×1728 centrado del array 4608×2592 (`x_addr=768..3839`, `y_addr=432..2159`) y aplica binning 2×2 → output 1536×864. Bayer queda BGGR tras el flip 0x0101=0x03.
+- `imx708.cpp`: init en dos fases (common, luego mode), siguiendo el patrón del kernel `bcm2835-unicam.c`.
+- `unicam.cpp`: `FRAME_W=1920` (1536 px × 10 bit / 8), `FRAME_H=864`, `FRAME_SZ=0x195000` (1.58 MB).
+- `main.cpp`: `SENSOR_W/H = 1536/864`, `RAW_STRIDE=1920`. Geometría debayer pasa de **downscale 6/5** (V156-V158) a **upscale 5/4**: cada bloque Bayer 2×2 binned → ~2.5 outputs. Nearest-neighbor por ahora; bilinear queda pendiente para suavizar el upscale.
+
+Posibles ganancias adicionales sobre V159 si el debayer lo permite:
+- **Reducir FLL más allá de 0x046D**: el mínimo es ~y_size+vblank. A FLL=900 se alcanzarían ~30 fps; a FLL=870 (mínimo absoluto) ~31 fps. Cambiar `0x0340/41` en `k_imx708_binned[]`.
+- **Bilinear o Catmull-Rom upscale 5/4** en `debayer_band` para suavizar los bloques 2.5x.
 
 ### 5. ✅ Cobertura DMA completa — HECHO (V154)
 
@@ -346,15 +353,15 @@ isb
 
 ```
 0x00000000 .. 0x00FFFFFF  Kernel + BSS + stack (≈ 11 KB)
-0x01000000 .. 0x01E3D000  RAW_A DMA target (14.93 MB ping)            ← V158
-0x02000000 .. 0x02E3D000  RAW_B DMA target (14.93 MB pong)            ← V158
+0x01000000 .. 0x01195000  RAW_A DMA target (1.58 MB binned ping)      ← V159
+0x02000000 .. 0x02195000  RAW_B DMA target (1.58 MB binned pong)      ← V159
 0x1C000000 .. 0x20000000  VPU heap (gpu_mem=128 → últimos 128 MB)
 0x1E402000 ..             Framebuffer (asignado por el VPU vía mailbox)
 0x3F000000 .. 0x40000000  MMIO peripherals (Device-nGnRnE en MMU)
 0xC0000000 | phys         Bus alias VideoCore para DMA writes
 ```
 
-(En V156 había sólo `RAW` y un `SNAP` separado para el memcpy CPU-stable; V158 elimina el snap y usa los dos slots como ping-pong DMA.)
+(V156 = RAW + SNAP separados para memcpy CPU-stable. V158 = dos buffers RAW para ping-pong, snap eliminado, full mode (14.93 MB cada uno). V159 = binned 1.58 MB cada uno.)
 
 MMU identity-mapea 1 GB con bloques de 2 MB. El rango VPU está mapeado **Normal Non-cacheable** + Inner Shareable para que la VPU vea los pixels sin caché ARM por encima.
 

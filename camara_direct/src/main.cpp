@@ -1,44 +1,42 @@
-/* camara_direct V158 — continuous DMA via IBSA0 rotation, snap eliminated.
+/* camara_direct V159 — binned 1536×864 mode for higher fps.
  *
- * Path chosen vs the V156 baseline:
- *   V156: wait_FS-to-FS stops CPE → memcpy raw_buffer→snap (18 ms) → rearm →
- *         debayer. Cycle = frame_period(117) + snap(18) = 135 ms = 7.4 fps.
- *   V158: two raw buffers (raw_a, raw_b). At each FS, software pre-stages
- *         IBSA0/IBEA0 to point at the OTHER buffer; LIP at FS commits the
- *         new address; the previous buffer is read directly (no memcpy)
- *         while DMA fills the new one. CPE never stops. Cycle =
- *         max(frame_period(117), debayer3) = 117 ms = 8.55 fps.
+ * Path chosen vs V158 (4608×2592 full mode, 7.4 fps):
+ *   V158 hit the conservation law `cycle = frame_period + memory_contention`
+ *   and stayed at 7.4 fps no matter how the dispatch was reordered, because
+ *   the sensor at 4608×2592 / 2-lane / FLL=0x0A5A has a 117 ms physical
+ *   frame period AND the 14.93 MB raw buffer + 8.3 MB FB writes saturate
+ *   the LPDDR2 bus during debayer.
+ *   V159 switches the IMX708 to its native binned mode: 3072×1728 analog
+ *   readout window centered in the 4608×2592 array, 2×2 binned to 1536×864
+ *   output. This both shortens the frame period (FLL=0x046D=1133 lines
+ *   instead of 0x0A5A=2650 → ~24 fps cap) and shrinks the raw buffer by
+ *   9× (1.58 MB instead of 14.93 MB), drastically reducing memory pressure
+ *   on the debayer + display pipeline.
  *
- * Why IBSA0 rotation instead of IBSA1/IBEA1 hardware ping-pong:
- *   The libcamera runtime dumps (linux_capture_linux/unicam_run*.txt) show
- *   that bcm2835-unicam.c never programs IBSA1/IBEA1 — instead it rewrites
- *   IBSA0 between frames (the two dumps captured at different times have
- *   *different* IBSA0 values). The "double-buffer section" comment in the
- *   parent's hardware_sim.h appears to be the parent project's guess; the
- *   BCM2837 TRM is not public, and the most plausible interpretation given
- *   libcamera's behaviour is that IBSA1/IBEA1 belong to a *second* DMA
- *   channel (e.g. embedded-data on a different VC/DT) rather than a
- *   ping-pong of the same image stream. We follow the proven libcamera
- *   pattern.
+ * V158's continuous-DMA architecture is preserved verbatim: two raw
+ * buffers (raw_a, raw_b), pre-stage IBSA0 + LIP at FS1 of every real
+ * frame, wait FS2 to confirm completion, debayer the just-completed
+ * buffer async on cores 1-3 while DMA fills the new buffer.
  *
- * Async debayer (cores 1-3, 3 bands of 360 rows = ~32 ms) runs concurrently
- * with the wait_FS for the next frame on core 0. The debayer's memory
- * footprint (read 14.93 MB + write 8.3 MB) overlaps with DMA's writes
- * (~128 MB/s steady-state) and with core 0's MMIO polling. The 117 ms
- * frame period leaves ~85 ms idle on cores 1-3 after the debayer finishes,
- * so contention is bounded to the debayer window.
+ * IBSA0 rotation (NOT IBSA1/IBEA1 hardware ping-pong) is preserved from
+ * V158. The libcamera runtime dumps show bcm2835-unicam.c rewrites IBSA0
+ * between frames; IBSA1/IBEA1 are never programmed in libcamera and most
+ * plausibly belong to a second DMA channel for embedded data. The proven
+ * libcamera pattern is followed.
  *
- * Memory layout:
- *   RAW_A 0x01000000 .. 0x01E3D000   (14.24 MB DMA target, ping)
- *   RAW_B 0x02000000 .. 0x02E3D000   (14.24 MB DMA target, pong)
- * Both are inside the Normal Inner-Shareable cacheable region built by
- * mmu.cpp. A `dc ivac` over the just-completed buffer is required before
- * the debayer reads it because DMA writes bypass the CPU cache.
+ * Memory layout (binned mode reduces buffer footprint ~9×):
+ *   RAW_A 0x01000000 .. 0x01195000   (1.58 MB DMA target, ping)
+ *   RAW_B 0x02000000 .. 0x02195000   (1.58 MB DMA target, pong)
  *
- * Sensor: Pi Camera v3 in full readout (no binning), Bayer is BGGR after the
- * 0x0101=0x03 H+V flip Linux applies. ISP constants (BLC, WB, CCM, gamma)
- * are taken from the Linux libcamera tuning file
- * (linux_extract/tuning/imx708.json) and the actual DNG:
+ * Debayer geometry switches from 6/5 downscale (V156-V158) to 5/4 upscale:
+ * 1536×864 sensor → 1920×1080 display. Each binned 2×2 Bayer block maps
+ * to ~2.5 output pixels (nearest-neighbor for now; bilinear is a future
+ * improvement to smooth the upscale).
+ *
+ * Sensor: Pi Camera v3 binned readout, Bayer is BGGR after the 0x0101=0x03
+ * H+V flip Linux applies. ISP constants (BLC, WB, CCM, gamma) carry over
+ * unchanged from V158 — they're tied to the IMX708's color response, not
+ * the readout mode:
  *   BlackLevel = 64 (10-bit)
  *   AsShotNeutral = [0.4784, 1.0, 0.5629]
  *   CCM (4640K) = the daylight matrix from imx708.json
@@ -99,10 +97,10 @@ extern uint32_t fb_pitch;
 #define FB_W   1920u
 #define FB_H   1080u
 
-#define SENSOR_W   4608u
-#define SENSOR_H   2592u
-#define RAW_STRIDE 5760u             /* 4608 px * 10 bit / 8 */
-#define FRAME_BYTES (RAW_STRIDE * SENSOR_H)   /* 14,929,920 = 0xE3D000 */
+#define SENSOR_W   1536u             /* V159 binned: 1536x864 from 3072x1728 crop, 2x2 binned */
+#define SENSOR_H   864u
+#define RAW_STRIDE 1920u             /* 1536 px * 10 bit / 8 */
+#define FRAME_BYTES (RAW_STRIDE * SENSOR_H)   /* 1,658,880 = 0x195000 */
 
 /* ── Multi-core task pool (V158: cores 1-3 only) ───────────────────────────
  * Core 0 owns the Unicam state machine (stage IBSA0, wait FS+LIP, swap,
@@ -282,12 +280,18 @@ static inline void dcache_clean_range(void* addr, uint32_t len) {
     __asm__ volatile("dsb ish\nisb\n");
 }
 
-/* ── Debayer 4608x2592 BGGR → 1920x1080 ─────────────────────────────────────
+/* ── Debayer 1536x864 BGGR → 1920x1080 ─────────────────────────────────────
  *
- * Sensor → display ratio is exactly 2.4× both axes (16:9 → 16:9), so the full
- * sensor maps to the full screen with no letterbox. For output pixel (vx,vy):
- *   blk_x = (vx * 2304) / 1920 = (vx * 6) / 5
- *   blk_y = (vy * 1296) / 1080 = (vy * 6) / 5
+ * V159 binned: sensor → display ratio is 5/4 in both axes (UPSCALE, not the
+ * V158-and-earlier downscale 6/5). Sensor is 1536×864 = 768×432 Bayer 2×2
+ * blocks; display is 1920×1080. For output pixel (vx,vy):
+ *   blk_x = (vx * 768) / 1920 = (vx * 2) / 5     // vx ∈ [0..1919] → blk_x ∈ [0..767]
+ *   blk_y = (vy * 432) / 1080 = (vy * 2) / 5     // vy ∈ [0..1079] → blk_y ∈ [0..431]
+ *
+ * Each 2×2 block of binned sensor pixels maps to a 5/4 × 5/4 output region
+ * (~2.5 outputs per block axis = blocky nearest-neighbor look). Bilinear
+ * smoothing is a future improvement; for now nearest-neighbor with the
+ * existing NEON ISP pipeline is correct and fast enough.
  *
  * Bayer extraction with 0x0101=0x03 flip applied (BGGR per DNG):
  *   row even, col even → B    row even, col odd  → Gb
@@ -302,11 +306,11 @@ static uint32_t g_byte_off[FB_W];    /* byte offset of B inside the row for each
 
 static void debayer_init_tables() {
     for (uint32_t vy = 0; vy < FB_H; vy++) {
-        uint32_t blk_y = (vy * 6u) / 5u;
+        uint32_t blk_y = (vy * 2u) / 5u;             /* upscale 5/4 in block coords */
         g_row_off[vy] = (blk_y * 2u) * RAW_STRIDE;
     }
     for (uint32_t vx = 0; vx < FB_W; vx++) {
-        uint32_t blk_x   = (vx * 6u) / 5u;
+        uint32_t blk_x   = (vx * 2u) / 5u;
         uint32_t sx_even = blk_x * 2u;
         g_byte_off[vx] = (sx_even >> 2) * 5u + (sx_even & 3u);
     }
@@ -417,7 +421,7 @@ static inline uint32_t cnt_to_ms(uint64_t delta) {
 
 extern "C" void kernel_main() {
     uart_init();
-    uart_puts("camara_direct V158: IMX708 4608x2592 -> HDMI 1920x1080 (continuous DMA, IBSA0 rotation)\n");
+    uart_puts("camara_direct V159: IMX708 1536x864 binned -> HDMI 1920x1080 (continuous DMA)\n");
 
     {
         uint64_t freq;
@@ -608,7 +612,7 @@ extern "C" void kernel_main() {
             uint32_t bytes_seen = (ibwp_pre_lip > prev_bus) ? (ibwp_pre_lip - prev_bus) : 0u;
             uint32_t rows_max = ibls ? (bytes_seen / ibls) : 0u;
             uart_puts("FRAME rows_max=0x"); uart_hex(rows_max);
-            uart_puts(" / 0xA20\n");
+            uart_puts(" / 0x360\n");   /* expected = SENSOR_H = 864 (binned) */
             cycle = 1u;
         }
 
