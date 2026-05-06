@@ -10,8 +10,9 @@
  * which is itself a port of the official raspberrypi/linux
  * imx708.c mode_2x2binned_720p_regs[] sequence with these overrides
  * proven on hardware:
- *   - 0x0310=0x00 non-continuous HS clock (V104 from parent — ⚠ SUSPECT, see
- *     V159 lane-swap regression note inline; libcamera default is 0x01)
+ *   - 0x0310=0x01 continuous HS clock (libcamera default; the parent's V104
+ *     override 0x00 reintroduced the lane-swap bug in V159 initial commit
+ *     — see inline note at the 0x0310 line)
  *   - 0x0204/05=0x03C0 ANA_GAIN=16x (V122; libcamera default 0x0070=1.12x is too dim)
  *   - 0x020E/0F=0x0200 DIG_GAIN=2x (V122)
  *   - 0x0220=0x00 + secondary-exposure regs zeroed (V150, HDR/DOL fully OFF)
@@ -113,27 +114,21 @@ static const RegVal k_imx708_binned[] = {
     { 0x0305, 0x02 }, { 0x0306, 0x00 },
     { 0x0307, 0x76 },
     { 0x030B, 0x02 }, { 0x030D, 0x04 },
-    /* ⚠ V159 LANE-SWAP REGRESSION SUSPECT — DO NOT KEEP AT 0x00.
+    /* HS clock = continuous (libcamera default in BOTH binned and full).
      *
-     * 0x0310 controls IMX708's HS clock continuity:
-     *   0x00 = non-continuous (clock lane goes to LP between line bursts)
-     *   0x01 = continuous (clock lane stays in HS the whole time)
-     *
-     * camara_direct V158 full-mode used 0x01 (libcamera default) and worked
-     * cleanly. V159 inherited the parent project's V104 override (0x00) when
-     * porting parent's binned tables; that override was for parent-project
-     * specific debug context, NOT a libcamera-validated value.
-     *
-     * Both libcamera dumps (linux_extract/registers/imx708_writes_*) show
-     * 0x0310 = 0x01 in BOTH modes (full and binned). Setting 0x00 here is
-     * what brought back the "lane swap" appearance — DAT1 readback in V159
-     * (0x02000005) is missing bit 26 vs V158's lane-1 readback, consistent
-     * with lane-1 losing HS sync because the BCM2837's auto-termination
-     * cannot re-engage cleanly when the clock drops to LP between bursts.
-     *
-     * Fix: change to 0x01. Keep 0x00 ONLY if a future debug session proves
-     * 0x01 introduces a different regression. */
-    { 0x0310, 0x00 },
+     * V159 initial commit inherited parent project's `{ 0x0310, 0x00 }`
+     * override (non-continuous HS) and reintroduced the lane-swap bug
+     * V150 had resolved: clock lane dropping to LP between line bursts
+     * caused BCM2837's auto-termination on lane-1 (configured as
+     * clock-pattern HS termination, DAT1=0x06000005) to lose HS sync,
+     * delivering bytes out of phase with lane-0 → real scenes showed
+     * mixed-byte "lane swap" (test patterns hid it). Confirmed by Unicam
+     * DAT1 readback: V158 0xC0000005 (bit 26 set, HS-active) vs V159
+     * initial 0x02000005 (bit 26 lost). libcamera dumps in
+     * linux_extract/registers/imx708_writes_*_unique_final.txt show
+     * 0x0310 = 0x01 in both modes — the parent's "V104 HW-verified" flag
+     * was a parent-context debug override, not a portable value. */
+    { 0x0310, 0x01 },
     /* 3CA0-3CBF timing block (per official binned sequence) */
     { 0x3CA0, 0x00 }, { 0x3CA1, 0x3C },
     { 0x3CA4, 0x01 }, { 0x3CA5, 0x5E },

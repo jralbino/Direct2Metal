@@ -12,7 +12,7 @@ TIMING wait=18 sync=7 inval=0 disp=0 total=26 ms  fps=38.46
 ```
 Bottleneck pasó del sensor (V158: 117 ms cap) al debayer (V159: ~25 ms = 38-45 fps cap). El sensor en binned a `FLL=0x046D` da ~24 fps teóricos pero medimos 40+ fps porque cada iteración corresponde a 1 frame físico y el wait queda en ~14-21 ms por la asimetría del 2-FSI window. Buffer DMA pasó de 14.93 MB → 1.58 MB → contención prácticamente eliminada (el `wait` ya no crece como en V157/V158).
 
-⚠ **V159 lane-swap regression:** la imagen muestra el "lane swap" característico (escenas reales con bytes mezclados; test patterns uniformes no lo revelan) que V150 había resuelto en full mode. **Origen identificado, fix NO aplicado** — ver §"V159 lane-swap regression" abajo.
+**V159 lane-swap regression — RESUELTO** flipando `0x0310` de `0x00` (override del padre) → `0x01` (libcamera default). En validación HW. Detalle del análisis y mecanismo en §"V159 lane-swap regression".
 
 ---
 
@@ -114,16 +114,16 @@ camara_direct V158 full-mode usaba `0x01` (libcamera default) y funcionaba limpi
 
 `DAT1` perdió bit 26 (lane HS-active status). Mecanismo plausible: con `0x0310=0x00` el clock lane oscila entre HS y LP entre bursts; la auto-termination del BCM2837 en lane 1 (configurada como clock-pattern HS termination = `0x06000005`) no consigue re-engancharse limpiamente en cada burst, perdiendo sincronía. Lane 0 (data-pattern termination = `0xC0000005`) sí re-engancha. Resultado: lane 1 entrega bytes desincronizados respecto a lane 0 → "lane swap" visible.
 
-**Fix propuesto (no aplicado):**
+**Fix aplicado:**
 
 ```c
 // src/imx708_regs.h, dentro de k_imx708_binned[]:
-{ 0x0310, 0x01 },   // libcamera default; era 0x00 (V104 padre)
+{ 0x0310, 0x01 },   // libcamera default; era 0x00 (override V104 del padre)
 ```
 
-Misma corrección que V158 ya tenía en su `k_imx708_full[]`. La regresión es un copy-paste del padre sin filtrar overrides.
+Misma corrección que V158 ya tenía implícita en su `k_imx708_full[]` por descartar el override del padre. **Pendiente de validar en HW** (esperando uart.log + observación visual del próximo run).
 
-**Por qué no aplicado todavía:** queremos confirmar primero que el cambio resuelve el lane swap sin introducir otra regresión (e.g. timing margin del CSI-2). El override del padre puede haber tenido razones legítimas en SU plataforma; vale la pena verificar contra el HW antes de marcarlo como "muerto".
+**Lección portable:** los overrides marcados "VNNN HW-verified" del proyecto padre son contexto del padre, no validaciones libcamera. Cuando portemos cualquier tabla del padre a camara_direct, diff contra `linux_extract/registers/imx708_writes_*_unique_final.txt` y mantener el valor de libcamera salvo que un test HW de camara_direct demuestre lo contrario.
 
 ---
 
