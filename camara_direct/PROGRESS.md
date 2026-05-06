@@ -1,0 +1,366 @@
+# camara_direct — Progreso y Retos
+
+**Plataforma:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53). Bare-metal AArch64, sin sistema operativo.
+**Cámara:** Pi Camera v3 (Sony IMX708), CSI-2 a 2 lanes.
+**Estado actual:** V156 — captura full mode 4608×2592 → HDMI 1920×1080 a aspecto nativo 16:9, FOV completo del sensor, multi-core debayer (4×Cortex-A53), FS-a-FS frame-end. **Cobertura DMA al 100%** (`rows_max=0xA20=2592`) confirmada con FS-a-FS — la "limitación del 67%" que vimos en V148–V153 era sólo el polling IBWP-stable parando DMA en falsos positivos de VBLANK.
+
+**Throughput sostenido medido:** `wait=93/117 snap=18 debayer=24 total=135 ms → 7.40 fps`. El cuello es el **período físico del sensor (117 ms a la configuración actual) más los 18 ms de memcpy DMA→snap**: `1 / (117+18) = 7.4 fps`. Ver §"Período del sensor — finding V157" para los detalles.
+
+---
+
+## Logros
+
+### Captura CSI-2 byte-exact vs Linux libcamera (V108 → V154)
+
+- **V108:** root cause de 21 versiones previas — `SET_DOMAIN_STATE(domain=14)` enciende el decoder Unicam1. `SET_POWER_STATE(0x0d)` no lo hace.
+- **V147:** transporte Unicam/CSI-2/DMA verificado **byte-perfect** con un test pattern sólido de 4 valores distintos por canal — todos los 704 rows coincidían exactamente con los bytes esperados.
+- **V150 IMX708 init:** la tabla `k_imx708_full[]` (266 escrituras) coincide **265/265** con la traza I2C real de libcamera a 4608×2592 (`tools/diff_imx708_full.py`):
+
+  ```
+  == AE/AGC final values ==
+    CIT=0x09E7  AGAIN=0x03C0(16x)  DGAIN=0x0100  FLL=0x0A5A  ORIENT=0x03  → ok
+  ```
+
+- **V150 Unicam runtime:** todos los registros D-PHY, ICTL, CMP0, IDI0 coinciden con el dump runtime de Linux. Sólo difieren `IBSA0/IBEA0/IBLS` (geometría de buffer dependiente del modo).
+
+### V154: detección de fin-de-frame Linux-aligned (FS-a-FS)
+
+V148–V153 usaban un heurístico "5000 lecturas estables de IBWP = VBLANK" que disparaba en falsos positivos cuando el sensor enviaba paquetes cortos PDAF/embedded en otra VC (IDI0 los filtra → IBWP no se mueve durante ms). Resultado: DMA paraba mid-frame en líneas variables (1750/1738/1742) → filas torcidas que el debayer renderizaba como **líneas magenta horizontales que se movían entre frames**.
+
+V154 porta el protocolo FS-a-FS del proyecto padre (`camera_unicam.cpp:1409`), idéntico al que usa libcamera + `bcm2835-unicam.c`:
+
+```
+poll(ISTA) — esperar primer FSI (FS1) → trigger LIP (latch IBSA, reset WP)
+            — entre FS1 y FS2: trackear max(IBWP) cada 256 iteraciones
+            — esperar segundo FSI (FS2) → CPE=0 (congelar buffer)
+```
+
+El borde es la señal de inicio de frame del propio sensor — no hay falsos positivos posibles. **Imagen estable, sin líneas magenta.**
+
+### Zero-fill del tail no cubierto por DMA
+
+El BCM2837 Unicam tiene un límite pre-existente de cobertura ~81% (V146/V147) — algunos paquetes cortos PDAF/embedded cuentan contra el contador de líneas sin escribir al buffer. Sin tratamiento, el tail muestra datos del frame N-1 (verde fosforescente / púrpura). Solución: tras el snapshot, zero-rellenar `snap[bytes_valid..FRAME_BYTES]` → la franja inferior renderiza limpia en negro.
+
+### Pipeline de imagen calidad libcamera
+
+Constantes portadas verbatim del archivo de tuning libcamera (`linux_extract/tuning/imx708.json`) y del DNG real:
+
+- **BlackLevel** = 64 (10-bit), pedestal = 16 en MSB8.
+- **AsShotNeutral** = [0.4784, 1.0, 0.5629] → WB Q8 = (535, 256, 455).
+- **CCM 4640K** (daylight): 9 coeficientes Q10 signed.
+- **Gamma sRGB** vía LUT de 256 entradas (aproxima `gamma_curve` de libcamera).
+
+### Bug del "line swap" resuelto
+
+V148 mostraba bytes mezclados en escenas reales pero no en test patterns. Causa root encontrada al diff-ear contra el dump Unicam runtime de libcamera: `DAT1 = 0x06000005` (terminación HS clock-pattern) — Linux usa este valor para la lane 1, no `0xC0000005` como la lane 0. Aplicado en V150 → escenas reales limpias.
+
+### Bug del "verde fosforescente" en blancos resuelto
+
+NEON `vmul_n_u16` truncaba al multiplicar `R(255) × WB_R(535) = 127865`, que excede u16 max 65535. Wrap → R/B basura cerca de 0, G correcto a 255 → CCM produce R=0,G=255,B=0. Fix: ensanchar a u32 con `vmovl_u16 + vmulq_n_u32` antes del shift.
+
+### Performance
+
+| Versión | wait | snap | debayer | total | fps |
+|---------|-----:|-----:|--------:|------:|----:|
+| V150 escalar single-core | 25 ms | 18 ms | 218 ms | ~275 ms | 3.6 |
+| + lookup tables (`g_row_off`, `g_byte_off`) | 25 | 18 | ~190 | ~245 | 4.1 |
+| + NEON 4-wide CCM (`smlal v.4s`) | 22 | 18 | 95 | 135 | **7.40** |
+| + multi-core debayer (4×Cortex-A53, 270 rows/core) | 18 | 23 | 24 | 65 | 15.15 (medido pre-FS-a-FS) |
+| V154 FS-a-FS (espera real frame boundary) | 93 | 18 | 24 | 135 | **7.40** (sostenido) |
+| V156 = V154 sin V155 crop, baseline actual | 93 | 18 | 24 | 135 | **7.40** |
+| V157 (revertido) double-buffer software | 117 | 18 | (en paralelo) | 135 | 7.40 |
+
+NEON aplicado: gather scalar (no hay gather en ARMv8-A), pero pedestal subtract + WB + CCM (3×SMLAL chains) + clamp en vectores 4-wide. Gamma escalar (LUT 256 no cabe en `tbl`).
+
+Las mediciones "15 fps" tempranas (V152) fueron tomadas con polling IBWP-stable que paraba DMA antes del frame end, por lo que el wait era artificialmente bajo. El throughput sostenido con FS-a-FS y captura completa es 7.40 fps; ver §"Período del sensor — finding V157".
+
+### Período del sensor — finding V157
+
+V157 intentó solapar `debayer` con `wait` usando dos snap buffers + dispatch async (cores 1-3) + core 0 dedicado a wait+snap. Resultado medido en HW (2026-05-06):
+
+```
+TIMING wait=93  snap=18 sync=0 disp=0 total=112 ms  fps=8.92    ← iter 1 (con prime)
+TIMING wait=117 snap=18 sync=0 disp=0 total=135 ms  fps=7.40    ← iter 2+
+TIMING wait=116 snap=18 sync=0 disp=0 total=135 ms  fps=7.40
+```
+
+`sync=0` confirma que el debayer (32 ms en 3 cores) sí terminaba antes que el wait. **Pero el wait creció exactamente 24 ms = el debayer "absorbido" en V156**. Conclusión: el `wait=93 ms` que medíamos en V156 era engañoso — el período físico real del sensor a la configuración actual (`FLL=0x0A5A`, `LLP=0x3D20`, 2-lane, link clock IMX708 full-mode) es **117 ms**. V156 lo escondía porque su debayer corría DESPUÉS del rearm y antes del wait, consumiendo 24 ms del frame period antes de que la función de wait fuera siquiera llamada.
+
+**Ley de conservación:** mientras tengamos
+- 1 frame del sensor por ciclo → 117 ms inevitables, físicos,
+- 1 memcpy raw_buffer → snap → 18 ms con DMA pausada,
+
+el techo es `1 / (117+18) = 7.40 fps`, sin importar cómo se reordenen las fases en software. V157 fue revertido y V156 queda como baseline limpia para construir cualquier mejora real.
+
+**Por dónde sí se puede subir** (listado completo en §"Próximos Retos"):
+
+| Camino | Ganancia | Riesgo |
+|--------|---------:|--------|
+| (a) IBSA1/IBEA1 hardware double-buffer (elimina los 18 ms de snap) | 7.40 → 8.55 fps (+15%) | medio: latch de IBSA1 al FE no documentado en el chip |
+| (b) Reducir FLL/LLP (acortar el frame period del sensor) | algunos ms si hay margen | alto: puede romper la temporización D-PHY o timing-critical de libcamera tuning |
+| (c) Modo binned 1536×864 (lo que hace el padre) | ~52 fps native, snap ~2 ms | alto: nueva tabla `k_imx708_full[]`, nuevo ratio en debayer (upscale en lugar de downscale), revalidar línea/lane timing |
+
+### Multi-core wake + per-core MMU (foundation)
+
+`mmu.cpp` dividido en `mmu_build_table()` (privado, solo core 0) y `mmu_enable_this_core()` (público, per-core: TLBI, MAIR, TCR, TTBR0, SCTLR — todos banked). `start.S` ahora maneja cores 1-3:
+
+- `secondary_spin`: poll en `0xD8 + core_id*8` (spin-table del armstub Pi 3+, también funciona en QEMU).
+- `secondary_entry`: drop EL2→EL1 + `CPACR_EL1.FPEN=0b11` + per-core stack 16 KB + llamada a C `secondary_main(core_id)`.
+- 48 KB reservados en BSS para los stacks secundarios.
+
+**Gotcha clave:** core 0 escribe la entry-point al spin-table con MMU on (mapping cacheable), así que el store se queda en L1 y nunca llega a RAM. Cores 1-3 con D-cache off lo leen como 0 → spin para siempre. Fix: `dc civac` explícito en cada slot tras escribir, antes del `dsb sy; sev`. Sin esto el wake-up nunca dispara.
+
+### Reset hard del IMX708 ante estados stuck
+
+`camera_gpio_override_high()` ahora pulsa GPIOs 40/41/42/44 a LOW durante ~50 ms (descarga regulador + latch del sensor en reset) y luego HIGH durante ~10 ms (boot interno). Esto recupera el sensor cuando un boot anterior lo dejó mid-stream — el síntoma era NACK persistente en el probe I2C aunque el cable estuviera bien reasentado.
+
+### Infrastructure
+
+- **Diff estático IMX708** (`tools/diff_imx708_full.py`): bare-metal vs traza Linux, registro a registro.
+- **Diff runtime** (`tools/diff_runtime_full.py`): UART log vs dump Linux runtime, marca diferencias esperadas vs reales.
+- **Makefile con tracking de headers** (`-MMD -MP`): un cambio en `imx708_regs.h` ahora rebuilda `imx708.o` automáticamente. (Sin esto, los valores AE corregidos no llegaron al binario en V150 inicial.)
+- **TIMING per-frame** vía `CNTPCT_EL0`: `wait`, `snap`, `debayer` por separado en cada UART line.
+
+---
+
+## Próximos Retos
+
+### 0. ✅ Recuperar la franja negra inferior — HECHO (V154/V156)
+
+V155 intentó esto vía crop+stretch asumiendo que la cobertura DMA estaba limitada al 67% (basado en logs de V153). Resultó que **V154 FS-a-FS ya había desbloqueado cobertura 100%** (`rows_max=0xA20=2592`) — la "limitación" era el polling IBWP-stable parando DMA mid-frame, no un límite de hardware. V156 revierte el crop de V155 → debayer con ratio nativo 6/5 que cubre los 2592 rows reales del sensor a 1080 HDMI rows con aspecto 16:9 correcto.
+
+### 1. ✅ Multi-core debayer task pool — HECHO (V152, ~15 fps)
+
+`debayer_to_fb` tomaba 95 ms en un Cortex-A53. Repartido en 4 bandas (270 rows/core): ~24 ms efectivo. `mc_dispatch_debayer` publica `g_task_epoch++` con RELEASE; cores 1–3 esperan en WFE, leen con ACQUIRE, ejecutan su banda, incrementan `g_task_done` con RELEASE, sev. Core 0 hace su banda en paralelo y polea `g_task_done == 3`. Memoria del `snap` en Normal Inner Shareable cacheable → SCU snooping garantiza coherencia.
+
+### 2. ✅ FS-a-FS frame-end — HECHO (V154)
+
+Reemplazo del polling IBWP-stable por protocolo de interrupciones del sensor (FS1 → LIP → FS2 → CPE=0). Eliminó las líneas magenta y la variabilidad de `rows_max`.
+
+### 3. Hardware double-buffer DMA (IBSA1/IBEA1) — siguiente paso recomendado
+
+**Ganancia esperada: 7.40 → ~8.55 fps (+15%).** Es la mejora más limpia de las que quedan.
+
+El snapshot actual copia 14.93 MB raw_buffer → snap (~18 ms con DMA pausada). Pi OS / libcamera evitan ese copy programando dos buffers en hardware: la DMA alterna entre `IBSA0/IBEA0` e `IBSA1/IBEA1` automáticamente en el frame boundary. Lectura del buffer "inactivo" en paralelo con la escritura del "activo" → snap = 0 ms. Ciclo nuevo:
+
+```
+wait_FS-to-FS (117 ms)   ← período del sensor, inalterable
+debayer del buffer pasivo (24 ms, 4 cores, oculto en el wait)
+swap activo↔pasivo (atómico vía LIP / register write)
+```
+
+Tareas concretas:
+1. Reservar `0x03000000..0x03E3D000` como buffer B (sigue dentro de Normal Inner Shareable cacheable).
+2. En `unicam.cpp`: programar `IBSA1`/`IBEA1` (offsets `0x130`/`0x134` según el dump runtime de libcamera, **verificar con `tools/diff_runtime_full.py`**).
+3. Cambiar `unicam_wait_frame_end_stop` para no parar `CPE` al FE: dejar la DMA correr y reportar qué buffer es el "recién terminado" leyendo el bit de "buffer-in-use" del Unicam (campo a identificar — probablemente en `STA` o `IBWP`).
+4. En `main.cpp`: leer del buffer pasivo (sin snap), debayer directo, sync vía FE bit.
+
+Riesgos: el latch de IBSA1 al FE no está documentado en el TRM del BCM2837; hay que inferirlo del runtime dump de libcamera. Si el swap no es atómico, habrá tearing en líneas exactas del frame.
+
+### 4. Modo binned 1536×864 — saltar a 30+ fps
+
+**Ganancia esperada: 7.40 → ~25-30 fps** (limitado por debayer + presentación HDMI, no por sensor).
+
+Cambio arquitectónico mayor pero válido si necesitamos fps alto (YOLO realtime, etc.). Requiere:
+- Nueva tabla `k_imx708_full[]` con regs binned (similar a la que usa el padre).
+- Buffer raw 1.66 MB en lugar de 14.24 MB (snap → ~2 ms).
+- Debayer con upscale 1536×864 → 1920×1080 (en lugar del downscale actual 4608×2592 → 1920×1080), o cambiar la salida HDMI a la resolución nativa del sensor.
+- Revalidar `DAT0/DAT1` y `CLT/DLT` para el link clock distinto del modo binned.
+
+### 5. ✅ Cobertura DMA completa — HECHO (V154)
+
+V146/V147 atribuían el "maxWP=704/864 (~81%)" a un límite pre-existente del Unicam BCM2837. V148–V153 vieron 1750/2592 (~67%) en full mode. V154 FS-a-FS confirma que el límite era artefacto del polling IBWP-stable: con FS-a-FS la cobertura es 0xA20/0xA20 = 2592/2592 = **100%**. La memoria del proyecto sobre ese límite estaba equivocada.
+
+### 6. Interrupciones reales (eliminar el polling de FSI)
+
+`unicam_wait_frame_end_stop` poolea ISTA a ~150 ns por lectura durante todo el frame period (~117 ms). Instalar un vector AArch64 + handler de FSI en el GIC de BCM2837 dejaría el core 0 libre durante ese tiempo. **No es ganancia de fps directa** (el wait sigue siendo 117 ms), pero libera el core 0 para preprocessing YOLO o cualquier otra carga concurrente.
+
+### 7. (Opcional) YOLOv5n integration
+
+El proyecto padre ya tiene la pipeline YOLOv5n 320×320 a 511 ms. Integrar en este código bare-metal requeriría:
+- Crop 320×320 de la zona central del raw → tensor RGB normalizado.
+- Conv2d NEON + multi-core (ya existen en el padre).
+- Bounding boxes overlay sobre el FB.
+
+Latencia objetivo: ~600 ms = ~1.7 fps de detección, sobre los 7.4–8.5 fps de captura.
+
+---
+
+## Configuración para reproducir
+
+### Hardware
+
+- **SBC:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53 @ 1 GHz nominal, 512 MB LPDDR2).
+- **Cámara:** Pi Camera Module v3 (Sony IMX708) en CSI-1, 2 lanes MIPI.
+- **Display:** monitor HDMI vía adaptador **mini-HDMI**.
+  - ⚠️ El adaptador/cable mini-HDMI fue causa real de bloqueos en V117–V122 — comprueba con un cable conocido bueno antes de sospechar del software.
+- **UART consola:** USB-TTL 3.3 V a GPIO 14 (TXD) / GPIO 15 (RXD) / GND. PL011 a 115200 8N1.
+- **Power:** alimentación estable; el `over_voltage=-2` en `config.txt` reduce ruido y estabiliza la D-PHY de la cámara.
+
+### Toolchain
+
+```dockerfile
+# Dockerfile (etiqueta: rpi-forge)
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y \
+    make gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+WORKDIR /app
+```
+
+```bash
+docker build -t rpi-forge .
+docker run --rm -v $(pwd):/app rpi-forge make
+```
+
+### Layout de la SD (FAT32, partición boot)
+
+| Archivo | Origen | Necesario para |
+|---------|--------|----------------|
+| `bootcode.bin`, `start4.elf`, `start_x.elf`, `fixup_x.dat` | Pi firmware oficial | Boot del VPU + carga del kernel |
+| `bcm2710-rpi-zero-2-w.dtb` | Pi firmware oficial | Device tree |
+| `overlays/imx708.dtbo` | Pi firmware oficial | Activación D-PHY + clock + GPIOs cámara |
+| `config.txt` | Este repo | Ver abajo |
+| `kernel8.img` | Generado por `make` | El binario bare-metal AArch64 |
+
+### `config.txt` mínimo
+
+```ini
+arm_64bit=1
+kernel=kernel8.img
+enable_uart=1
+gpu_mem=128
+
+# Reloj conservador para estabilizar D-PHY
+arm_freq=600
+core_freq=250
+sdram_freq=400
+over_voltage=-2
+
+# HDMI 1024×768 (la geometría real la elige el FB via mailbox)
+hdmi_force_hotplug=1
+hdmi_group=2
+hdmi_mode=4
+hdmi_drive=2
+disable_overscan=1
+
+# CRÍTICO PARA CÁMARA — sin esto la D-PHY queda sin calibrar y STA=0:
+start_x=1
+dtoverlay=imx708
+```
+
+### Secuencia de power-up de la cámara (gotchas reales)
+
+1. **`SET_DOMAIN_STATE(domain=14, state=1)` vía mailbox** — enciende el decoder Unicam1 CSI-2. Sin esto, `STA=0` para siempre. **`SET_POWER_STATE(0x0d)` NO funciona** (estado queda 0x02). Lección de V108.
+2. **CM_CAM1 a 100 MHz** desde PLLD (DIVI=5). Sin reloj digital, el decoder no procesa packets. Hacer esto en `unicam_init` antes de tocar ningún registro Unicam.
+3. **CM_CAM0 a 24 MHz** — provee EXTCLK al sensor. Lo configura el firmware del VPU al cargar `dtoverlay=imx708`.
+4. **Probe IMX708 en BSC1 (I2C1) a dirección `0x1A`**. Lectura de `0x0016/0x0017` debe dar `0x0708`. Si NACK persistente: 99% es flex-cable mal asentado, no software. Bus reset y soft-reset (`0x0103=0x01`) son fallbacks.
+5. **Escribir tabla `k_imx708_full[]` (266 regs)**. Sensor en standby (`0x0100=0x00`).
+6. **`imx708_stream_on()` (`0x0100=0x01`)**.
+7. **`unicam_capture_start()`** — re-asierta CPE + LIP para latch limpio del primer frame.
+
+### Registros Unicam runtime imprescindibles (verificados vs Linux)
+
+| Reg | Valor | Por qué |
+|-----|------:|---------|
+| `CTRL` | `0x00080F03` | MEM=1, CPE=1, PFT=0xF, OET=128, CPM=0=CSI-2 |
+| `ANA` | `0x770` | D-PHY power-up (escribir `0x774` 1 ms antes para AR hold) |
+| `CMP0` | `0x80000301` | Frame-boundary protocol; **NO** desactivar (V134 lo hizo y dañó la captura) |
+| `CLK` | `0x06000005` | Clock-pattern HS termination |
+| `DAT0` | `0xC0000005` | Data-pattern lane 0 |
+| **`DAT1`** | **`0x06000005`** | **Lane 1 usa termination CLOCK-pattern, no data-pattern**. Si pones `0xC0000005` aquí, escenas reales muestran "line swap"; test patterns uniformes no lo revelan. Bug encontrado vía diff contra runtime libcamera. |
+| `IDI0` | `0x0000002B` | RAW10, VC=0 |
+| `ICTL` | `0x00D80007` | FSIE+FEIE+IBOB + Pi OS upper DMA enables |
+
+### Valores AE/AGC convergidos (deben coincidir con Linux)
+
+| Reg | Valor | Significado |
+|-----|------:|-------------|
+| `0x0202/03` | `0x09E7` | CIT = 2535 líneas (`0x0929` da imagen 4× oscura) |
+| `0x0204/05` | `0x03C0` | AGAIN = 16× (`0x0300` da 4×) |
+| `0x020E/0F` | `0x0100` | DGAIN = 1.0× |
+| `0x0340/41` | `0x0A5A` | FLL = 2650 líneas (frame length lines) |
+| `0x0342/43` | `0x3D20` | LLP = 15648 pck/línea (line length pixels) |
+| `0x0101` | `0x03` | H+V flip → Bayer efectivo BGGR (sin esto sería RGGB y sale espejado) |
+
+Verificación: `python3 tools/diff_imx708_full.py` debe imprimir `265/265 common`.
+
+**Período del frame derivado de FLL × LLP:** `2650 × 15648 / pixel_clock ≈ 117 ms = 8.55 Hz teóricos`, confirmado empíricamente por V157 (medición HW). Es el techo absoluto de la cadencia de captura mientras se conserve esta configuración full-mode 4608×2592 @ 2-lane. Bajar `FLL` o `LLP` lo reduciría, pero hay que respetar `vblank ≥ 58` líneas y `hblank ≥ 11040 pck` que libcamera valida — bajar más rompe el timing D-PHY.
+
+### Habilitación FP/SIMD (requerido para NEON sin trap)
+
+En `src/start.S`, antes de bajar a EL1:
+
+```asm
+# Limpiar CPTR_EL2.TFP (bit 10) — sin esto FP/SIMD trap a EL2
+mrs     x0, cptr_el2
+bic     x0, x0, #(1 << 10)
+msr     cptr_el2, x0
+```
+
+Y en EL1 antes de `kernel_main`:
+
+```asm
+# CPACR_EL1.FPEN = 0b11 (no traps FP/SIMD a EL0/EL1)
+mov     x0, #(3 << 20)
+msr     cpacr_el1, x0
+isb
+```
+
+`Makefile`: usar `-mcpu=cortex-a53` (sin `+nosimd`) y `-MMD -MP` para tracking de headers (sin esto, cambios en `*.h` no rebuildan los `.o` correspondientes — pasó con `imx708_regs.h` y los valores AE quedaron fuera del binario).
+
+### Mapa de memoria
+
+```
+0x00000000 .. 0x00FFFFFF  Kernel + BSS + stack (≈ 11 KB)
+0x01000000 .. 0x01E3D000  RAW DMA target (14.93 MB raw_buffer)
+0x02000000 .. 0x02E3D000  CPU snapshot (14.93 MB snap)
+0x1C000000 .. 0x20000000  VPU heap (gpu_mem=128 → últimos 128 MB)
+0x1E402000 ..             Framebuffer (asignado por el VPU vía mailbox)
+0x3F000000 .. 0x40000000  MMIO peripherals (Device-nGnRnE en MMU)
+0xC0000000 | phys         Bus alias VideoCore para DMA writes
+```
+
+MMU identity-mapea 1 GB con bloques de 2 MB. El rango VPU está mapeado **Normal Non-cacheable** + Inner Shareable para que la VPU vea los pixels sin caché ARM por encima.
+
+### Tooling de diagnóstico
+
+```bash
+# Diff estático: tabla bare-metal vs traza I2C Linux full mode
+python3 tools/diff_imx708_full.py
+# (espera: "Last-value match: 265 / 265 common")
+
+# Diff runtime: uart.log bare-metal vs dump runtime libcamera
+python3 tools/diff_runtime_full.py uart.log linux_capture_linux/
+# (todos los registros deben coincidir excepto IBSA0/IBEA0/IBLS marcados EXPECTED)
+```
+
+UART log esperado tras boot (V156 baseline, captura 2026-05-06):
+
+```
+camara_direct V156: IMX708 4608x2592 -> HDMI 1920x1080 (16:9 native, full FOV)
+CORES alive=[1,1,1,1]
+Mailbox: domain 14 ON
+BSC1: init
+Unicam: V150 full-mode init (4608x2592)
+Unicam: CM_CAM1 = PLLD/5 (100MHz)
+Unicam: init OK. IBSA0=0xC1000000 IBEA0=0xC1E3D000 IBLS=0x00001680
+IMX708: Probe OK
+IMX708: stream ON
+Unicam: CPE + LIP re-armed after sensor stream_on
+FRAME rows_max=0x00000A20 / 0xA20      ← cobertura 100% (V154 FS-a-FS lo desbloqueó)
+UNICAM_BEGIN ... UNICAM_END             ← 19 regs Linux-comparable
+IMX708_BEGIN ... IMX708_END             ← 19 regs Linux-comparable
+TIMING wait=93 snap=18 debayer=24 total=135 ms  fps=7.40
+TIMING wait=93 snap=18 debayer=23 total=135 ms  fps=7.40
+TIMING wait=93 snap=18 debayer=24 total=136 ms  fps=7.35
+```
+
+`wait=93` es el período del sensor (117 ms) menos los 24 ms de debayer que corren entre rearm y wait — ver §"Período del sensor — finding V157" para por qué este número es engañoso.
+
+---
+
+## Referencias
+
+- **Linux baseline:** `linux_extract/` — DNG, JSON tuning, ftrace, registros I2C/Unicam runtime capturados de un Bookworm + IMX708 funcional.
+- **Diff report:** `linux_extract/DIFF_REPORT.md` — regs faltantes/divergentes vs libcamera.
+- **Memoria del proyecto:** `~/.claude/projects/-home-jolux-projects-Direct2Metal/memory/` — historial V108 → V157 con root causes (incluye `camara_direct_sensor_period.md` con la deducción del techo 7.4 fps).
