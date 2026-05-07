@@ -1,4 +1,20 @@
-/* camara_direct V159 — binned 1536×864 mode for higher fps.
+/* camara_direct V160 — all-4-cores debayer with band-while-wait on core 0.
+ *
+ * V159 binned mode reached ~40 fps with 3-core debayer (cores 1-3, 360
+ * rows each) and core 0 dedicated to FSI polling. V160 adds core 0 to
+ * the debayer pool: it now runs band 0 (rows 0..269) interleaved with
+ * its FSI polls inside wait_fs_and_lip_with_band(). All 4 cores → 270
+ * rows each → ~17 ms debayer, hidden inside the 15-20 ms FSI wait
+ * window. Target: ~50 fps.
+ *
+ * The interleaving is row-grained: between every two ISTA polls,
+ * core 0 processes one full FB row (~63 µs) of band 0. Polling
+ * latency for FSI detection stays well under the 15 ms FS-to-FS
+ * interval, so frame timing is unaffected.
+ *
+ * — V159 below (preserved for context) —
+ *
+ * V159 — binned 1536×864 mode for higher fps.
  *
  * Path chosen vs V158 (4608×2592 full mode, 7.4 fps):
  *   V158 hit the conservation law `cycle = frame_period + memory_contention`
@@ -102,20 +118,29 @@ extern uint32_t fb_pitch;
 #define RAW_STRIDE 1920u             /* 1536 px * 10 bit / 8 */
 #define FRAME_BYTES (RAW_STRIDE * SENSOR_H)   /* 1,658,880 = 0x195000 */
 
-/* ── Multi-core task pool (V158: cores 1-3 only) ───────────────────────────
- * Core 0 owns the Unicam state machine (stage IBSA0, wait FS+LIP, swap,
- * cache invalidate). Cores 1, 2, 3 run debayer bands. Per-frame split:
- *   core 0:    stage_buf + wait_FS_LIP + invalidate + dispatch  (~117 ms)
- *   cores 1-3: debayer 360 rows each (BAND_COUNT=3, FB_H/3 = exact 360)
+/* ── Multi-core task pool (V160: all 4 cores debayer) ──────────────────────
+ * Cores 1, 2, 3 run debayer bands when woken from WFE. Core 0 *also* runs
+ * a band — but inline, interleaved with its FSI polling inside the new
+ * wait_fs_and_lip_with_band(). Per-frame split with 4 bands of 270 rows
+ * (FB_H / 4 exact):
+ *
+ *   band 0 (rows 0..269)    → core 0 (during its wait_fs polling loop)
+ *   band 1 (rows 270..539)  → core 1 (WFE-driven)
+ *   band 2 (rows 540..809)  → core 2 (WFE-driven)
+ *   band 3 (rows 810..1079) → core 3 (WFE-driven)
  *
  * Sequencing per frame:
- *   1. core 0 calls mc_dispatch_debayer_async, which sets g_task_*
- *      and bumps g_task_epoch with RELEASE + sev.
- *   2. core 0 immediately moves on to wait_FS_LIP for the next frame.
- *   3. cores 1-3 wake from WFE, ACQUIRE the new epoch, run their band,
- *      RELEASE-increment g_task_done.
- *   4. before the *next* dispatch, core 0 calls mc_wait_debayer_done so
- *      we don't tear g_task_* on top of an in-flight task.
+ *   1. core 0's mc_dispatch_debayer_async sets g_task_* and bumps
+ *      g_task_epoch with RELEASE + sev. Cores 1-3 wake.
+ *   2. cores 1-3 run their bands and RELEASE-increment g_task_done.
+ *   3. core 0 enters wait_fs_and_lip_with_band, which polls FSI and runs
+ *      its band's rows between polls. The band finishes mid-wait or just
+ *      after FS2, depending on which is faster.
+ *   4. before the next dispatch, core 0 calls mc_wait_debayer_done to
+ *      ensure cores 1-3 finished (they only count up to BAND_COUNT-1=3
+ *      since core 0 doesn't increment g_task_done).
+ *
+ * Per-iter cycle: max(wait_fs(~15-20 ms), debayer_per_core(~17 ms)).
  *
  * Memory model: both raw buffers (raw_a, raw_b) are in Inner Shareable
  * Normal cacheable memory. SCU snooping makes any cacheable accesses
@@ -132,15 +157,14 @@ static const uint8_t* g_task_raw = nullptr;
 static volatile uint32_t* g_task_fb = nullptr;
 static uint32_t g_task_fb_stride = 0;
 
-#define BAND_COUNT 3u                 /* secondary cores 1, 2, 3 */
-#define BAND_H (FB_H / BAND_COUNT)    /* 360 rows per core (1080/3 exact) */
+#define BAND_COUNT 4u                 /* 4 cores total (0 + 1, 2, 3) */
+#define BAND_H (FB_H / BAND_COUNT)    /* 270 rows per core (1080/4 exact) */
 
-static inline void band_for_secondary(uint32_t core_id,
-                                      uint32_t* vy_start, uint32_t* vy_end) {
-    /* core_id ∈ {1,2,3}; band index = core_id - 1. */
-    uint32_t band_idx = core_id - 1u;
-    *vy_start = band_idx * BAND_H;
-    *vy_end   = (band_idx == BAND_COUNT - 1u) ? FB_H : ((band_idx + 1u) * BAND_H);
+static inline void band_for_core(uint32_t core_id,
+                                 uint32_t* vy_start, uint32_t* vy_end) {
+    /* core_id ∈ {0,1,2,3}; each gets BAND_H consecutive output rows. */
+    *vy_start = core_id * BAND_H;
+    *vy_end   = (core_id == BAND_COUNT - 1u) ? FB_H : ((core_id + 1u) * BAND_H);
 }
 
 extern "C" void secondary_main(uint32_t core_id) {
@@ -153,10 +177,12 @@ extern "C" void secondary_main(uint32_t core_id) {
     __asm__ volatile("dsb sy" ::: "memory");
     __asm__ volatile("sev");
 
-    /* Task work loop — cores 1, 2, 3 cover 3 bands of 360 rows each. */
+    /* Task work loop — cores 1, 2, 3 cover bands 1, 2, 3 (270 rows each).
+     * Core 0's band (band 0) is run inline by main inside
+     * wait_fs_and_lip_with_band. */
     uint32_t local_epoch = 0;
     uint32_t vy_start, vy_end;
-    band_for_secondary(core_id, &vy_start, &vy_end);
+    band_for_core(core_id, &vy_start, &vy_end);
     while (1) {
         /* Wait for new task. WFE clears the local event after consuming it,
          * so we re-check the epoch each wakeup; spurious SEVs just iterate. */
@@ -197,11 +223,17 @@ static void mc_dispatch_debayer_async(const uint8_t* raw, volatile uint32_t* fb,
 }
 
 static void mc_wait_debayer_done() {
-    /* Polling (not WFE) so we don't deadlock if a secondary hangs.
-     * Healthy 3-core debayer is ~32 ms; timeout is generous (~1 s). */
+    /* Wait for cores 1, 2, 3 (the 3 secondaries) to each increment
+     * g_task_done once. Core 0 doesn't increment because its band is
+     * run inline by main and doesn't go through the WFE path. So the
+     * counter target is BAND_COUNT - 1 = 3, not BAND_COUNT.
+     *
+     * Polling (not WFE) so we don't deadlock if a secondary hangs.
+     * Healthy 4-core debayer is ~17 ms; timeout is generous (~1 s). */
+    const uint32_t kSecondariesTarget = BAND_COUNT - 1u;
     const uint32_t timeout_iters = 200000000u;
     uint32_t spins = 0;
-    while (__atomic_load_n(&g_task_done, __ATOMIC_ACQUIRE) < BAND_COUNT) {
+    while (__atomic_load_n(&g_task_done, __ATOMIC_ACQUIRE) < kSecondariesTarget) {
         if (++spins > timeout_iters) {
             uart_puts("WARN: debayer sync timeout, done=");
             uart_dec(__atomic_load_n(&g_task_done, __ATOMIC_RELAXED));
@@ -324,21 +356,24 @@ static void debayer_init_tables() {
  *
  * Bit-exact equivalent of the scalar version: vqsub_u16 == saturating sub,
  * vshrq_n_s32 is arithmetic shift right (matching `int32 >> 10`), vmlal_n_s16
- * accumulates into int32 with no intermediate truncation. */
-static void debayer_band(uint32_t vy_start, uint32_t vy_end,
-                         const uint8_t* raw, volatile uint32_t* fb,
-                         uint32_t fb_stride_px) {
+ * accumulates into int32 with no intermediate truncation.
+ *
+ * V160: extracted as a per-row function so wait_fs_and_lip_with_band can
+ * call it once per loop iteration and interleave row work with FSI polling
+ * on core 0. */
+static void debayer_one_row(uint32_t vy,
+                            const uint8_t* raw, volatile uint32_t* fb,
+                            uint32_t fb_stride_px) {
     const uint16x4_t v_ped   = vdup_n_u16((uint8_t)(BLACK_LVL >> 2));
     const int32x4_t  v_zero  = vdupq_n_s32(0);
     const int32x4_t  v_max   = vdupq_n_s32(255);
     const int32x4_t  v_round = vdupq_n_s32(512);
 
-    for (uint32_t vy = vy_start; vy < vy_end; vy++) {
-        const uint8_t* row_e = raw + g_row_off[vy];
-        const uint8_t* row_o = row_e + RAW_STRIDE;
-        volatile uint32_t* fb_row = fb + vy * fb_stride_px;
+    const uint8_t* row_e = raw + g_row_off[vy];
+    const uint8_t* row_o = row_e + RAW_STRIDE;
+    volatile uint32_t* fb_row = fb + vy * fb_stride_px;
 
-        for (uint32_t vx = 0; vx < FB_W; vx += 4u) {
+    for (uint32_t vx = 0; vx < FB_W; vx += 4u) {
             uint32_t o0 = g_byte_off[vx + 0];
             uint32_t o1 = g_byte_off[vx + 1];
             uint32_t o2 = g_byte_off[vx + 2];
@@ -402,8 +437,66 @@ static void debayer_band(uint32_t vy_start, uint32_t vy_end,
             fb_row[vx + 1] = 0xFF000000u | (k_gamma_srgb[r1i] << 16) | (k_gamma_srgb[g1i] << 8) | k_gamma_srgb[b1i];
             fb_row[vx + 2] = 0xFF000000u | (k_gamma_srgb[r2i] << 16) | (k_gamma_srgb[g2i] << 8) | k_gamma_srgb[b2i];
             fb_row[vx + 3] = 0xFF000000u | (k_gamma_srgb[r3i] << 16) | (k_gamma_srgb[g3i] << 8) | k_gamma_srgb[b3i];
+    }
+}
+
+/* Wrapper used by secondary cores (cores 1, 2, 3) to process a band of
+ * consecutive output rows. Core 0 doesn't go through this — it interleaves
+ * row work with FSI polling inside wait_fs_and_lip_with_band. */
+static void debayer_band(uint32_t vy_start, uint32_t vy_end,
+                         const uint8_t* raw, volatile uint32_t* fb,
+                         uint32_t fb_stride_px) {
+    for (uint32_t vy = vy_start; vy < vy_end; vy++) {
+        debayer_one_row(vy, raw, fb, fb_stride_px);
+    }
+}
+
+/* Core 0's wait + band-work-during-wait loop. Implements the V154 2-FSI
+ * protocol via the unicam.h primitives, but interleaves debayer rows
+ * between FSI polls so core 0 contributes its band of work concurrent
+ * with the wait. Returns the IBWP value sampled BEFORE the LIP at FS1
+ * (== bytes of the just-completed frame in the buffer that was active
+ * before this LIP). If FS2 fires before band finishes, the remaining
+ * rows are drained synchronously before returning. */
+static uint32_t wait_fs_and_lip_with_band(
+        uint32_t band_start, uint32_t band_end,
+        const uint8_t* raw, volatile uint32_t* fb, uint32_t fb_stride_px) {
+    unicam_arm_for_wait();
+
+    int      fs_count    = 0;
+    uint32_t ibwp_pre_lip = 0u;
+    uint32_t cur_row      = band_start;
+    const uint32_t kMaxIters = 20000000u;
+
+    for (uint32_t i = 0; i < kMaxIters; i++) {
+        if (unicam_consume_fsi()) {
+            fs_count++;
+            if (fs_count == 1) {
+                ibwp_pre_lip = unicam_get_ibwp();
+                unicam_lip_strobe();
+            } else {
+                /* FS2: drain remaining rows synchronously before returning so
+                 * the FB scanout sees a complete frame on this iteration. */
+                while (cur_row < band_end) {
+                    debayer_one_row(cur_row, raw, fb, fb_stride_px);
+                    cur_row++;
+                }
+                return ibwp_pre_lip;
+            }
+        }
+        if (cur_row < band_end) {
+            debayer_one_row(cur_row, raw, fb, fb_stride_px);
+            cur_row++;
         }
     }
+
+    /* Timeout fallback — drain band to keep FB consistent. Caller will
+     * see an unexpected return value and probably stutter, but won't tear. */
+    while (cur_row < band_end) {
+        debayer_one_row(cur_row, raw, fb, fb_stride_px);
+        cur_row++;
+    }
+    return 0u;
 }
 
 /* ── Cycle counter (CNTPCT_EL0) for per-phase wall-clock timing. ────────── */
@@ -421,7 +514,7 @@ static inline uint32_t cnt_to_ms(uint64_t delta) {
 
 extern "C" void kernel_main() {
     uart_init();
-    uart_puts("camara_direct V159: IMX708 1536x864 binned -> HDMI 1920x1080 (continuous DMA)\n");
+    uart_puts("camara_direct V160: IMX708 1536x864 binned -> HDMI 1920x1080 (4-core debayer, core 0 band-while-wait)\n");
 
     {
         uint64_t freq;
@@ -543,34 +636,31 @@ extern "C" void kernel_main() {
         uart_puts("IMX708_END\n");
     }
 
-    /* Steady-state loop. Two-buffer rotation with continuous DMA, two
-     * FSIs per LIP cycle (one full sensor frame per buffer):
+    /* Steady-state loop. V160 — all 4 cores debayer:
      *
      *   active_buf  = the buffer DMA is currently writing into.
      *   prev_buf    = the buffer that holds the just-completed frame.
+     *   g_task_raw  = the buffer cores 1-3 are debayering (set by the
+     *                 dispatch at the END of the previous iteration; its
+     *                 value at iter K's start equals iter K-1's prev_buf).
      *
      * Each iteration:
      *   (1) pre-stage IBSA0 = OTHER buffer; takes effect at next LIP.
-     *   (2) wait for two FSIs (= one full sensor period). The FIRST FSI
-     *       triggers LIP (commits next_buf as the new DMA target); the
-     *       SECOND FSI confirms one image frame has been written.
+     *   (2) wait_fs_and_lip_with_band: poll for two FSIs (one full sensor
+     *       period). At FS1 strobe LIP and commit next_buf as DMA target.
+     *       Between polls, run core 0's band of g_task_raw — same buffer
+     *       cores 1-3 are working on. At FS2 drain remaining rows of
+     *       core 0's band synchronously and return.
      *   (3) swap state: prev_buf = active_buf; active_buf = next_buf.
-     *   (4) sync with previous iteration's debayer. In steady state this
-     *       is ~0 ms because cores 1-3 finished ~70 ms ago (32 ms work
-     *       running concurrently with the 105 ms wait above).
+     *   (4) sync — wait for cores 1, 2, 3 to finish their bands. Healthy:
+     *       ~0 ms because the 17 ms 4-core debayer fits inside the 15-20 ms
+     *       wait_fs window.
      *   (5) invalidate prev_buf cache lines.
-     *   (6) dispatch debayer of prev_buf → FB, async on cores 1-3.
+     *   (6) dispatch debayer of prev_buf → FB, async on cores 1-3 for the
+     *       NEXT iteration's wait window.
      *
-     * Why sync AFTER wait (not before): cores 1-3 dispatch happens at
-     * step (6) of iter K. By the time iter K+1's LIP fires inside step
-     * (2) of iter K+1, cores have had the entire wait_fs window minus
-     * loop overhead (~63 ms FS1 offset minus a few ms) to finish their
-     * 32 ms debayer. They're done well before LIP, so there's no DMA-vs-
-     * core race on prev_buf-of-prev-iter (which is next_buf of THIS iter).
-     * Putting sync BEFORE wait_fs serialises the 32 ms debayer with the
-     * wait — see V158 commit b3d0f29's measured sync=28ms regression.
-     *
-     * Per-frame total ≈ 117 ms = 8.55 fps. */
+     * Per-frame total: max(wait_fs(~15-20 ms), debayer4(~17 ms)) ≈ ~20 ms
+     * → ~50 fps target (vs V159's 38-45 fps with 3-core debayer). */
     uint8_t* active_buf        = raw_a;
     bool     debayer_in_flight = false;
     uint32_t cycle             = 0u;
@@ -583,23 +673,27 @@ extern "C" void kernel_main() {
         uint8_t* next_buf = (active_buf == raw_a) ? raw_b : raw_a;
         unicam_stage_dma_buffer(next_buf);
 
-        /* Step 2: wait for two FSIs (one full sensor period). LIP fires
-         * at the 1st FSI to commit next_buf; we return after the 2nd
-         * FSI when one full image frame is in next_buf. The returned
-         * value is IBWP sampled BEFORE the LIP — i.e. the byte count of
-         * the just-completed frame inside active_buf. */
-        uint32_t ibwp_pre_lip = unicam_wait_fs_and_lip();
+        /* Step 2: wait for two FSIs. If a previous iteration dispatched
+         * a debayer, run core 0's band of that same buffer (g_task_raw)
+         * during the wait. Otherwise just poll without doing band work. */
+        uint32_t ibwp_pre_lip;
+        if (debayer_in_flight) {
+            uint32_t bs, be;
+            band_for_core(0u, &bs, &be);
+            ibwp_pre_lip = wait_fs_and_lip_with_band(
+                bs, be, g_task_raw, fb, fb_stride_px);
+        } else {
+            ibwp_pre_lip = unicam_wait_fs_and_lip();
+        }
         uint64_t t1 = cnt_now();
 
         /* Step 3: swap state. */
         uint8_t* prev_buf = active_buf;
         active_buf        = next_buf;
 
-        /* Step 4: sync with previous iteration's debayer. Healthy: ~0 ms
-         * because cores 1-3 finished during the wait above. If sync > 0
-         * grows persistently, debayer is running longer than the wait,
-         * which means we're starving the next frame — symptom would be
-         * sensor frames being dropped (rows_max diagnostic would warn). */
+        /* Step 4: sync with cores 1-3 of the previous iteration's debayer.
+         * Healthy: ~0 ms because all three secondaries finish their
+         * 17 ms bands inside the 15-20 ms wait above. */
         if (debayer_in_flight) {
             mc_wait_debayer_done();
         }

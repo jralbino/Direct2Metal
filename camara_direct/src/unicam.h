@@ -58,3 +58,28 @@ uint32_t unicam_get_ibwp_max();
  *     frame in the buffer that was active before this LIP. */
 void unicam_stage_dma_buffer(void* buf);
 uint32_t unicam_wait_fs_and_lip();
+
+/* ── V160 low-level primitives for core-0-while-wait band work ─────────────
+ *
+ * These expose the parts of unicam_wait_fs_and_lip so the caller can drive
+ * its own polling loop interleaved with other work (e.g. core 0 doing its
+ * debayer band rows between FSI polls). The complete state machine the
+ * caller must run is:
+ *
+ *   unicam_arm_for_wait();
+ *   fs_count = 0; ibwp_pre_lip = 0;
+ *   while (fs_count < 2):
+ *     if (unicam_consume_fsi()):
+ *       fs_count++;
+ *       if (fs_count == 1):
+ *         ibwp_pre_lip = unicam_get_ibwp();
+ *         unicam_lip_strobe();
+ *     else:
+ *       do one chunk of pending work (e.g. debayer one row);
+ *
+ * This recreates the exact 2-FSI protocol of unicam_wait_fs_and_lip() but
+ * lets the caller interleave the *poll → work* pattern without needing
+ * a callback through the lib. */
+void     unicam_arm_for_wait();   /* CPE on, CLKGATE, MISC, clear ISTA */
+bool     unicam_consume_fsi();    /* atomic read+clear of FSI bit */
+void     unicam_lip_strobe();     /* commit staged IBSA0/IBEA0 */

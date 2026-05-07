@@ -376,6 +376,32 @@ void unicam_stage_dma_buffer(void* buf) {
     __asm__ volatile("dsb st" ::: "memory");
 }
 
+/* V160 low-level primitives — see unicam.h docstring for the
+ * caller-driven state machine. These are the building blocks of
+ * unicam_wait_fs_and_lip(), pulled out so callers can interleave their
+ * own work between polls. */
+
+void unicam_arm_for_wait() {
+    U_SETBITS(U_CTRL, U_CTRL_CPE);
+    UNICAM1_CLKGATE = 0x5A000015u;
+    U_SETBITS(U_MISC, U_MISC_FLBITS);
+    __asm__ volatile("dsb st" ::: "memory");
+    U_WRITE(U_ISTA, 0xFFFFFFFFu);
+}
+
+bool unicam_consume_fsi() {
+    if (U_READ(U_ISTA) & U_ISTA_FSI) {
+        U_WRITE(U_ISTA, 0xFFFFFFFFu);   /* W1C all status bits */
+        return true;
+    }
+    return false;
+}
+
+void unicam_lip_strobe() {
+    U_SETBITS(U_ICTL, U_ICTL_LIP);
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
 uint32_t unicam_wait_fs_and_lip() {
     /* The IMX708 emits *two* FSIs per real frame (V158 HW: wait between
      * consecutive FSIs is ~63 ms, but the sensor period from FLL × LLP is

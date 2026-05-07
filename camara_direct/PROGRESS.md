@@ -2,7 +2,7 @@
 
 **Plataforma:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53). Bare-metal AArch64, sin sistema operativo.
 **Cámara:** Pi Camera v3 (Sony IMX708), CSI-2 a 2 lanes.
-**Estado actual:** V159 — captura **binned 1536×864** → HDMI 1920×1080. Throughput **~38-45 fps medido en HW** (5-6× sobre V158), pero **REGRESIÓN VISUAL: lane swap bug volvió** (ver §"V159 lane-swap regression").
+**Estado actual:** V160 — captura binned 1536×864 → HDMI 1920×1080, **debayer en los 4 cores** con core 0 corriendo banda 0 entrelazado con polling FSI. En validación HW. Lane swap (V159) ya RESUELTO.
 
 **Throughput medido:**
 ```
@@ -271,9 +271,34 @@ Posibles ganancias adicionales sobre V159 si el debayer lo permite:
 
 V146/V147 atribuían el "maxWP=704/864 (~81%)" a un límite pre-existente del Unicam BCM2837. V148–V153 vieron 1750/2592 (~67%) en full mode. V154 FS-a-FS confirma que el límite era artefacto del polling IBWP-stable: con FS-a-FS la cobertura es 0xA20/0xA20 = 2592/2592 = **100%**. La memoria del proyecto sobre ese límite estaba equivocada.
 
-### 6. Interrupciones reales (eliminar el polling de FSI)
+### 6. Interrupciones reales (eliminar el polling de FSI) — alternativa a V160
 
-`unicam_wait_frame_end_stop` poolea ISTA a ~150 ns por lectura durante todo el frame period (~117 ms). Instalar un vector AArch64 + handler de FSI en el GIC de BCM2837 dejaría el core 0 libre durante ese tiempo. **No es ganancia de fps directa** (el wait sigue siendo 117 ms), pero libera el core 0 para preprocessing YOLO o cualquier otra carga concurrente.
+V160 (debayer en 4 cores con band-while-wait en core 0 vía polling intercalado) consigue el mismo efecto que GIC interrupts (liberar core 0 para más trabajo) **sin tocar la infraestructura de excepciones del BCM2837** (que tiene routing de dos etapas: legacy IC en `0x3F00B000` → GIC400 en `0x40041000`/`0x40042000`, no-trivial documentar/programar fuera de Linux).
+
+Si en el futuro hace falta procesamiento concurrente que no encaja en el patrón "una banda de filas por iter" (e.g. YOLO cuyo grafo de cómputo no se parece a un loop por filas), entonces sí justifica implementar GIC. Cosas que se necesitarían:
+- Vector table AArch64 (~16 entradas × 128 bytes).
+- Mapear `0x40000000+` en MMU (T0SZ 34 → 33, table[1024]).
+- GICD + GICC init.
+- Routing de la IRQ del Unicam (probablemente en el rango GIC SPI 64-71 vía agregación de la legacy IC).
+- ISR + WFI loop para reemplazar el polling.
+
+V160 evita todo eso y entrega la ganancia (8.55 fps → ~50 fps) con un cambio quirúrgico al loop principal.
+
+### 6b. ✅ V160 implementado: 4-core debayer con band-while-wait
+
+Cambio:
+- `BAND_COUNT 3 → 4`. `BAND_H = FB_H/4 = 270` (1080/4 exacto).
+- `band_for_secondary(core_id-1)` → `band_for_core(core_id)`. Cores 1, 2, 3 → bands 1, 2, 3. Core 0 → band 0.
+- `mc_wait_debayer_done` ahora espera `done == BAND_COUNT - 1 = 3` (core 0 no incrementa el contador, su trabajo es inline).
+- `debayer_band` refactorizado a wrapper sobre `debayer_one_row(vy, ...)`.
+- Nueva `wait_fs_and_lip_with_band(band_start, band_end, raw, fb, stride)` que entrelaza el polling de FSI con `debayer_one_row(cur_row)` entre polls. Latencia de FSI ≤ ~63 µs (un row), muy por debajo del intervalo FS-to-FS de ~15 ms.
+- Nuevas primitivas en `unicam.h/.cpp`: `unicam_arm_for_wait`, `unicam_consume_fsi`, `unicam_lip_strobe` para que main.cpp pueda manejar el polling state machine sin duplicar lógica.
+
+Per-iter cycle:
+```
+max(wait_fs(15-20 ms), debayer_per_core(17 ms)) ≈ 20 ms = 50 fps
+```
+vs V159's `max(wait_fs, 23 ms) = 23-25 ms = 38-45 fps`. **+25% sobre V159**.
 
 ### 7. (Opcional) YOLOv5n integration
 
