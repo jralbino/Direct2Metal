@@ -12,7 +12,9 @@ TIMING wait=18 sync=7 inval=0 disp=0 total=26 ms  fps=38.46
 ```
 Bottleneck pasó del sensor (V158: 117 ms cap) al debayer (V159: ~25 ms = 38-45 fps cap). El sensor en binned a `FLL=0x046D` da ~24 fps teóricos pero medimos 40+ fps porque cada iteración corresponde a 1 frame físico y el wait queda en ~14-21 ms por la asimetría del 2-FSI window. Buffer DMA pasó de 14.93 MB → 1.58 MB → contención prácticamente eliminada (el `wait` ya no crece como en V157/V158).
 
-**V159 lane-swap regression — RESUELTO** flipando `0x0310` de `0x00` (override del padre) → `0x01` (libcamera default). En validación HW. Detalle del análisis y mecanismo en §"V159 lane-swap regression".
+**V159 lane-swap regression — RESUELTO Y VALIDADO EN HW** (2026-05-07): flipando `0x0310` de `0x00` (override del padre) → `0x01` (libcamera default). UART log muestra `reg=0x00000310 val=0x00000001`, escenas reales sin bytes mezclados, fps mantiene 38-45. Detalle del análisis y mecanismo en §"V159 lane-swap regression".
+
+**Detalle no crítico observado en V159:** movimientos rápidos muestran motion blur por la exposición larga (`CIT=0x046B`= 1131 líneas ≈ 41.6 ms — anti-flicker para 50 Hz fluorescente). A 40 fps con shutter casi abierto todo el frame period, objetos rápidos se estiran sobre múltiples columnas. Reducir `0x0202/03` a `0x0100` (~9.4 ms) y bajar gain a juego elimina el blur si la escena tiene luz ambiente suficiente. Decisión: no aplicado, no es bloqueante.
 
 ---
 
@@ -114,14 +116,21 @@ camara_direct V158 full-mode usaba `0x01` (libcamera default) y funcionaba limpi
 
 `DAT1` perdió bit 26 (lane HS-active status). Mecanismo plausible: con `0x0310=0x00` el clock lane oscila entre HS y LP entre bursts; la auto-termination del BCM2837 en lane 1 (configurada como clock-pattern HS termination = `0x06000005`) no consigue re-engancharse limpiamente en cada burst, perdiendo sincronía. Lane 0 (data-pattern termination = `0xC0000005`) sí re-engancha. Resultado: lane 1 entrega bytes desincronizados respecto a lane 0 → "lane swap" visible.
 
-**Fix aplicado:**
+**Fix aplicado y VALIDADO EN HW** (2026-05-07):
 
 ```c
 // src/imx708_regs.h, dentro de k_imx708_binned[]:
 { 0x0310, 0x01 },   // libcamera default; era 0x00 (override V104 del padre)
 ```
 
-Misma corrección que V158 ya tenía implícita en su `k_imx708_full[]` por descartar el override del padre. **Pendiente de validar en HW** (esperando uart.log + observación visual del próximo run).
+UART log post-fix:
+```
+reg=0x00000310 val=0x00000001    ← era 0x00
+DAT1 = 0x06000005                ← termination clock-pattern reaplicada limpia
+TIMING wait=18 sync=7 ... fps=38.46
+```
+
+Misma corrección que V158 ya tenía implícita en su `k_imx708_full[]` por descartar el override del padre. Imagen real ya no muestra el lane swap de bytes mezclados.
 
 **Lección portable:** los overrides marcados "VNNN HW-verified" del proyecto padre son contexto del padre, no validaciones libcamera. Cuando portemos cualquier tabla del padre a camara_direct, diff contra `linux_extract/registers/imx708_writes_*_unique_final.txt` y mantener el valor de libcamera salvo que un test HW de camara_direct demuestre lo contrario.
 
