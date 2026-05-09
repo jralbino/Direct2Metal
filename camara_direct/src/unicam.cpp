@@ -103,11 +103,8 @@ static void cm_cam1_enable_100mhz() {
 }
 
 void unicam_init(void* buffer) {
-    uart_puts("Unicam: V159 binned-mode init (1536x864)\n");
-
     /* STEP 0A: CM_CAM1CTL — digital backend clock (100MHz from PLLD) */
     cm_cam1_enable_100mhz();
-    uart_puts("Unicam: CM_CAM1 = PLLD/5 (100MHz)\n");
 
     /* STEP 1: CTRL = MEM only (no CPE, no CPR yet). */
     U_WRITE(U_CTRL, U_CTRL_MEM);
@@ -225,7 +222,6 @@ void unicam_capture_start() {
     __asm__ volatile("dsb st" ::: "memory");
     U_SETBITS(U_MISC, U_MISC_FLBITS);
     U_SETBITS(U_ICTL, U_ICTL_LIP);
-    uart_puts("Unicam: CPE + LIP re-armed after sensor stream_on\n");
 }
 
 uint32_t unicam_get_ibwp()  { return U_READ(U_IBWP); }

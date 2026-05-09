@@ -271,24 +271,98 @@ static void mc_wait_debayer_done() {
 #define CCM_BB  1592
 
 /* sRGB encoding gamma LUT (close approximation of imx708.json gamma_curve). */
-static const uint8_t k_gamma_srgb[256] = {
-      0,  13,  22,  28,  34,  38,  42,  46,  50,  53,  56,  59,  61,  64,  66,  69,
-     71,  73,  75,  77,  79,  81,  83,  85,  86,  88,  90,  92,  93,  95,  96,  98,
-     99, 101, 102, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 118, 119,
-    120, 121, 122, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136,
-    137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 148, 149, 150, 151,
-    152, 153, 154, 155, 155, 156, 157, 158, 159, 159, 160, 161, 162, 163, 163, 164,
-    165, 166, 167, 167, 168, 169, 170, 170, 171, 172, 173, 173, 174, 175, 175, 176,
-    177, 178, 178, 179, 180, 180, 181, 182, 182, 183, 184, 185, 185, 186, 187, 187,
-    188, 189, 189, 190, 190, 191, 192, 192, 193, 194, 194, 195, 196, 196, 197, 197,
-    198, 199, 199, 200, 200, 201, 202, 202, 203, 203, 204, 205, 205, 206, 206, 207,
-    208, 208, 209, 209, 210, 210, 211, 212, 212, 213, 213, 214, 214, 215, 215, 216,
-    216, 217, 218, 218, 219, 219, 220, 220, 221, 221, 222, 222, 223, 223, 224, 224,
-    225, 226, 226, 227, 227, 228, 228, 229, 229, 230, 230, 231, 231, 232, 232, 233,
-    233, 234, 234, 235, 235, 236, 236, 237, 237, 238, 238, 238, 239, 239, 240, 240,
-    241, 241, 242, 242, 243, 243, 244, 244, 245, 245, 246, 246, 246, 247, 247, 248,
-    248, 249, 249, 250, 250, 251, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255,
+/* IMX708 tuned gamma curve (linux_extract/tuning/imx708.json → rpi.contrast).
+ * 51 control points, 16-bit input → 16-bit output, piecewise linear.
+ * Built into k_gamma[256] (8-bit→8-bit) at boot in debayer_init_tables(). */
+static const uint16_t k_gamma_pts[51][2] = {
+    {    0,     0}, {  512,  2518}, { 1024,  5033}, { 1536,  7175},
+    { 2048,  9309}, { 2560, 10814}, { 3072, 12312}, { 3584, 13773},
+    { 4096, 15225}, { 4608, 16566}, { 5120, 17899}, { 5632, 19221},
+    { 6144, 20534}, { 6656, 21684}, { 7168, 22826}, { 7680, 24024},
+    { 8192, 25212}, { 9216, 27251}, {10240, 29167}, {11264, 30947},
+    {12288, 32696}, {13312, 34309}, {14336, 35849}, {15360, 37194},
+    {16384, 38445}, {17408, 39598}, {18432, 40732}, {19456, 41717},
+    {20480, 42687}, {22528, 44343}, {24576, 45871}, {26624, 47222},
+    {28672, 48441}, {30720, 49460}, {32768, 50470}, {34816, 51476},
+    {36864, 52480}, {38912, 53382}, {40960, 54294}, {43008, 55155},
+    {45056, 56035}, {47104, 56920}, {49152, 57824}, {51200, 58737},
+    {53248, 59666}, {55296, 60604}, {57344, 61558}, {59392, 62529},
+    {61440, 63516}, {63488, 64519}, {65535, 65535},
 };
+static uint8_t k_gamma[256];
+
+static void build_gamma_lut() {
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < 256u; i++) {
+        uint32_t in16 = i * 257u;   /* 0→0, 255→65535 */
+        while (j + 1u < 50u && k_gamma_pts[j + 1u][0] < in16) j++;
+        uint32_t x0 = k_gamma_pts[j][0],     y0 = k_gamma_pts[j][1];
+        uint32_t x1 = k_gamma_pts[j + 1][0], y1 = k_gamma_pts[j + 1][1];
+        uint32_t out16 = (x1 == x0) ? y0
+                       : y0 + ((y1 - y0) * (in16 - x0)) / (x1 - x0);
+        uint32_t out8  = (out16 + 128u) >> 8;
+        if (out8 > 255u) out8 = 255u;
+        k_gamma[i] = (uint8_t)out8;
+    }
+}
+
+/* ── Auto-exposure ─────────────────────────────────────────────────────────
+ * Closed-loop CIT control on core 0. Runs between mc_dispatch_debayer_async
+ * (cores 1-3 busy) and the next iteration's wait_fs — pure slack time.
+ *
+ * Sample: 32×32 grid of raw bytes from prev_buf (1024 points). Each byte is
+ * the high 8 bits of the 10-bit packed pixel — channel-mixed but a fine
+ * luminance proxy after BLC removal.
+ *
+ * Control: pure-P clamp, target=AE_TARGET, k=1/8, |delta| <= 32 lines/update.
+ * Update every AE_PERIOD frames (~12 Hz at 47 fps) to avoid oscillation and
+ * I2C overhead in the inner loop. */
+#define AE_TARGET    100u   /* post-BLC mean target (mid-warm grey) */
+#define AE_BLC          16u  /* BLACK_LVL>>2 in 8-bit space */
+#define AE_PERIOD       4u
+#define AE_CIT_MIN     16u
+#define AE_CIT_MAX   1110u   /* FLL=1133, headroom 22 lines */
+
+static uint16_t s_ae_cit       = 1131u;   /* matches imx708_regs.h initial 0x046B */
+static uint32_t s_ae_frame     = 0u;
+
+static uint32_t ae_sample_mean(const uint8_t* raw) {
+    uint32_t sum = 0;
+    for (uint32_t y = 8u; y < 864u; y += 27u) {           /* 32 rows */
+        const uint8_t* row = raw + y * 1920u;             /* RAW_STRIDE */
+        for (uint32_t x = 16u; x < 1536u; x += 48u) {     /* 32 cols */
+            uint32_t off = (x >> 2) * 5u + (x & 3u);
+            sum += row[off];
+        }
+    }
+    return sum >> 10;   /* 1024 samples → mean */
+}
+
+static void ae_step(const uint8_t* prev_buf) {
+    s_ae_frame++;
+    if ((s_ae_frame & (AE_PERIOD - 1u)) != 0u) return;
+
+    uint32_t mean_raw = ae_sample_mean(prev_buf);
+    int32_t  mean8    = (int32_t)mean_raw - (int32_t)AE_BLC;
+    if (mean8 < 0) mean8 = 0;
+
+    int32_t error = (int32_t)AE_TARGET - mean8;
+    int32_t delta = error >> 3;          /* k_p = 1/8 */
+    if (delta >  32) delta =  32;        /* slew cap */
+    if (delta < -32) delta = -32;
+
+    int32_t cit = (int32_t)s_ae_cit + delta;
+    if (cit < (int32_t)AE_CIT_MIN) cit = AE_CIT_MIN;
+    if (cit > (int32_t)AE_CIT_MAX) cit = AE_CIT_MAX;
+    if ((uint16_t)cit == s_ae_cit) return;
+
+    s_ae_cit = (uint16_t)cit;
+    /* Group-hold so high+low bytes latch atomically at next FS. */
+    imx708_write(0x0104, 0x01);
+    imx708_write(0x0202, (uint8_t)(s_ae_cit >> 8));
+    imx708_write(0x0203, (uint8_t)(s_ae_cit & 0xFF));
+    imx708_write(0x0104, 0x00);
+}
 
 /* Pre-DMA fill so the FB never displays uninitialised SDRAM during cold
  * boot. Any non-zero pattern works; 0xA5 stays distinctive in hex dumps. */
@@ -337,6 +411,7 @@ static uint32_t g_row_off[FB_H];     /* sy_even * RAW_STRIDE for each output lin
 static uint32_t g_byte_off[FB_W];    /* byte offset of B inside the row for each output column */
 
 static void debayer_init_tables() {
+    build_gamma_lut();
     for (uint32_t vy = 0; vy < FB_H; vy++) {
         uint32_t blk_y = (vy * 2u) / 5u;             /* upscale 5/4 in block coords */
         g_row_off[vy] = (blk_y * 2u) * RAW_STRIDE;
@@ -433,10 +508,10 @@ static void debayer_one_row(uint32_t vy,
             uint32_t b2i = (uint32_t)vgetq_lane_s32(b2, 2);
             uint32_t b3i = (uint32_t)vgetq_lane_s32(b2, 3);
 
-            fb_row[vx + 0] = 0xFF000000u | (k_gamma_srgb[r0i] << 16) | (k_gamma_srgb[g0i] << 8) | k_gamma_srgb[b0i];
-            fb_row[vx + 1] = 0xFF000000u | (k_gamma_srgb[r1i] << 16) | (k_gamma_srgb[g1i] << 8) | k_gamma_srgb[b1i];
-            fb_row[vx + 2] = 0xFF000000u | (k_gamma_srgb[r2i] << 16) | (k_gamma_srgb[g2i] << 8) | k_gamma_srgb[b2i];
-            fb_row[vx + 3] = 0xFF000000u | (k_gamma_srgb[r3i] << 16) | (k_gamma_srgb[g3i] << 8) | k_gamma_srgb[b3i];
+            fb_row[vx + 0] = 0xFF000000u | (k_gamma[r0i] << 16) | (k_gamma[g0i] << 8) | k_gamma[b0i];
+            fb_row[vx + 1] = 0xFF000000u | (k_gamma[r1i] << 16) | (k_gamma[g1i] << 8) | k_gamma[b1i];
+            fb_row[vx + 2] = 0xFF000000u | (k_gamma[r2i] << 16) | (k_gamma[g2i] << 8) | k_gamma[b2i];
+            fb_row[vx + 3] = 0xFF000000u | (k_gamma[r3i] << 16) | (k_gamma[g3i] << 8) | k_gamma[b3i];
     }
 }
 
@@ -553,7 +628,6 @@ extern "C" void kernel_main() {
     for (uint32_t y = 0; y < FB_H; y++)
         for (uint32_t x = 0; x < FB_W; x++)
             fb[y * fb_stride_px + x] = 0xFF000000u | (0xFFu << 16);
-    uart_puts("FB: painted red (XRGB)\n");
 
     if (!mailbox_set_domain_state(14, 1)) {
         uart_puts("ERR: domain 14 power on failed\n");
@@ -592,9 +666,7 @@ extern "C" void kernel_main() {
 
     /* One-shot Linux-comparable register snapshot. Done before entering the
      * steady-state loop so the values reflect the post-init / pre-stream
-     * state and can be diff'd against linux_capture_linux/. After the first
-     * iteration's wait_FS_LIP runs, the rows_max value will reflect a real
-     * captured frame's coverage. */
+     * state and can be diff'd against linux_capture_linux/. */
     {
         uart_puts("UNICAM_BEGIN\n");
         uart_puts("  CTRL  = 0x"); uart_hex(unicam_get_ctrl()); uart_puts("\n");
@@ -663,7 +735,6 @@ extern "C" void kernel_main() {
      * → ~50 fps target (vs V159's 38-45 fps with 3-core debayer). */
     uint8_t* active_buf        = raw_a;
     bool     debayer_in_flight = false;
-    uint32_t cycle             = 0u;
     while (1) {
         uint64_t t0 = cnt_now();
 
@@ -676,14 +747,13 @@ extern "C" void kernel_main() {
         /* Step 2: wait for two FSIs. If a previous iteration dispatched
          * a debayer, run core 0's band of that same buffer (g_task_raw)
          * during the wait. Otherwise just poll without doing band work. */
-        uint32_t ibwp_pre_lip;
         if (debayer_in_flight) {
             uint32_t bs, be;
             band_for_core(0u, &bs, &be);
-            ibwp_pre_lip = wait_fs_and_lip_with_band(
+            (void)wait_fs_and_lip_with_band(
                 bs, be, g_task_raw, fb, fb_stride_px);
         } else {
-            ibwp_pre_lip = unicam_wait_fs_and_lip();
+            (void)unicam_wait_fs_and_lip();
         }
         uint64_t t1 = cnt_now();
 
@@ -699,17 +769,6 @@ extern "C" void kernel_main() {
         }
         uint64_t t2 = cnt_now();
 
-        /* One-shot rows_max diagnostic on the first real captured frame. */
-        if (cycle == 0u) {
-            uint32_t prev_bus = 0xC0000000u | (uint32_t)(uintptr_t)prev_buf;
-            uint32_t ibls     = unicam_get_ibls();
-            uint32_t bytes_seen = (ibwp_pre_lip > prev_bus) ? (ibwp_pre_lip - prev_bus) : 0u;
-            uint32_t rows_max = ibls ? (bytes_seen / ibls) : 0u;
-            uart_puts("FRAME rows_max=0x"); uart_hex(rows_max);
-            uart_puts(" / 0x360\n");   /* expected = SENSOR_H = 864 (binned) */
-            cycle = 1u;
-        }
-
         /* Step 5: invalidate prev_buf cache lines. DMA wrote there
          * bypassing CPU caches, so without this debayer reads stale data. */
         dcache_invalidate_range(prev_buf, FRAME_BYTES);
@@ -719,6 +778,11 @@ extern "C" void kernel_main() {
         mc_dispatch_debayer_async(prev_buf, fb, fb_stride_px);
         debayer_in_flight = true;
         uint64_t t4 = cnt_now();
+
+        /* Step 7: AE — measure prev_buf and (every AE_PERIOD frames)
+         * push a new CIT to the sensor. Cores 1-3 are reading prev_buf
+         * for debayer; ae_sample_mean is read-only so no conflict. */
+        ae_step(prev_buf);
 
         uint32_t ms_wait     = cnt_to_ms(t1 - t0);   /* incl. stage_buf */
         uint32_t ms_sync     = cnt_to_ms(t2 - t1);
@@ -737,6 +801,7 @@ extern "C" void kernel_main() {
         uint32_t frac = fps_x100 % 100u;
         if (frac < 10u) uart_putc('0');
         uart_dec(frac);
+        uart_puts("  ae_cit=");     uart_dec(s_ae_cit);
         uart_putc('\n');
     }
 }
