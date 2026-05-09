@@ -589,7 +589,7 @@ static inline uint32_t cnt_to_ms(uint64_t delta) {
 
 extern "C" void kernel_main() {
     uart_init();
-    uart_puts("camara_direct V160: IMX708 1536x864 binned -> HDMI 1920x1080 (4-core debayer, core 0 band-while-wait)\n");
+    uart_puts("camara_direct V162: IMX708 1536x864 binned -> HDMI 1920x1080 (4-core debayer, ISP from Linux, AE on CIT, double-buffer FB)\n");
 
     {
         uint64_t freq;
@@ -619,15 +619,23 @@ extern "C" void kernel_main() {
         uart_puts("FB: FAILED\n");
         return;
     }
-    volatile uint32_t* fb = (volatile uint32_t*)fb_ptr;
+    /* Double-buffered FB: virtual_height = 2 × FB_H, two surfaces stacked
+     * vertically. fb_buf[0] at y=0 is shown by default; debayer renders into
+     * the offscreen one and we page-flip via SET_VIRTUAL_OFFSET after each
+     * frame completes. Eliminates motion tearing — scanout never crosses an
+     * in-flight write. */
     const uint32_t fb_stride_px = fb_pitch / 4;
+    volatile uint32_t* fb_buf[2] = {
+        (volatile uint32_t*)fb_ptr,
+        (volatile uint32_t*)fb_ptr + (uint32_t)FB_H * fb_stride_px,
+    };
     uart_puts("FB: stride_px=0x"); uart_hex(fb_stride_px);
     uart_puts(" expected=0x"); uart_hex(FB_W); uart_puts("\n");
 
-    /* Startup fill: solid red (XRGB8888). */
-    for (uint32_t y = 0; y < FB_H; y++)
+    /* Startup fill: solid red on both halves (XRGB8888). */
+    for (uint32_t y = 0; y < FB_H * 2u; y++)
         for (uint32_t x = 0; x < FB_W; x++)
-            fb[y * fb_stride_px + x] = 0xFF000000u | (0xFFu << 16);
+            fb_buf[0][y * fb_stride_px + x] = 0xFF000000u | (0xFFu << 16);
 
     if (!mailbox_set_domain_state(14, 1)) {
         uart_puts("ERR: domain 14 power on failed\n");
@@ -733,8 +741,12 @@ extern "C" void kernel_main() {
      *
      * Per-frame total: max(wait_fs(~15-20 ms), debayer4(~17 ms)) ≈ ~20 ms
      * → ~50 fps target (vs V159's 38-45 fps with 3-core debayer). */
-    uint8_t* active_buf        = raw_a;
-    bool     debayer_in_flight = false;
+    uint8_t*  active_buf        = raw_a;
+    bool      debayer_in_flight = false;
+    /* Start dispatching into fb_buf[1] (offscreen). After the first frame
+     * completes, we page-flip to it; from then on the buffer being written
+     * is always the one not currently scanned out. */
+    uint32_t  fb_back_idx        = 1u;
     while (1) {
         uint64_t t0 = cnt_now();
 
@@ -751,7 +763,7 @@ extern "C" void kernel_main() {
             uint32_t bs, be;
             band_for_core(0u, &bs, &be);
             (void)wait_fs_and_lip_with_band(
-                bs, be, g_task_raw, fb, fb_stride_px);
+                bs, be, g_task_raw, fb_buf[fb_back_idx], fb_stride_px);
         } else {
             (void)unicam_wait_fs_and_lip();
         }
@@ -763,9 +775,13 @@ extern "C" void kernel_main() {
 
         /* Step 4: sync with cores 1-3 of the previous iteration's debayer.
          * Healthy: ~0 ms because all three secondaries finish their
-         * 17 ms bands inside the 15-20 ms wait above. */
+         * 17 ms bands inside the 15-20 ms wait above. After sync the offscreen
+         * buffer is fully rendered — page-flip then toggle for the next
+         * dispatch. */
         if (debayer_in_flight) {
             mc_wait_debayer_done();
+            framebuffer_set_offset(fb_back_idx * (uint32_t)FB_H);
+            fb_back_idx ^= 1u;
         }
         uint64_t t2 = cnt_now();
 
@@ -774,8 +790,9 @@ extern "C" void kernel_main() {
         dcache_invalidate_range(prev_buf, FRAME_BYTES);
         uint64_t t3 = cnt_now();
 
-        /* Step 6: dispatch debayer of prev_buf, async on cores 1-3. */
-        mc_dispatch_debayer_async(prev_buf, fb, fb_stride_px);
+        /* Step 6: dispatch debayer of prev_buf, async on cores 1-3,
+         * targeting the offscreen surface. */
+        mc_dispatch_debayer_async(prev_buf, fb_buf[fb_back_idx], fb_stride_px);
         debayer_in_flight = true;
         uint64_t t4 = cnt_now();
 
