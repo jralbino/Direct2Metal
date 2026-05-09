@@ -2,19 +2,17 @@
 
 **Plataforma:** Raspberry Pi Zero 2 W (BCM2837, 4×Cortex-A53). Bare-metal AArch64, sin sistema operativo.
 **Cámara:** Pi Camera v3 (Sony IMX708), CSI-2 a 2 lanes.
-**Estado actual:** V160 — captura binned 1536×864 → HDMI 1920×1080, **debayer en los 4 cores** con core 0 corriendo banda 0 entrelazado con polling FSI. En validación HW. Lane swap (V159) ya RESUELTO.
+**Estado actual:** **V162** — captura binned 1536×864 → HDMI 1920×1080, debayer en los 4 cores con core 0 entrelazado, ISP completo (BLC/WB/CCM/gamma/LSC) byte-exact con libcamera, AE en CIT con feedback P-controller, double-buffer FB. Validado en HW.
 
-**Throughput medido:**
+**Throughput medido (V162):**
 ```
-TIMING wait=20 sync=0 inval=1 disp=0 total=22 ms  fps=45.45   ← iter 1
-TIMING wait=14 sync=9 inval=0 disp=0 total=25 ms  fps=40.00
-TIMING wait=18 sync=7 inval=0 disp=0 total=26 ms  fps=38.46
+TIMING wait=21 sync=0 inval=0 disp=0 total=21 ms  fps=47.61  ae_cit=1110
 ```
-Bottleneck pasó del sensor (V158: 117 ms cap) al debayer (V159: ~25 ms = 38-45 fps cap). El sensor en binned a `FLL=0x046D` da ~24 fps teóricos pero medimos 40+ fps porque cada iteración corresponde a 1 frame físico y el wait queda en ~14-21 ms por la asimetría del 2-FSI window. Buffer DMA pasó de 14.93 MB → 1.58 MB → contención prácticamente eliminada (el `wait` ya no crece como en V157/V158).
+Bottleneck es el sensor (FS-to-FS = 21 ms), debayer 4-core entra dentro de la ventana de wait. Buffer DMA 1.58 MB.
 
-**V159 lane-swap regression — RESUELTO Y VALIDADO EN HW** (2026-05-07): flipando `0x0310` de `0x00` (override del padre) → `0x01` (libcamera default). UART log muestra `reg=0x00000310 val=0x00000001`, escenas reales sin bytes mezclados, fps mantiene 38-45. Detalle del análisis y mecanismo en §"V159 lane-swap regression".
+**Diff vs Linux libcamera ground truth (`linux_extract/DIFF_REPORT.md`):** de 125 regs faltantes en V148, quedan **~17** y todos están en bloques deliberadamente saltados (PDAF disabled, test pattern off, 2 misc enable bits). El init I2C de V162 cierra la brecha al 86%.
 
-**Detalle no crítico observado en V159:** movimientos rápidos muestran motion blur por la exposición larga (`CIT=0x046B`= 1131 líneas ≈ 41.6 ms — anti-flicker para 50 Hz fluorescente). A 40 fps con shutter casi abierto todo el frame period, objetos rápidos se estiran sobre múltiples columnas. Reducir `0x0202/03` a `0x0100` (~9.4 ms) y bajar gain a juego elimina el blur si la escena tiene luz ambiente suficiente. Decisión: no aplicado, no es bloqueante.
+**Tearing residual en movimiento:** seam horizontal visible en objetos que se mueven rápido. Causa documentada: mailbox `SET_VIRTUAL_OFFSET` (0x48009) tarda ~4 ms vs vblank HDMI ~0.67 ms → el escribe del HVS por la VPU cae en active scan. **Límite del firmware Pi3, no del bare-metal.** Detalle en §"V162 double-buffer FB". Solución requiere escritura directa al HVS (sin datasheet público) o GIC IRQ vsync — ambas diferidas.
 
 ---
 
@@ -79,6 +77,10 @@ NEON `vmul_n_u16` truncaba al multiplicar `R(255) × WB_R(535) = 127865`, que ex
 | V154 FS-a-FS (espera real frame boundary) | 93 | 18 | 24 | 135 | **7.40** (sostenido) |
 | V156 = V154 sin V155 crop, baseline actual | 93 | 18 | 24 | 135 | **7.40** |
 | V157 (revertido) double-buffer software | 117 | 18 | (en paralelo) | 135 | 7.40 |
+| V159 binned 1536×864 + lane-swap fix | 21 | — | 4 | 25 | **40** |
+| V160 4-core debayer + band-while-wait | 21 | — | (paralelo) | 21 | **47.6** |
+| V161 + ISP linux + AE on CIT | 21 | — | (paralelo) | 21 | **47.6** |
+| V162 + double-buffer FB | 21 | — | (paralelo) | 21 | **47.6** |
 
 NEON aplicado: gather scalar (no hay gather en ARMv8-A), pero pedestal subtract + WB + CCM (3×SMLAL chains) + clamp en vectores 4-wide. Gamma escalar (LUT 256 no cabe en `tbl`).
 
@@ -300,14 +302,67 @@ max(wait_fs(15-20 ms), debayer_per_core(17 ms)) ≈ 20 ms = 50 fps
 ```
 vs V159's `max(wait_fs, 23 ms) = 23-25 ms = 38-45 fps`. **+25% sobre V159**.
 
-### 7. (Opcional) YOLOv5n integration
+### 6c. ✅ V161 implementado: ISP byte-exact con libcamera + AE en CIT
 
-El proyecto padre ya tiene la pipeline YOLOv5n 320×320 a 511 ms. Integrar en este código bare-metal requeriría:
-- Crop 320×320 de la zona central del raw → tensor RGB normalizado.
-- Conv2d NEON + multi-core (ya existen en el padre).
-- Bounding boxes overlay sobre el FB.
+Auditoría inicial reveló que **V160 ya tenía BLC=64, WB Q8=(535,256,455) y CCM Q10 correctos** — coinciden byte-exact con `binned_exif.txt:AsShotNeutral` y la ALSC ccm de `imx708.json`. Lo que faltaba:
 
-Latencia objetivo: ~600 ms = ~1.7 fps de detección, sobre los 7.4–8.5 fps de captura.
+- **Gamma:** sRGB LUT reemplazado por la `gamma_curve` afinada de `linux_extract/tuning/imx708.json:rpi.contrast` (51 puntos 16-bit, construida en `k_gamma[256]` al boot vía `build_gamma_lut()`). Sombras más profundas, midtones con más punch.
+- **LSC:** 108 regs `0x7B10-0x7B45` + `0x7C00-0x7C35` portados verbatim del trace I2C de Linux (líneas 50-157 de `imx708_writes_binned_1536x864.txt`). Tabla `k_imx708_lsc[]` aplicada entre `k_imx708_common[]` y `k_imx708_binned[]` en `imx708_init_baseline()`. Vignetting visiblemente reducido. Los 2 regs Misc enable (`0xC428=0x01`, `0x3100=0x00`) quedan diferidos — la corrección on-die activa sin ellos.
+- **AE:** P-controller en CIT (`0x0202/0x0203`). Sample disperso 32×32 = 1024 puntos del raw, target=100 (post-BLC), `k_p=1/8`, slew `±32 lines/update`, clamp `[16, FLL-22=1110]`, update cada 4 frames (~12 Hz), group-hold via `0x0104` para latch atómico. Converge en 1-3 s. Logged inline como `ae_cit=NNN` en TIMING.
+
+Costo runtime: 108 escrituras I2C extra al boot (+10 ms una vez), 0 ms steady-state. AE sample 1024 reads (~10 µs) + I2C cada 4 frames (~400 µs) — invisible en TIMING.
+
+### 6d. ✅ V162 implementado: double-buffer FB + límite firmware Pi3 documentado
+
+Para eliminar la race "cores escriben FB mientras scanout lee":
+- `framebuffer_init` allocata `virtual_height = 2 × FB_H = 2160`, `size = 0xFD2000` (verificado).
+- Nueva `framebuffer_set_offset(y_offset)` con tag `0x48009 SET_VIRTUAL_OFFSET`.
+- `main.cpp` mantiene `fb_buf[2]` con `fb_back_idx` toggleado. Cores siempre escriben el buffer offscreen; page-flip tras `mc_wait_debayer_done`.
+
+**Race buffer-write resuelta**: scanout y cores nunca tocan el mismo buffer.
+
+**Pero tearing seam persiste en movimiento.** Auditoría con polling de PV2 (`0x3F80702C`):
+
+```
+PV_STAT bit map empírico (BCM2837 firmware):
+  bit 10: HDMI link active (constante)
+  bit 6:  active video (~88% del frame)
+  bit 5:  late vblank pulse (final del vblank window)
+  bit 7:  early vblank pulse (inicio del vblank window)
+  bits 0-3: HSYNC-related
+  bits 5/6 mutuamente exclusivos
+```
+
+NO coinciden con las bit definitions del driver vc4 mainline (que asumen bits 19-31). Ojo si se reusa.
+
+Causa raíz del tearing: mailbox roundtrip ~4 ms >> vblank ~0.67 ms. Aún capturando el inicio limpio de vblank (verificado con `wait_for_vblank()` esperando bit 6→0), el escribe del registro HVS por la VPU cae en active scan → seam mid-line.
+
+**Caminos para tear-free flip (todos diferidos)**:
+1. Escritura directa al registro HVS scanout-origin desde ARM (~1 µs, cabe en vblank). Bloqueo: dirección no documentada en datasheets públicos del BCM2837.
+2. GIC vsync IRQ con handler que haga el flip atómico en hardware. Bloqueo: bare-metal no monta IRQ infrastructure todavía.
+3. Triple buffer. No elimina seam — solo estabiliza el contenido.
+
+V162 deja `wait_for_vblank` revertido (no ayuda y costaba 12 fps), double-buffer queda como infraestructura lista para cuando se aborde una de las opciones 1/2.
+
+---
+
+### 7. Próxima sesión — back-port de V162 al proyecto padre + YOLO integration
+
+El proyecto padre `Direct2Metal/` (un nivel arriba) tiene YOLOv5n funcionando con un debayer V124-era (full-res 4608×2592 → crop 1536×864, RGGB sin ISP afinado). La idea: portar el pipeline V162 de `camara_direct/` al padre, dejando YOLO + bounding boxes intactos arriba.
+
+**Cambios a aplicar en `Direct2Metal/src/`** (orden sugerido):
+
+| Paso | Archivos del padre | Qué portar desde camara_direct |
+|---|---|---|
+| 1 | `camera_imx708.cpp`, `imx708_regs.h` | Tabla `k_imx708_binned[]` para 1536×864 + LSC `k_imx708_lsc[108]`. Cambiar de full-mode a binned. |
+| 2 | `camera_unicam.cpp` | Geometría binned (IBLS, FRAME_W/H), FS-a-FS continuo (V154/V162 protocol), `unicam_stage_dma_buffer` para IBSA0 rotation. |
+| 3 | `camera_debayer.cpp` | Cambiar `debayer_raw10_to_chw320` de **RGGB** a **BGGR** (V162 con flip 0x0101=0x03). Eliminar crop (binned ya entrega 1536×864 nativo). Aplicar BLC=16/WB Q8/CCM Q10/gamma curve antes del normalize a float32 — el modelo entrenado con libcamera espera ese pipeline ISP. |
+| 4 | `camera_debayer.cpp` (FB path) | Reemplazar el FB debayer por la versión V162 (4-core con band-while-wait, double-buffer). Opcional; mantiene fps de detección si se prefiere preservar cycles para inferencia. |
+| 5 | `kernel.cpp` | AE step inline tras el dispatch — re-uso directo de `ae_step()` de V162 main.cpp. |
+
+Validación HW por paso (igual disciplina que esta sesión): build → flashear → escena de prueba → confirmar visual → siguiente paso. Las constantes ISP están todas en `linux_extract/` para reproducir.
+
+YOLO en sí queda intacto: `run_yolo_complete()` consume `cam_frame` (320×320 CHW float32) y dibuja boxes sobre el FB. Si el chw320 sale BGGR + ISP-correcto del paso 3, el modelo debería detectar correctamente.
 
 ---
 
