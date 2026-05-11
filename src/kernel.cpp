@@ -405,9 +405,9 @@ void run_yolo_complete() {
             uint32_t* row = (uint32_t*)((uint8_t*)lfb + (uint32_t)y * pitch);
             for (int x = 0; x < 640; x++) row[x] = 0xFF000000u;
         }
-        /* Camera thumbnail in the top-right corner of the canvas. */
-        const int THUMB_W = 192, THUMB_H = 108;
-        const int THUMB_X = 640 - THUMB_W - 8;   /* 440 */
+        /* Camera thumbnail in the top-right corner of the canvas (smaller). */
+        const int THUMB_W = 128, THUMB_H = 72;
+        const int THUMB_X = 640 - THUMB_W - 8;   /* 504 */
         const int THUMB_Y = 64;
         debayer_raw10_to_thumbnail(unicam_frame_ptr(), (uint8_t*)lfb, pitch,
                                    THUMB_X, THUMB_Y, THUMB_W, THUMB_H);
@@ -470,8 +470,12 @@ void run_yolo_complete() {
                 lbl[ln++] = '0' + (pct % 10);
                 lbl[ln++] = '%';
                 lbl[ln] = '\0';
+                /* Label sits above the bbox if there's room, otherwise inside.
+                 * Scale 2 = 16-px-tall glyphs, readable at typical viewing
+                 * distance. Solid black bg per-glyph (draw_text fills bg) so
+                 * the label is legible against bright bbox content. */
                 int label_y = (top - 18 >= disp_yoff) ? top - 18 : top + 4;
-                draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 1);
+                draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 2);
             }
         }
     }
