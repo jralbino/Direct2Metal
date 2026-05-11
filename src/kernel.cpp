@@ -9,6 +9,7 @@
 #include "watchdog.h"
 #include "camera.h"
 #include "mailbox.h"
+#include "hud.h"
 
 #ifndef NULL
 #define NULL 0
@@ -25,6 +26,7 @@ extern uint32_t pitch;
 // Multi-core debayer (declared in multicore.h) — needs the raw frame pointer.
 extern const uint8_t* unicam_frame_ptr();
 extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
+extern "C" uint16_t imx708_ae_cit_get();
 
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
@@ -435,11 +437,7 @@ void run_yolo_complete() {
         }
     }
     if (valid_boxes == 0) uart_puts("[DET] none\n");
-
-    // Heartbeat indicator: bottom-right corner of the framebuffer (always visible).
-    int hb_x = 640 - 50;
-    uint32_t heartbeat_color = (heartbeat_counter % 2 == 0) ? 0xFF00FF00 : 0xFF0000FF;
-    draw_rect(hb_x, 430, 40, 40, heartbeat_color, 40); heartbeat_counter++;
+    heartbeat_counter++;
 
     unsigned long t_end = get_timer_count();
 
@@ -462,19 +460,24 @@ void run_yolo_complete() {
         uart_puts("ms\n");
     }
 
+    /* HUD overlay — repaint the top + bottom letterbox bars with KPI chrome,
+     * detection cards, animated FPS gauge. Camera area (rows 60..419) is
+     * untouched. */
     {
-        unsigned long duration = t_end - t_start;
-        int fps_tenths = (duration > 0) ? (int)((unsigned long long)f * 10ULL / (unsigned long long)duration) : 0;
-        char fps_str[12]; int n = 0;
-        fps_str[n++] = 'F'; fps_str[n++] = 'P'; fps_str[n++] = 'S'; fps_str[n++] = ':'; fps_str[n++] = ' ';
-        int fps_int = fps_tenths / 10;
-        if (fps_int >= 10) fps_str[n++] = '0' + (fps_int / 10);
-        fps_str[n++] = '0' + (fps_int % 10);
-        fps_str[n++] = '.';
-        fps_str[n++] = '0' + (fps_tenths % 10);
-        fps_str[n]   = '\0';
-        draw_text(disp_xoff + 5, 10, fps_str, 0xFF00FFFF, 0xFF000000, 2);
+        unsigned long duration_ms = (t_end - t_start) * 1000UL / f;
+        HudPred hud_preds[3]; int hud_n = 0;
+        for (int ii = 0; ii < num_preds && hud_n < 3; ii++) {
+            if (preds[ii].conf > CONF_THRESH) {
+                hud_preds[hud_n].cls  = preds[ii].cls;
+                hud_preds[hud_n].conf = preds[ii].conf;
+                hud_n++;
+            }
+        }
+        hud_update_state(hud_preds, hud_n, global_frame_counter,
+                         (int)duration_ms, (int)imx708_ae_cit_get());
+        hud_render((uint8_t*)lfb, pitch);
     }
+
     num_preds = 0; video_flush();
 
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
@@ -482,7 +485,8 @@ void run_yolo_complete() {
 
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V164 (YOLO + camara_direct V162 pipeline) ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V166 (V165 + animated HUD chrome) ===\r\n");
+    hud_init();
 
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
     if (!mbox_call(MBOX_CH_PROP)) uart_puts("[GPU] ERROR: No mailbox response\n");

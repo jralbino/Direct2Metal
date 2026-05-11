@@ -39,6 +39,8 @@ bool g_use_camera = false;
 static uint16_t s_ae_cit   = 0x046Bu;   /* matches imx708_regs.h initial */
 static uint32_t s_ae_frame = 0u;
 
+extern "C" uint16_t imx708_ae_cit_get() { return s_ae_cit; }
+
 static uint32_t ae_sample_mean(const uint8_t* raw) {
     uint32_t sum = 0;
     for (uint32_t y = 8u; y < 864u; y += 27u) {           /* 32 rows */
