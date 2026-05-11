@@ -101,14 +101,15 @@ static inline void isp_pixel(uint8_t Rin, uint8_t Gin, uint8_t Bin,
 #define SENSOR_BLK_W  (SENSOR_PX_W / 2)   /* 768 Bayer blocks horizontally   */
 #define SENSOR_BLK_H  (SENSOR_PX_H / 2)   /* 432 Bayer blocks vertically     */
 
-/* ── YOLO path: 864×864 center crop → 192×192 ─────────────────────────────── */
-/* B1 (2026-05-11): dropped from 320 to 192. ~2.7× fewer FLOPs in the
- * inference pipeline. Must match YOLO_IN in kernel.cpp. */
-#define OUT_W    192
-#define OUT_H    192
+/* ── YOLO path: 864×864 center crop → 320×320 ─────────────────────────────── */
+/* Must match YOLO_IN in kernel.cpp. Reverted to 320 after false-positive
+ * tests at 192 — more spatial detail helps the model discriminate similar
+ * classes (cylindrical objects no longer all collapse to fire-hydrant). */
+#define OUT_W    320
+#define OUT_H    320
 #define CROP_X   336                      /* (1536 - 864) / 2                */
 #define CROP_SZ  864
-#define STEP_Q8  1152                     /* 864/192 = 4.5 in Q8             */
+#define STEP_Q8  691                      /* 864/320 = 2.7 in Q8             */
 
 /* ── Framebuffer path: full 1536×864 → 640×360 letterboxed on 640×480 ──── */
 /* V135: native aspect 1536:864 = 16:9. At 640 wide: 640 × (864/1536) = 360.

@@ -59,11 +59,12 @@ unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_
 extern "C" const float weights_start[]; extern "C" const float weights_end[];
 extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
 
-/* B1 — YOLO inference resolution. 192 = 3 × 2⁶ → divisible by stride 32.
- * Lowering from 320 cuts FLOPs ~2.7× (192² / 320² ≈ 36%). Same backbone,
- * same weights — pure runtime scaling. Spatial dims derived: S2=YOLO_IN/2,
- * S4=YOLO_IN/4, etc. */
-#define YOLO_IN  192
+/* B1 — YOLO inference resolution. Must be divisible by stride 32. 192 is
+ * 2.7× cheaper than 320 in FLOPs but the model's discrimination drops a lot
+ * — at 192² distant/small objects are <5×5 px in the P3 grid (stride 8).
+ * Bumped back to 320 to A/B-test whether false positives were a resolution
+ * issue or a model-capacity issue. fps cost: ~5.2 → ~1.9. */
+#define YOLO_IN  320
 #define YOLO_S2  (YOLO_IN / 2)
 #define YOLO_S4  (YOLO_IN / 4)
 #define YOLO_S8  (YOLO_IN / 8)
@@ -528,7 +529,7 @@ void run_yolo_complete() {
 
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V167 (HUD primary + camera thumbnail) ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V168 (YOLO 320×320 A/B test) ===\r\n");
     hud_init();
 
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
