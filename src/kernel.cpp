@@ -22,6 +22,9 @@ extern void video_flush();
 // Framebuffer pointer and pitch exported from video.cpp
 extern unsigned char* lfb;
 extern uint32_t pitch;
+// Multi-core debayer (declared in multicore.h) — needs the raw frame pointer.
+extern const uint8_t* unicam_frame_ptr();
+extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
 
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
@@ -355,24 +358,14 @@ void run_yolo_complete() {
         }
     }
 
-    // V138: 4-way rotation every ~40 frames to isolate the row-half-swap:
-    //   phase 0: debayer normal   (reads DMA buffer, Bayer interp)
-    //   phase 1: raw grayscale    (reads DMA buffer byte-for-byte)
-    //   phase 2: synthetic L-R    (NO DMA read — pure fb write test)
-    //   phase 3: synthetic gray   (uses grayscale loop BUT computes src values,
-    //                              no DRAM read, no Bayer) — isolates loop bug.
-    extern void debayer_diag_raw_grayscale_fb(uint8_t* fb, uint32_t pitch);
-    extern void debayer_diag_gradient_fb(uint8_t* fb, uint32_t pitch);
-    extern void debayer_diag_synthetic_gray_fb(uint8_t* fb, uint32_t pitch);
+    /* Render camera frame to FB via multi-core debayer (cores 1-3 do bands).
+     * Sequential with YOLO inference: cores 1-3 are reused below for
+     * parallel_conv2d/conv1x1, so we must wait here before YOLO dispatches. */
     if (g_use_camera) {
-        /* V153: V152 proved HDMI path is clean (synthetic L-dark/R-bright rendered
-         * perfectly). Re-enable normal camera render; the V153 deshift pass now
-         * does 4-state classification + row-clone fallback before debayer runs. */
-        camera_render_fullres((uint8_t*)lfb, pitch);
-        (void)debayer_diag_raw_grayscale_fb;
-        (void)debayer_diag_gradient_fb;
-        (void)debayer_diag_synthetic_gray_fb;
-        video_flush();
+        parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
+        parallel_debayer_wait();
+        /* Flush deferred until after bbox overlay so the user sees one
+         * consistent frame with boxes, not flash-then-boxes. */
     } else {
         draw_fill(0xFF222222);
         draw_tensor_image_fullscreen(input_img);
@@ -444,72 +437,9 @@ void run_yolo_complete() {
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
 }
 
-/* Camera-only pipeline mirroring camara_direct V162:
- *
- *   prime:   capture frame 0; dispatch its debayer async (cores 1-3)
- *   steady:  capture frame N+1  ──▶ runs in parallel with debayer of frame N
- *            sync workers       ──▶ frame N now rendered to FB
- *            flush              ──▶ frame N displayed
- *            dispatch debayer of N+1, swap "previous frame" pointer
- *
- * Cost per iter ≈ max(FSI wait ≈21 ms, 3-core debayer ≈7 ms) + flush.
- * Expected total ≈22 ms (≈45 fps). */
-extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
-extern const uint8_t* unicam_frame_ptr();
-
-static void run_camera_only() {
-    static bool s_primed = false;
-    if (!s_primed) {
-        if (g_use_camera) {
-            debayer_letterbox_clear((uint8_t*)lfb, pitch);
-            camera_capture();
-            parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
-        } else {
-            draw_fill(0xFF202020);
-            video_flush();
-        }
-        s_primed = true;
-        return;
-    }
-
-    watchdog_kick();
-    const unsigned long f  = get_timer_freq();
-    const unsigned long t0 = get_timer_count();
-
-    if (g_use_camera) {
-        camera_capture();                          /* FSI wait, overlaps with prev debayer */
-    }
-    const unsigned long t1 = get_timer_count();
-
-    if (g_use_camera) {
-        parallel_debayer_wait();                   /* sync: prev frame fully rendered */
-        video_flush();                             /* show prev frame */
-    } else {
-        draw_fill(0xFF202020);
-        video_flush();
-    }
-    const unsigned long t2 = get_timer_count();
-
-    if (g_use_camera) {
-        parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
-    }
-    const unsigned long t3 = get_timer_count();
-
-    const unsigned long cap_ms     = (t1 - t0) * 1000UL / f;
-    const unsigned long flush_ms   = (t2 - t1) * 1000UL / f;
-    const unsigned long disp_ms    = (t3 - t2) * 1000UL / f;
-    const unsigned long tot_ms     = (t3 - t0) * 1000UL / f;
-    uart_puts("[CAM] cap=");    uart_dec((int)cap_ms);
-    uart_puts(" sync+flush=");  uart_dec((int)flush_ms);
-    uart_puts(" disp=");        uart_dec((int)disp_ms);
-    uart_puts(" total=");       uart_dec((int)tot_ms);
-    if (tot_ms > 0) { uart_puts(" fps="); uart_dec((int)(1000UL / tot_ms)); }
-    uart_puts("\n");
-}
-
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V163 (camera-only, YOLO disabled) ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V164 (YOLO + camara_direct V162 pipeline) ===\r\n");
 
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
     if (!mbox_call(MBOX_CH_PROP)) uart_puts("[GPU] ERROR: No mailbox response\n");
@@ -522,13 +452,13 @@ extern "C" void kernel_main() {
     if (!camera_init()) uart_puts("[CAM] No camera — test mode\n");
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
 #ifdef SIMULATION
-    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_camera_only();
+    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_yolo_complete();
     uart_puts("[SIM] All simulation frames complete — exiting QEMU.\n");
     register uint64_t _x0 asm("x0") = 0x20026;
     register uint64_t _x1 asm("x1") = 0;
     asm volatile("hlt #0xf000" :: "r"(_x0), "r"(_x1));
     __builtin_unreachable();
 #else
-    while(1) run_camera_only();
+    while(1) run_yolo_complete();
 #endif
 }

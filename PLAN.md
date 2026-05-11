@@ -1,7 +1,7 @@
 # Direct2Metal — Plan de Desarrollo
 
 > Última actualización: 2026-05-10
-> Estado: **V163 (camera-only)** — V162 ISP/lane fixes portados desde `camara_direct/`, pipeline async multi-core, 52 fps con YOLO desactivado. Cámara byte-exact con libcamera. Siguiente: re-integrar YOLO.
+> Estado: **V164** — YOLO re-activado sobre el pipeline V163. Detecciones COCO funcionando (c=0 person, c=40 wine glass, ~65% conf). **~1.9 fps** (518 ms/frame, inferencia FP32 domina). Cámara a calidad libcamera.
 
 ---
 
@@ -32,11 +32,33 @@ Barras horizontales y shift izquierda-derecha persisten — causa no es captura 
 | V117 | Sim BGGR fix, tech debt T1/T2/T3 resueltos |
 | V118 | Base V111 + BGGR + FS-to-FS capture + brightness stretch |
 | V119–V162 | (Subproyecto `camara_direct/`) — debug del lane-swap, ISP libcamera, multi-core debayer. Ver `camara_direct/PROGRESS.md`. |
-| **V163** | **Back-port V162 al padre: BGGR flip 0x0101=0x03, HS clock continuo 0x0310=0x01, LSC LUT, ISP libcamera, lanes runtime-correctos, ping-pong DMA, multi-core debayer async, YOLO desactivado → 52 fps cámara-sólo.** |
+| V163 | Back-port V162 al padre: BGGR flip 0x0101=0x03, HS clock continuo 0x0310=0x01, LSC LUT, ISP libcamera, lanes runtime-correctos, ping-pong DMA, multi-core debayer async, YOLO desactivado → 52 fps cámara-sólo. |
+| **V164** | **YOLO re-activado sobre V163. `run_yolo_complete` usa `parallel_debayer_start/wait` para el render FB. Detecciones COCO confirmadas en HW (person 66%, wine glass 65%). ~1.9 fps, inferencia FP32 domina.** |
 
 ---
 
-## Estado actual — V163 (camera-only)
+## Estado actual — V164 (YOLO + pipeline V163)
+
+### Resueltos en V164
+- ✅ **YOLO end-to-end funcionando**: `[DET] c=0 %=66` (person) y `[DET] c=40 %=65` (wine glass) confirmados sobre escena real. Confirma que el ISP V162 entrega el input correcto al modelo.
+- ✅ **FB render multi-core en modo YOLO**: `parallel_debayer_start/wait` reemplaza al `camera_render_fullres` single-core (~21 ms → ~7 ms). El render no domina; YOLO sí.
+- ✅ **Bboxes coherentes con frame mostrado**: un solo `video_flush()` al final del iter (después de overlay) elimina el flash sin boxes.
+- ✅ **Eliminado `run_camera_only`** (modo prueba V163). Si necesario para diagnóstico, revivir desde commit `c3461a4`.
+
+### Métricas HW (2026-05-10)
+```
+[F41] [DET] c=0  %=66   → person
+[T] 518ms        → 1.93 fps
+[F58] [DET] c=40 %=65   → wine glass
+[T] 520ms        → 1.92 fps
+```
+
+### Cuello de botella actual
+Inferencia FP32 con NEON 4-wide sobre 4 cores ≈ 500 ms / frame. Cámara (~25 ms) y render (~7 ms) son ruido al lado. Optimización en Track B.
+
+---
+
+## Estado V163 — pipeline cámara (sin YOLO)
 
 ### Resueltos en V163
 - ✅ **Lane swap**: `DAT1=0x06000005` (clock-pattern, no data) + `0x0310=0x01` (HS continuo). Escenas reales sin bytes mezclados.
@@ -77,14 +99,21 @@ Supera al subproyecto (`wait=21 fps=47.61`) porque el padre debayera 640×480 en
 
 ---
 
-## Track B — Performance *(paralelo)*
+## Track B — Performance YOLO (siguiente foco tras V164)
 
-| # | Optimización | Ganancia estimada | Esfuerzo |
-|:--|:-------------|:-----------------|:---------|
-| B1 | INT8 quantization | −300ms → ~4.7 FPS | Alto |
-| B2 | conv1x1 8-ch | ~10ms | Bajo |
-| B3 | PRFM prefetch | 5–15% | Medio |
-| B4 | L0 stem K=6 unroll | ~5–10ms | Bajo |
+Cuello identificado: inferencia FP32 ~500 ms. Plan en orden ganancia/esfuerzo:
+
+| # | Fase | Esfuerzo | fps acumulado | Notas |
+|:--|:-----|:--------:|:--------------|:------|
+| B0 | **Profilar por capa** | 1 h | (sin cambio) | UART por etapa: `t_l0`, `t_backbone`, `t_neck`, `t_nms` ya existen, sólo falta imprimirlos. |
+| B1 | **Resolución 320 → 192** | 1–2 d | **~5** | Cambia `CROP_SZ`, `STEP_Q8`, `OUT_W/H`, anchors / grids. YOLOv5n entrenado a 640 tolera 192. mAP cae ~20%. |
+| B2 | **NEON 8-ch + PRFM** | 3–4 d | **~6** | Extender `conv2d_partial_8ch` a `conv1x1`, `prfm pldl1keep` para weights próximos. |
+| B3 | **INT8 quantization** | 1–2 sem | **~13–15** | Calibrar offline con ~50 frames reales, kernels con `vmlal_s16` + `vmovl_s8`. A53 no tiene SDOT. Memoria 4× menos → cache hits. |
+| B4 | **Frame-skip detección** | 0.5 d | **~25 percibido** | Inferir cada N frames, mantener bboxes. Cámara sigue a 52 fps. |
+| B5 | **Winograd F(2×2, 3×3)** | 1 sem | **+30% sobre 3×3** | Sólo si profiling muestra que convs 3×3 dominan tras INT8. |
+| B6 | **Async cámara + YOLO** | 1 d | **+3–5%** | Sólo vale la pena después de B3 cuando YOLO baje a ~50 ms. |
+
+**Stop realista** con A53 bare-metal: ~15 fps reales / 25 percibidos tras B1+B2+B3+B4. Para más: Pi 4/5 (A72/A76 con SDOT) o modelo más pequeño (NanoDet, PicoDet).
 
 ---
 
