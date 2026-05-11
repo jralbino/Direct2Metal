@@ -6,13 +6,10 @@
 #include <arm_neon.h>
 
 extern void uart_puts(const char* s);
-/* Forward decls — must be at file scope (NOT in an extern "C" block) so the
- * C++-mangled names match the definitions in camera_debayer.cpp / hud.cpp. */
+/* Forward decl — must be at file scope (NOT in an extern "C" block) so the
+ * C++-mangled name matches the definition in camera_debayer.cpp. */
 void debayer_raw10_to_fb_band(const unsigned char* raw, unsigned char* fb,
                               unsigned int pitch, int disp_y_start, int disp_y_end);
-void hud_render(unsigned char* fb, unsigned int pitch);
-extern unsigned char* lfb;
-extern unsigned int   pitch;
 extern "C" void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in,
                                          const float* w, const float* b,
                                          int C_out_start, int C_out_end, int C_out_total,
@@ -306,24 +303,8 @@ static void dispatch_task_and_wait() {
     __atomic_fetch_add((int*)&task_epoch, 1, __ATOMIC_RELEASE); asm volatile("sev");
 }
 
-/* S3: finite timeout on worker wait — degrades to single-core on hang.
- *
- * V166: while waiting on cores 1-3, render the HUD chrome into the FB. This
- * is core 0's idle time — workers are computing, FB writes don't compete
- * with their reads of separate tensor buffers (different memory regions).
- * Each conv layer triggers one HUD render, ~30 layers per YOLO cycle →
- * ~30 renders/cycle × ~5 cycles/sec = ~150 renders/sec perceived chrome
- * refresh rate. The actual tick rate is irregular (depends on which layers
- * are dispatched) but more than enough to make the FPS sweep + breathing
- * SCANNING animation look smooth. */
+/* S3: finite timeout on worker wait — degrades to single-core on hang */
 static void wait_for_workers() {
-    /* Render HUD only if workers actually still busy — avoids 1.5 ms cost
-     * when the wait would have been a no-op (rare, but happens for trivial
-     * 1×1 convs on small spatial sizes). */
-    if (lfb && __atomic_load_n((int*)&done_count, __ATOMIC_ACQUIRE) < 3) {
-        hud_render(lfb, pitch);
-    }
-
     unsigned long timeout = DISPATCH_TIMEOUT;
     while (__atomic_load_n((int*)&done_count, __ATOMIC_ACQUIRE) < 3) {
         asm volatile("yield");

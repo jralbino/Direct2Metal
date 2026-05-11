@@ -27,6 +27,7 @@ extern uint32_t pitch;
 extern const uint8_t* unicam_frame_ptr();
 extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
 extern "C" uint16_t imx708_ae_cit_get();
+extern const char* const coco_names[80];      /* defined in hud.cpp */
 
 volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
 volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
@@ -384,23 +385,41 @@ void run_yolo_complete() {
         }
     }
 
-    /* Render camera frame to FB via multi-core debayer (cores 1-3 do bands).
-     * Sequential with YOLO inference: cores 1-3 are reused below for
-     * parallel_conv2d/conv1x1, so we must wait here before YOLO dispatches. */
+    /* V167 layout: dark canvas (no full camera image) + bboxes + class labels.
+     * Camera shown as a 192×108 thumbnail in the top-right of the canvas.
+     *
+     *   y=0..59   HUD top bar
+     *   y=60..419 canvas (BLACK) + bboxes in CAM_DISP_* area + thumbnail
+     *             on the right
+     *   y=420..479 HUD bottom bar (detection cards)
+     *
+     * Skipping the full multi-core debayer saves ~7 ms/frame and lets the
+     * thumbnail single-core (~0.5–1 ms). */
+    extern void debayer_raw10_to_thumbnail(const uint8_t* raw, uint8_t* fb,
+                                           uint32_t pitch, int x_off, int y_off,
+                                           int thumb_w, int thumb_h);
+
     if (g_use_camera) {
-        parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
-        parallel_debayer_wait();
-        /* Flush deferred until after bbox overlay so the user sees one
-         * consistent frame with boxes, not flash-then-boxes. */
+        /* Clear the canvas region (rows 60..419) to solid black. */
+        for (int y = 60; y < 420; y++) {
+            uint32_t* row = (uint32_t*)((uint8_t*)lfb + (uint32_t)y * pitch);
+            for (int x = 0; x < 640; x++) row[x] = 0xFF000000u;
+        }
+        /* Camera thumbnail in the top-right corner of the canvas. */
+        const int THUMB_W = 192, THUMB_H = 108;
+        const int THUMB_X = 640 - THUMB_W - 8;   /* 440 */
+        const int THUMB_Y = 64;
+        debayer_raw10_to_thumbnail(unicam_frame_ptr(), (uint8_t*)lfb, pitch,
+                                   THUMB_X, THUMB_Y, THUMB_W, THUMB_H);
+        /* 1-px accent border around the thumbnail */
+        draw_rect(THUMB_X - 1, THUMB_Y - 1, THUMB_W + 2, THUMB_H + 2,
+                  0xFF00C0FFu, 1);
     } else {
         draw_fill(0xFF222222);
         draw_tensor_image_fullscreen(input_img);
     }
 
-    // Scale factors and offsets for mapping YOLO coords (320×320) to framebuffer coords.
-    // V124 camera mode: YOLO square (864×864 center crop of sensor) is displayed
-    // as 360×360 at x=[140,500] y=[60,420] inside the 640×360 16:9 image.
-    // Test mode: non-uniform 2.0×H / 1.5×V, image at x=[0,640] y=[0,480].
+    /* Bbox scale: YOLO_IN²-space → CAM_DISP square at (CAM_DISP_XOFF, CAM_DISP_YOFF). */
     const float disp_scale  = g_use_camera ? (CAM_DISP_W / (float)YOLO_IN) : (640.0f / (float)YOLO_IN);
     const float disp_scaleY = g_use_camera ? (CAM_DISP_H / (float)YOLO_IN) : (480.0f / (float)YOLO_IN);
     const int   disp_xoff   = g_use_camera ? CAM_DISP_XOFF : 0;
@@ -431,8 +450,28 @@ void run_yolo_complete() {
             if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
 
             if (box_w > 2 && box_h > 2) {
-                uint32_t color = (preds[ii].cls == 0) ? 0xFF0000FF : 0xFF00FFFF;
+                /* Color cycle per class so different objects get different colors. */
+                static const uint32_t bbox_palette[6] = {
+                    0xFF00C0FFu, 0xFF00FF80u, 0xFFFF00FFu,
+                    0xFFFFC000u, 0xFF80FF00u, 0xFFFF4080u
+                };
+                uint32_t color = bbox_palette[((unsigned)preds[ii].cls) % 6];
                 draw_rect(left, top, box_w, box_h, color, 3);
+
+                /* Class label above the bbox: "name 67%" */
+                const char* nm = (preds[ii].cls >= 0 && preds[ii].cls < 80)
+                                 ? coco_names[preds[ii].cls] : "?";
+                int pct = (int)(preds[ii].conf * 100.0f);
+                if (pct > 99) pct = 99;
+                char lbl[40]; int ln = 0;
+                while (*nm && ln < 30) lbl[ln++] = *nm++;
+                lbl[ln++] = ' ';
+                if (pct >= 10) lbl[ln++] = '0' + (pct / 10);
+                lbl[ln++] = '0' + (pct % 10);
+                lbl[ln++] = '%';
+                lbl[ln] = '\0';
+                int label_y = (top - 18 >= disp_yoff) ? top - 18 : top + 4;
+                draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 1);
             }
         }
     }
@@ -485,7 +524,7 @@ void run_yolo_complete() {
 
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V166 (V165 + animated HUD chrome) ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V167 (HUD primary + camera thumbnail) ===\r\n");
     hud_init();
 
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;

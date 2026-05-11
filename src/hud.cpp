@@ -174,17 +174,9 @@ static void render_bottom_bar(uint8_t* fb, uint32_t pitch) {
     fill_rect(fb, pitch, 0, 420, 640, 60, COL_BG);
     fill_rect(fb, pitch, 0, 420, 640, 2, COL_ACCENT);
 
-    /* If nothing detected: "SCANNING..." with breathing intensity */
-    if (s_hud.n_preds == 0) {
-        /* Breathing brightness via tick % 60 (period ~1s at 60fps). */
-        uint32_t phase = s_hud.tick % 60u;
-        uint32_t bright = (phase < 30u) ? phase : (60u - phase);  /* 0..30 */
-        uint32_t v = 80u + (bright * 4u);                          /* 80..200 */
-        if (v > 255u) v = 255u;
-        uint32_t col = 0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8);
-        draw_text(220, 440, "SCANNING . . .", col, COL_BG, 2);
-        return;
-    }
+    /* No detections → leave the bar empty (just the title strip). Avoids
+     * any animation chrome that misbehaves at low refresh. */
+    if (s_hud.n_preds == 0) return;
 
     /* Lay out up to 3 cards across 640 px: 200 px each + 10 gap. */
     const int card_w = 200;

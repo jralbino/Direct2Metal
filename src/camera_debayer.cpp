@@ -240,3 +240,42 @@ void debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch) {
     debayer_raw10_to_fb_band(unicam_frame_ptr(), fb, pitch, 0, DISP_H);
 }
 
+/* Thumbnail debayer — full sensor (1536×864) → thumb_w × thumb_h with the
+ * same BGGR + ISP pipeline. Positions output at (x_off, y_off) in fb.
+ *
+ * Single-core, ~0.5–1 ms for 192×108 thumbnails. Used when we don't want to
+ * spend the multi-core debayer budget on a full-res camera image. */
+void debayer_raw10_to_thumbnail(const uint8_t* raw, uint8_t* fb, uint32_t pitch,
+                                int x_off, int y_off, int thumb_w, int thumb_h) {
+    if (!k_gamma_ready) build_gamma_lut();
+    const int byte_stride = 1920;
+
+    for (int oy = 0; oy < thumb_h; oy++) {
+        int blk_y = (oy * SENSOR_BLK_H) / thumb_h;
+        int src_y = blk_y * 2;
+        if (src_y + 1 >= SENSOR_PX_H) src_y = SENSOR_PX_H - 2;
+
+        const uint8_t* row0 = raw + src_y       * byte_stride;
+        const uint8_t* row1 = raw + (src_y + 1) * byte_stride;
+
+        uint32_t* fb_row = (uint32_t*)(fb + (uint32_t)(y_off + oy) * pitch);
+
+        for (int ox = 0; ox < thumb_w; ox++) {
+            int blk_x = (ox * SENSOR_BLK_W) / thumb_w;
+            int src_x = blk_x * 2;
+
+            uint8_t B  = raw10_msb8(row0, src_x);
+            uint8_t Gb = raw10_msb8(row0, src_x + 1);
+            uint8_t Gr = raw10_msb8(row1, src_x);
+            uint8_t R  = raw10_msb8(row1, src_x + 1);
+            uint8_t G  = (uint8_t)(((unsigned)Gr + Gb) >> 1);
+
+            uint8_t Ro, Go, Bo;
+            isp_pixel(R, G, B, &Ro, &Go, &Bo);
+
+            fb_row[x_off + ox] =
+                0xFF000000u | ((uint32_t)Bo << 16) | ((uint32_t)Go << 8) | (uint32_t)Ro;
+        }
+    }
+}
+
