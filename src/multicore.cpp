@@ -166,6 +166,11 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                             float32x4_t s1l=vdupq_n_f32(0.0f), s1h=vdupq_n_f32(0.0f);
                             float32x4_t s2l=vdupq_n_f32(0.0f), s2h=vdupq_n_f32(0.0f);
                             for (int ci = 0; ci < C_in; ci++) {
+                                /* PRFM next ci's input + weights tile (B2). */
+                                if (ci + 1 < C_in) {
+                                    __builtin_prefetch(in + (ci+1)*HW_in + io, 0, 3);
+                                    __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
+                                }
                                 const float* ip  = in + ci*HW_in + io;
                                 const float* wci = wg + ci * 72; /* 9 pos × 8 floats */
                                 /* Row 0 */

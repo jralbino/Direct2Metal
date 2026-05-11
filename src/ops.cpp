@@ -50,8 +50,19 @@ static inline float32x4_t neon_silu(float32x4_t x) {
     return vmulq_f32(x, recip);
 }
 
-/* conv1x1 kernel: p_step-outer (cache-friendly — input tile loaded once, reused
- * across all output channel groups). Bias recomputed per tile (negligible cost). */
+/* conv1x1 kernel: p_step-outer tiled across HW for L1-cache locality on the
+ * input tile (reused across all output channel groups in the tile).
+ *
+ * B2 (2026-05-11): 8-output-channel hot path. With C_out=64/128/256 (typical
+ * YOLOv5n head/neck), this halves the C_out loop iteration count and doubles
+ * the work-per-input-load. A53 has 32 NEON regs so the 8 accumulators + 1
+ * v_in + 8 dup-weights fit easily.
+ *
+ * PRFM (pldl1keep, locality=3) prefetches the next ci's input tile during
+ * the current ci iter — at 192² input the smaller layers (L6/L8) fit in L1
+ * already, but L2/L4 (C_in × HW × 4 B = ~10-40 KB / channel) benefit.
+ *
+ * Falls back to 4-ch path for the remainder, then scalar tail. */
 void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const float* w, const float* b, int C_out_start, int C_out_end, int C_out_total, bool do_silu, float* out) {
     int HW = H * W;
     #define TILE_P 32
@@ -59,8 +70,83 @@ void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const floa
     for (int p_step = 0; p_step < HW; p_step += TILE_P) {
         int p_max = (p_step + TILE_P < HW) ? p_step + TILE_P : HW;
         int co = C_out_start;
+
+        /* ───── 8-channel hot path ───── */
+        for (; co <= C_out_end - 8; co += 8) {
+            float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
+            float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
+            float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
+            float32x4_t bias3 = vdupq_n_f32(b ? b[co+3] : 0.0f);
+            float32x4_t bias4 = vdupq_n_f32(b ? b[co+4] : 0.0f);
+            float32x4_t bias5 = vdupq_n_f32(b ? b[co+5] : 0.0f);
+            float32x4_t bias6 = vdupq_n_f32(b ? b[co+6] : 0.0f);
+            float32x4_t bias7 = vdupq_n_f32(b ? b[co+7] : 0.0f);
+            const float* w0 = w + (co+0) * C_in;
+            const float* w1 = w + (co+1) * C_in;
+            const float* w2 = w + (co+2) * C_in;
+            const float* w3 = w + (co+3) * C_in;
+            const float* w4 = w + (co+4) * C_in;
+            const float* w5 = w + (co+5) * C_in;
+            const float* w6 = w + (co+6) * C_in;
+            const float* w7 = w + (co+7) * C_in;
+            float* out0 = out + (co+0) * HW;
+            float* out1 = out + (co+1) * HW;
+            float* out2 = out + (co+2) * HW;
+            float* out3 = out + (co+3) * HW;
+            float* out4 = out + (co+4) * HW;
+            float* out5 = out + (co+5) * HW;
+            float* out6 = out + (co+6) * HW;
+            float* out7 = out + (co+7) * HW;
+            int p = p_step;
+            for (; p <= p_max - 4; p += 4) {
+                float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
+                float32x4_t acc4 = bias4, acc5 = bias5, acc6 = bias6, acc7 = bias7;
+                for (int ci = 0; ci < C_in; ci++) {
+                    /* PRFM: pull next-ci tile into L1 ahead of the load. */
+                    if (ci + 1 < C_in)
+                        __builtin_prefetch(in + (ci+1) * HW + p, 0, 3);
+                    float32x4_t v_in = vld1q_f32(in + ci * HW + p);
+                    acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci]));
+                    acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));
+                    acc2 = vmlaq_f32(acc2, v_in, vdupq_n_f32(w2[ci]));
+                    acc3 = vmlaq_f32(acc3, v_in, vdupq_n_f32(w3[ci]));
+                    acc4 = vmlaq_f32(acc4, v_in, vdupq_n_f32(w4[ci]));
+                    acc5 = vmlaq_f32(acc5, v_in, vdupq_n_f32(w5[ci]));
+                    acc6 = vmlaq_f32(acc6, v_in, vdupq_n_f32(w6[ci]));
+                    acc7 = vmlaq_f32(acc7, v_in, vdupq_n_f32(w7[ci]));
+                }
+                if (do_silu) {
+                    acc0 = neon_silu(acc0); acc1 = neon_silu(acc1);
+                    acc2 = neon_silu(acc2); acc3 = neon_silu(acc3);
+                    acc4 = neon_silu(acc4); acc5 = neon_silu(acc5);
+                    acc6 = neon_silu(acc6); acc7 = neon_silu(acc7);
+                }
+                vst1q_f32(out0+p, acc0); vst1q_f32(out1+p, acc1);
+                vst1q_f32(out2+p, acc2); vst1q_f32(out3+p, acc3);
+                vst1q_f32(out4+p, acc4); vst1q_f32(out5+p, acc5);
+                vst1q_f32(out6+p, acc6); vst1q_f32(out7+p, acc7);
+            }
+            for (; p < p_max; p++) {
+                float s0=b?b[co+0]:0.0f, s1=b?b[co+1]:0.0f, s2=b?b[co+2]:0.0f, s3=b?b[co+3]:0.0f;
+                float s4=b?b[co+4]:0.0f, s5=b?b[co+5]:0.0f, s6=b?b[co+6]:0.0f, s7=b?b[co+7]:0.0f;
+                for (int ci = 0; ci < C_in; ci++) {
+                    float v = in[ci*HW+p];
+                    s0+=w0[ci]*v; s1+=w1[ci]*v; s2+=w2[ci]*v; s3+=w3[ci]*v;
+                    s4+=w4[ci]*v; s5+=w5[ci]*v; s6+=w6[ci]*v; s7+=w7[ci]*v;
+                }
+                if (do_silu) {
+                    s0*=mini_sigmoidf(s0); s1*=mini_sigmoidf(s1);
+                    s2*=mini_sigmoidf(s2); s3*=mini_sigmoidf(s3);
+                    s4*=mini_sigmoidf(s4); s5*=mini_sigmoidf(s5);
+                    s6*=mini_sigmoidf(s6); s7*=mini_sigmoidf(s7);
+                }
+                out0[p]=s0; out1[p]=s1; out2[p]=s2; out3[p]=s3;
+                out4[p]=s4; out5[p]=s5; out6[p]=s6; out7[p]=s7;
+            }
+        }
+
+        /* ───── 4-channel path for remainder ───── */
         for (; co <= C_out_end - 4; co += 4) {
-            /* bias computed once per (tile, co-group): 4 cheap vdup vs re-reading in[] */
             float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
             float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
             float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
@@ -77,6 +163,8 @@ void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const floa
             for (; p <= p_max - 4; p += 4) {
                 float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
                 for (int ci = 0; ci < C_in; ci++) {
+                    if (ci + 1 < C_in)
+                        __builtin_prefetch(in + (ci+1) * HW + p, 0, 3);
                     float32x4_t v_in = vld1q_f32(in + ci * HW + p);
                     acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci]));
                     acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));

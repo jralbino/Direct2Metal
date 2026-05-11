@@ -1,7 +1,7 @@
 # Direct2Metal — Plan de Desarrollo
 
-> Última actualización: 2026-05-10
-> Estado: **V164** — YOLO re-activado sobre el pipeline V163. Detecciones COCO funcionando (c=0 person, c=40 wine glass, ~65% conf). **~1.9 fps** (518 ms/frame, inferencia FP32 domina). Cámara a calidad libcamera.
+> Última actualización: 2026-05-11
+> Estado: **V165** — B0 (per-layer profiling UART) + B1 (192×192 inference) + B2 (NEON 8-ch conv1x1 + PRFM). Ganancia esperada ×2.7×1.15 ≈ ×3.1, **fps target ~6**. B3 (INT8) plan en `tools/B3_INT8_PLAN.md`.
 
 ---
 
@@ -33,7 +33,8 @@ Barras horizontales y shift izquierda-derecha persisten — causa no es captura 
 | V118 | Base V111 + BGGR + FS-to-FS capture + brightness stretch |
 | V119–V162 | (Subproyecto `camara_direct/`) — debug del lane-swap, ISP libcamera, multi-core debayer. Ver `camara_direct/PROGRESS.md`. |
 | V163 | Back-port V162 al padre: BGGR flip 0x0101=0x03, HS clock continuo 0x0310=0x01, LSC LUT, ISP libcamera, lanes runtime-correctos, ping-pong DMA, multi-core debayer async, YOLO desactivado → 52 fps cámara-sólo. |
-| **V164** | **YOLO re-activado sobre V163. `run_yolo_complete` usa `parallel_debayer_start/wait` para el render FB. Detecciones COCO confirmadas en HW (person 66%, wine glass 65%). ~1.9 fps, inferencia FP32 domina.** |
+| V164 | YOLO re-activado sobre V163. `run_yolo_complete` usa `parallel_debayer_start/wait` para el render FB. Detecciones COCO confirmadas en HW (person 66%, wine glass 65%). ~1.9 fps, inferencia FP32 domina. |
+| **V165** | **B0: per-layer profiling UART `[P] cap= l0= bb= neck= head= render=`. B1: inference 320→192 (parametrizado por `YOLO_IN` macro, todas las dimensiones espaciales derivadas). B2: 8-output-channel hot path en `ops_neon_conv1x1_kernel` + `__builtin_prefetch(pldl1keep)` en conv1x1 y conv2d_partial_8ch. B3 plan documentado en `tools/B3_INT8_PLAN.md`.** |
 
 ---
 

@@ -56,10 +56,24 @@ unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_
 extern "C" const float weights_start[]; extern "C" const float weights_end[];
 extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
 
+/* B1 — YOLO inference resolution. 192 = 3 × 2⁶ → divisible by stride 32.
+ * Lowering from 320 cuts FLOPs ~2.7× (192² / 320² ≈ 36%). Same backbone,
+ * same weights — pure runtime scaling. Spatial dims derived: S2=YOLO_IN/2,
+ * S4=YOLO_IN/4, etc. */
+#define YOLO_IN  192
+#define YOLO_S2  (YOLO_IN / 2)
+#define YOLO_S4  (YOLO_IN / 4)
+#define YOLO_S8  (YOLO_IN / 8)
+#define YOLO_S16 (YOLO_IN / 16)
+#define YOLO_S32 (YOLO_IN / 32)
+
 static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000];
-static float cam_frame[3 * 320 * 320];
-static float save_L4[64 * 40 * 40]; static float save_L6[128 * 20 * 20]; static float save_Neck_P5[128 * 10 * 10];
-static float save_Neck_P4[64 * 20 * 20]; static float save_P3_Head[64 * 40 * 40]; static float save_P4_Head[128 * 20 * 20];
+static float cam_frame[3 * YOLO_IN * YOLO_IN];
+static float save_L4[64 * YOLO_S8 * YOLO_S8];   static float save_L6[128 * YOLO_S16 * YOLO_S16];
+static float save_Neck_P5[128 * YOLO_S32 * YOLO_S32];
+static float save_Neck_P4[64 * YOLO_S16 * YOLO_S16];
+static float save_P3_Head[64 * YOLO_S8 * YOLO_S8];
+static float save_P4_Head[128 * YOLO_S16 * YOLO_S16];
 
 static float mini_exp(float x) {
     if (x > 88.0f) { return 3.40282347e+38f; } // <--- Corregido el warning de indentación
@@ -216,11 +230,14 @@ static uint32_t crc32_sw(const uint8_t* data, size_t len) {
 static int heartbeat_counter = 0;
 
 static void draw_tensor_image_fullscreen(const float* img) {
-    const float* dst_r = img; const float* dst_g = img + (320 * 320); const float* dst_b = img + (2 * 320 * 320);
+    const float* dst_r = img;
+    const float* dst_g = img + (YOLO_IN * YOLO_IN);
+    const float* dst_b = img + (2 * YOLO_IN * YOLO_IN);
     for (int y = 0; y < 480; y++) {
-        int src_y = (y * 320) / 480;
+        int src_y = (y * YOLO_IN) / 480;
         for (int x = 0; x < 640; x++) {
-            int src_x = (x * 320) / 640; int idx = src_y * 320 + src_x;
+            int src_x = (x * YOLO_IN) / 640;
+            int idx = src_y * YOLO_IN + src_x;
             int r = (int)(dst_r[idx] * 255.0f); int g = (int)(dst_g[idx] * 255.0f); int b = (int)(dst_b[idx] * 255.0f);
             
             // <--- Corregidos los warnings de indentación
@@ -257,7 +274,7 @@ void run_yolo_complete() {
     if (g_use_camera) camera_capture_frame(cam_frame);
     const float* input_img = g_use_camera ? cam_frame : test_image;
 
-    int hw = 320 * 320;
+    int hw = YOLO_IN * YOLO_IN;
     float scale = (input_img[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
     float32x4_t vscale = vdupq_n_f32(scale); int i = 0;
     for (; i <= hw - 4; i += 4) {
@@ -273,56 +290,60 @@ void run_yolo_complete() {
     unsigned long t_rgb = get_timer_count();
 
     const float* w0 = ws.next(16*3*6*6, "L0_W"); const float* b0 = ws.next(16, "L0_B");
-    parallel_conv2d(buf_B, 320, 320, 3, w0, b0, 16, 6, 2, 2, true, buf_A);
+    parallel_conv2d(buf_B, YOLO_IN, YOLO_IN, 3, w0, b0, 16, 6, 2, 2, true, buf_A);
     unsigned long t_l0 = get_timer_count();
 
     const float* w1 = ws.next(32*16*3*3, "L1_W"); const float* b1 = ws.next(32, "L1_B");
-    parallel_conv2d(buf_A, 160, 160, 16, w1, b1, 32, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, 80, 80, 32, 32, 1, true, ws, "L2");
+    parallel_conv2d(buf_A, YOLO_S2, YOLO_S2, 16, w1, b1, 32, 3, 2, 1, true, buf_B);
+    c3_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
 
     const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
-    parallel_conv2d(buf_A, 80, 80, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, 40, 40, 64, 64, 2, true, ws, "L4"); copy_tensor(buf_A, save_L4, 64*40*40);
+    parallel_conv2d(buf_A, YOLO_S4, YOLO_S4, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
+    c3_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
+    copy_tensor(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
 
     const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
-    parallel_conv2d(buf_A, 40, 40, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, 20, 20, 128, 128, 3, true, ws, "L6"); copy_tensor(buf_A, save_L6, 128*20*20);
+    parallel_conv2d(buf_A, YOLO_S8, YOLO_S8, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
+    c3_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 3, true, ws, "L6");
+    copy_tensor(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
 
     const float* w7 = ws.next(256*128*3*3, "L7_W"); const float* b7 = ws.next(256, "L7_B");
-    parallel_conv2d(buf_A, 20, 20, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, 10, 10, 256, 256, 1, true, ws, "L8");
-    sppf_real_inference(buf_A, buf_B, scratch, 10, 10, 256, ws);
+    parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
+    c3_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
+    sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
 
     unsigned long t_backbone = get_timer_count();
 
     const float* w10 = ws.next(128*256, "L10_W"); const float* b10 = ws.next(128, "L10_B");
-    parallel_conv1x1(buf_B, 10, 10, 256, w10, b10, 128, true, buf_A);
-    copy_tensor(buf_A, save_Neck_P5, 128*10*10);
+    parallel_conv1x1(buf_B, YOLO_S32, YOLO_S32, 256, w10, b10, 128, true, buf_A);
+    copy_tensor(buf_A, save_Neck_P5, 128 * YOLO_S32 * YOLO_S32);
 
-    upsample2x_nearest(buf_A, buf_B, 10, 10, 128); concat_tensor(buf_B, 128, save_L6, 128, scratch, 20*20);
-    c3_real_inference(scratch, buf_A, buf_B, 20, 20, 256, 128, 1, false, ws, "L13");
-    copy_tensor(buf_A, save_Neck_P4, 64*20*20);
+    upsample2x_nearest(buf_A, buf_B, YOLO_S32, YOLO_S32, 128);
+    concat_tensor(buf_B, 128, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
+    c3_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 256, 128, 1, false, ws, "L13");
+    copy_tensor(buf_A, save_Neck_P4, 64 * YOLO_S16 * YOLO_S16);
 
     const float* w14 = ws.next(64*128, "L14_W"); const float* b14 = ws.next(64, "L14_B");
-    parallel_conv1x1(buf_A, 20, 20, 128, w14, b14, 64, true, buf_B);
-    copy_tensor(buf_B, save_Neck_P4, 64*20*20);
+    parallel_conv1x1(buf_A, YOLO_S16, YOLO_S16, 128, w14, b14, 64, true, buf_B);
+    copy_tensor(buf_B, save_Neck_P4, 64 * YOLO_S16 * YOLO_S16);
 
-    upsample2x_nearest(buf_B, buf_A, 20, 20, 64); concat_tensor(buf_A, 64, save_L4, 64, scratch, 40*40);
-    c3_real_inference(scratch, buf_B, buf_A, 40, 40, 128, 64, 1, false, ws, "L17");
-    copy_tensor(buf_B, save_P3_Head, 64*40*40);
+    upsample2x_nearest(buf_B, buf_A, YOLO_S16, YOLO_S16, 64);
+    concat_tensor(buf_A, 64, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
+    c3_real_inference(scratch, buf_B, buf_A, YOLO_S8, YOLO_S8, 128, 64, 1, false, ws, "L17");
+    copy_tensor(buf_B, save_P3_Head, 64 * YOLO_S8 * YOLO_S8);
 
     const float* w18 = ws.next(64*64*3*3, "L18_W"); const float* b18 = ws.next(64, "L18_B");
-    parallel_conv2d(buf_B, 40, 40, 64, w18, b18, 64, 3, 2, 1, true, buf_A);
+    parallel_conv2d(buf_B, YOLO_S8, YOLO_S8, 64, w18, b18, 64, 3, 2, 1, true, buf_A);
 
-    concat_tensor(buf_A, 64, save_Neck_P4, 64, scratch, 20*20);
-    c3_real_inference(scratch, buf_B, buf_A, 20, 20, 128, 128, 1, false, ws, "L20");
-    copy_tensor(buf_B, save_P4_Head, 128*20*20);
+    concat_tensor(buf_A, 64, save_Neck_P4, 64, scratch, YOLO_S16 * YOLO_S16);
+    c3_real_inference(scratch, buf_B, buf_A, YOLO_S16, YOLO_S16, 128, 128, 1, false, ws, "L20");
+    copy_tensor(buf_B, save_P4_Head, 128 * YOLO_S16 * YOLO_S16);
 
     const float* w21 = ws.next(128*128*3*3, "L21_W"); const float* b21 = ws.next(128, "L21_B");
-    parallel_conv2d(buf_B, 20, 20, 128, w21, b21, 128, 3, 2, 1, true, buf_A);
+    parallel_conv2d(buf_B, YOLO_S16, YOLO_S16, 128, w21, b21, 128, 3, 2, 1, true, buf_A);
 
-    concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, 10*10);
-    c3_real_inference(scratch, buf_B, buf_A, 10, 10, 256, 256, 1, false, ws, "L23");
+    concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, YOLO_S32 * YOLO_S32);
+    c3_real_inference(scratch, buf_B, buf_A, YOLO_S32, YOLO_S32, 256, 256, 1, false, ws, "L23");
 
     unsigned long t_neck = get_timer_count();
 
@@ -330,14 +351,17 @@ void run_yolo_complete() {
     const float* w_det_p4 = ws.next(255*128, "Det_P4_W"); const float* b_det_p4 = ws.next(255, "Det_P4_B");
     const float* w_det_p5 = ws.next(255*256, "Det_P5_W"); const float* b_det_p5 = ws.next(255, "Det_P5_B");
 
-    parallel_conv1x1(save_P3_Head, 40, 40, 64, w_det_p3, b_det_p3, 255, false, scratch);
-    float anchors_p3[3][2] = {{10,13}, {16,30}, {33,23}}; decode_yolo_grid(scratch, 40, 40, 8, anchors_p3);
+    parallel_conv1x1(save_P3_Head, YOLO_S8, YOLO_S8, 64, w_det_p3, b_det_p3, 255, false, scratch);
+    float anchors_p3[3][2] = {{10,13}, {16,30}, {33,23}};
+    decode_yolo_grid(scratch, YOLO_S8, YOLO_S8, 8, anchors_p3);
 
-    parallel_conv1x1(save_P4_Head, 20, 20, 128, w_det_p4, b_det_p4, 255, false, scratch);
-    float anchors_p4[3][2] = {{30,61}, {62,45}, {59,119}}; decode_yolo_grid(scratch, 20, 20, 16, anchors_p4);
+    parallel_conv1x1(save_P4_Head, YOLO_S16, YOLO_S16, 128, w_det_p4, b_det_p4, 255, false, scratch);
+    float anchors_p4[3][2] = {{30,61}, {62,45}, {59,119}};
+    decode_yolo_grid(scratch, YOLO_S16, YOLO_S16, 16, anchors_p4);
 
-    parallel_conv1x1(buf_B, 10, 10, 256, w_det_p5, b_det_p5, 255, false, scratch);
-    float anchors_p5[3][2] = {{116,90}, {156,198}, {373,326}}; decode_yolo_grid(scratch, 10, 10, 32, anchors_p5);
+    parallel_conv1x1(buf_B, YOLO_S32, YOLO_S32, 256, w_det_p5, b_det_p5, 255, false, scratch);
+    float anchors_p5[3][2] = {{116,90}, {156,198}, {373,326}};
+    decode_yolo_grid(scratch, YOLO_S32, YOLO_S32, 32, anchors_p5);
 
     unsigned long t_nms = get_timer_count();
 
@@ -375,8 +399,8 @@ void run_yolo_complete() {
     // V124 camera mode: YOLO square (864×864 center crop of sensor) is displayed
     // as 360×360 at x=[140,500] y=[60,420] inside the 640×360 16:9 image.
     // Test mode: non-uniform 2.0×H / 1.5×V, image at x=[0,640] y=[0,480].
-    const float disp_scale  = g_use_camera ? (CAM_DISP_W / 320.0f) : (640.0f / 320.0f);
-    const float disp_scaleY = g_use_camera ? (CAM_DISP_H / 320.0f) : (480.0f / 320.0f);
+    const float disp_scale  = g_use_camera ? (CAM_DISP_W / (float)YOLO_IN) : (640.0f / (float)YOLO_IN);
+    const float disp_scaleY = g_use_camera ? (CAM_DISP_H / (float)YOLO_IN) : (480.0f / (float)YOLO_IN);
     const int   disp_xoff   = g_use_camera ? CAM_DISP_XOFF : 0;
     const int   disp_yoff   = g_use_camera ? CAM_DISP_YOFF : 0;
     const int   disp_right  = disp_xoff + (g_use_camera ? CAM_DISP_W : 640);
@@ -418,6 +442,25 @@ void run_yolo_complete() {
     draw_rect(hb_x, 430, 40, 40, heartbeat_color, 40); heartbeat_counter++;
 
     unsigned long t_end = get_timer_count();
+
+    /* B0: per-stage profiling. Prints once per frame so we can see where the
+     * budget goes. cap → rgb prep, l0 → first conv2d, backbone → through L8,
+     * neck → through L23, head → up to NMS, total → end. */
+    {
+        unsigned long ms_cap      = (t_rgb      - t_start)    * 1000UL / f;
+        unsigned long ms_l0       = (t_l0       - t_rgb)      * 1000UL / f;
+        unsigned long ms_backbone = (t_backbone - t_l0)       * 1000UL / f;
+        unsigned long ms_neck     = (t_neck     - t_backbone) * 1000UL / f;
+        unsigned long ms_head     = (t_nms      - t_neck)     * 1000UL / f;
+        unsigned long ms_render   = (t_end      - t_nms)      * 1000UL / f;
+        uart_puts("[P] cap=");     uart_dec((int)ms_cap);
+        uart_puts(" l0=");         uart_dec((int)ms_l0);
+        uart_puts(" bb=");         uart_dec((int)ms_backbone);
+        uart_puts(" neck=");       uart_dec((int)ms_neck);
+        uart_puts(" head=");       uart_dec((int)ms_head);
+        uart_puts(" render=");     uart_dec((int)ms_render);
+        uart_puts("ms\n");
+    }
 
     {
         unsigned long duration = t_end - t_start;
