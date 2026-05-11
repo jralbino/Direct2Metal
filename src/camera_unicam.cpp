@@ -297,12 +297,30 @@ static void mbox_flush_to_vc(unsigned int words) {
  * Byte stride per line = 1536 pixels * 10 bits / 8 bits/byte = 1920 bytes/line.
  * FRAME_W is the BYTE stride (used for IBLS), not pixel count. */
 #define FRAME_W  1920   /* RAW10-packed bytes/line: 1536px * 10bit / 8 = 1920 */
-#define FRAME_H   864
+#define FRAME_H   864   /* V136: sensor is programmed for 864 output lines
+                         * (0x034E/0x034F=0x0360). V134 buffer at 704 caused
+                         * IBEA to clip DMA prematurely, dropping bottom 160
+                         * rows. PDAF already disabled via 0x0B8E/0x0B94 so
+                         * all 864 rows are real pixel data. */
 #define FRAME_SZ  (FRAME_W * FRAME_H)  /* 1920 * 864 = 1,658,880 bytes */
 
-/* ─── DMA frame buffer ────────────────────────────────────────────────────── */
+/* ─── DMA frame buffers — ping-pong (camara_direct V162 pattern) ─────────────
+ * Two buffers alternate as DMA target. One holds the just-completed frame
+ * the CPU is reading; the other is being written by Unicam. LIP at FSI 1 of
+ * every iteration flips which is which. */
 __attribute__((aligned(64)))
-static uint8_t g_raw_frame[FRAME_SZ];
+static uint8_t g_raw_a[FRAME_SZ];
+__attribute__((aligned(64)))
+static uint8_t g_raw_b[FRAME_SZ];
+
+/* Active = DMA target (do NOT read while CPE is on); completed = frame for
+ * CPU consumers. Initialized to raw_a in unicam_init so callers that read
+ * before the first capture see a valid (zeroed) buffer instead of NULL. */
+static uint8_t* g_active_buf    = g_raw_a;
+static uint8_t* g_completed_buf = g_raw_a;
+
+/* Backwards-compatible alias for the rest of the file (sim path, etc.). */
+#define g_raw_frame g_active_buf
 
 /* ─── Global sim state (defined here, extern in hardware_sim.h) ───────────── */
 UnicamSimState g_sim_state = {0};
@@ -313,45 +331,6 @@ static void delay_nop(unsigned int n) {
 }
 
 /* ─── DMA cache coherency ────────────────────────────────────────────────── */
-/* V110: After DMA completes, frame data is in DRAM but ARM D-cache may hold
- * stale lines (BSS zeros or previous frame). DC CIVAC = Clean + Invalidate:
- *   Clean = writeback dirty lines to DRAM (no-op if DMA already wrote)
- *   Invalidate = mark lines invalid → next ARM read fetches fresh DRAM
- * DC IVAC (invalidate-only) can be UNPREDICTABLE on dirty lines on some
- * implementations. CIVAC is safe regardless of line state. */
-static void invalidate_frame_dcache() {
-#ifndef SIMULATION
-    unsigned long addr = (unsigned long)(void*)g_raw_frame;
-    unsigned long end  = addr + FRAME_SZ;
-    for (unsigned long a = addr & ~63UL; a < end; a += 64)
-        asm volatile("dc civac, %0" :: "r"(a) : "memory");
-    asm volatile("dsb sy" ::: "memory");
-#endif
-}
-
-/* V110: Stop DMA after capture — freeze buffer contents.
- * Clear CPE to disable Unicam peripheral. Without this, the sensor at 52fps
- * overwrites the buffer during the ~1100ms debayer, corrupting the frame. */
-static void stop_unicam_dma() {
-#ifndef SIMULATION
-    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
-    U1[U_CTRL/4] &= ~U_CTRL_CPE;   /* CPE=0 → peripheral disabled, DMA stops */
-    asm volatile("dsb st" ::: "memory");
-#endif
-}
-
-/* V110: Restart DMA for next capture.
- * Re-enable CPE, re-write CLKGATE, re-assert MISC FL bits, trigger LIP. */
-static void restart_unicam_dma() {
-#ifndef SIMULATION
-    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
-    U1[U_CTRL/4] |= U_CTRL_CPE;                    /* CPE=1 */
-    *UNICAM1_CLKGATE = 0x5A000015u;                 /* re-assert CLKGATE */
-    U1[U_MISC/4] |= (1u << 6) | (1u << 9);         /* MISC FL0|FL1 */
-    U1[U_ICTL/4] |= U_ICTL_LIP;                    /* LIP — latch addresses */
-    asm volatile("dsb st" ::: "memory");
-#endif
-}
 
 /* ─── SIMULATION register file and emulation ─────────────────────────────── */
 #ifdef SIMULATION
@@ -602,30 +581,6 @@ static uint32_t sim_on_read(uint32_t offset) {
 #endif /* SIMULATION */
 
 /* ─── Diagnostic register dump (hardware only) ───────────────────────────── */
-#ifndef SIMULATION
-static void dump_unicam_regs(volatile uint32_t* U1) {
-    uart_puts("\n=== UNICAM1 REGISTER DUMP (V76) ===\n");
-    uart_puts("CTRL (0x000): "); uart_hex(U1[U_CTRL/4]);
-    uart_puts(" STA (0x004): "); uart_hex(U1[U_STA/4]);   uart_puts("\n");
-    uart_puts("ANA  (0x008): "); uart_hex(U1[U_ANA/4]);
-    uart_puts(" CLK (0x010): "); uart_hex(U1[U_CLK/4]);   uart_puts("\n");
-    uart_puts("DAT0 (0x018): "); uart_hex(U1[U_DAT0/4]);
-    uart_puts(" DAT1(0x01C): "); uart_hex(U1[U_DAT1/4]);  uart_puts("\n");
-    uart_puts("CLT  (0x014): "); uart_hex(U1[U_CLT/4]);
-    uart_puts(" DLT (0x028): "); uart_hex(U1[U_DLT/4]);   uart_puts("\n");
-    uart_puts("ICTL (0x100): "); uart_hex(U1[U_ICTL/4]);
-    uart_puts(" ISTA(0x104): "); uart_hex(U1[U_ISTA/4]);  uart_puts("\n");
-    uart_puts("IDI0 (0x108): "); uart_hex(U1[U_IDI0/4]);
-    uart_puts(" IPIPE(0x10C):"); uart_hex(U1[U_IPIPE/4]); uart_puts("\n");
-    uart_puts("IBSA0(0x110): "); uart_hex(U1[U_IBSA0/4]);
-    uart_puts(" IBEA0(0x114):"); uart_hex(U1[U_IBEA0/4]); uart_puts("\n");
-    uart_puts("IBLS (0x118): "); uart_hex(U1[U_IBLS/4]);
-    uart_puts(" IBWP(0x11C): "); uart_hex(U1[U_IBWP/4]);  uart_puts("\n");
-    uart_puts("MISC (0x400): "); uart_hex(U1[U_MISC/4]);  uart_puts("\n");
-    uart_puts("===================================\n");
-}
-#endif
-
 /* ─── Complete Unicam1 initialization (matches bcm2835-unicam.c unicam_start_rx) ─ */
 static void setup_unicam_block(volatile uint32_t* U1) {
     /* STEP 0: Simulation state init */
@@ -666,13 +621,7 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     }
 #else
     {
-        uint32_t vpu_ana = U1[U_ANA/4];
-        uart_puts("[UNICAM] ANA (VPU): "); uart_hex(vpu_ana); uart_puts("\n");
-
-        /* VPU always leaves ANA=0x777 (fully powered down, uncalibrated).
-         * Always do full power-up with Linux-matched values: 0x774 → 0x770.
-         * CTATADJ=7, PTATADJ=7 = Linux bcm2835-unicam.c exact values. */
-        uart_puts("[UNICAM] ANA: power-up 0x774->0x770 (Linux CTAT=7 PTAT=7)\n");
+        /* ANA power-up: 0x774 → 0x770 (Linux CTAT=7 PTAT=7) */
         U1[U_ANA/4] = 0x774u;   /* power up, hold AR, CTATADJ=7, PTATADJ=7 */
         delay_nop(1000000);      /* 1ms DDL lock (Linux: usleep_range(1000, 2000)) */
         U1[U_ANA/4] = 0x770u;   /* release AR */
@@ -748,7 +697,10 @@ static void setup_unicam_block(volatile uint32_t* U1) {
     U_WRITE(U_CLT, 0x0602u);   /* CLT1=2, CLT2=6 (60ns settle — Linux exact) */
     U_WRITE(U_DLT, 0x0602u);   /* DLT1=2, DLT2=6, DLT3=0 */
 
-    /* STEP 9: CMP0 — secondary Frame End detection via STA.PI0=BIT(15) */
+    /* STEP 9: CMP0 — V162 port: restored to 0x80000301 (libcamera runtime value).
+     * V134 had disabled this fearing premature line-704 PI0; subsequent work in
+     * camara_direct V147+V154 proved this is the correct frame-boundary protocol
+     * and CMP0 must stay enabled. */
     U_WRITE(U_CMP0, 0x80000301u);
 
     /* STEP 10: Lane configuration — *** MUST BE AFTER CPR ***
@@ -766,16 +718,25 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      * V82 diagnostic: print CLK value BEFORE our write to prove CPR reset it.
      * Expected: CLK=0x00000002 (power-down default) if CPR works correctly.
      */
-#ifndef SIMULATION
-    uart_puts("[UNICAM] CLK after CPR (pre-write): ");
-    uart_hex(U1[U_CLK/4]);
-    uart_puts("\n");
-#endif
-    U_WRITE(U_CLK,  0x0005u);   /* V103: CLE|CLLPE — Pi OS exact (non-continuous HS clk) */
-    U_WRITE(U_DAT0, 0x0005u);   /* V103: DLE|DLLPE — Pi OS exact */
-    U_WRITE(U_DAT1, 0x0005u);   /* V103: 2-lane — Pi OS exact */
-    U_WRITE(U_DAT2, 0x00u);
-    U_WRITE(U_DAT3, 0x00u);
+    /* V162 port: full lane configuration as dumped from a running libcamera
+     * session on 2026-04-26 (camara_direct linux_capture_linux/unicam_run.txt).
+     * The previous 0x0005-only values dropped HS termination bits, which masked
+     * the DAT1 issue while the sensor was in non-continuous HS clock mode
+     * (0x0310=0x00). Now that 0x0310=0x01 enables continuous HS clock, lane
+     * termination must be programmed too — otherwise real scenes show "line
+     * swap" (bytes from D0/D1 phase-shifted), while uniform test patterns
+     * hide it.
+     *   CLK  = 0x06000005  (3<<25) | CLE | CLLPE   — clock-pattern HS term
+     *   DAT0 = 0xC0000005  (3<<30) | DLE | DLLPE   — data-pattern HS term
+     *   DAT1 = 0x06000005  CLOCK-pattern (NOT data) — libcamera-confirmed
+     *   DAT2 = 0x0A000002  unused-lane config (Linux still writes non-zero)
+     *   DAT3 = 0x0A000002  same as DAT2
+     * See memory/camara_direct_v159_lane_swap.md for the analysis. */
+    U_WRITE(U_CLK,  0x06000005u);
+    U_WRITE(U_DAT0, 0xC0000005u);
+    U_WRITE(U_DAT1, 0x06000005u);
+    U_WRITE(U_DAT2, 0x0A000002u);
+    U_WRITE(U_DAT3, 0x0A000002u);
 
     /* STEP 11: DMA buffer addresses
      * IBSA0: bus address with 0xC0000000 VideoCore bus alias.
@@ -804,21 +765,16 @@ static void setup_unicam_block(volatile uint32_t* U1) {
 
     /* STEP 14B: CLKGATE — write AFTER CPE (V107: matches Linux unicam_start_rx order)
      * Linux: CPR → registers → CPE → clk_write() → MISC → LIP.
-     * V93 had this in Step 0B (before CPR) — wrong ordering.
-     * V106: address corrected to 0x3F802004 (CSI1, not CSI0).
-     * Value: 2-lane shift+OR = 0x5A000015. */
+     * V147: back to 0x5A000015 (2-lane). V146 1-lane test ruled out lane-demux. */
     {
-        const uint32_t clkgate_val = 0x5A000015u;  /* 2-lane correct value */
+        const uint32_t clkgate_val = 0x5A000015u;  /* V147: 2-lane value */
 #ifndef SIMULATION
         *UNICAM1_CLKGATE = clkgate_val;
         asm volatile("dsb st" ::: "memory");
-        uint32_t cg_after = *UNICAM1_CLKGATE;
-        uart_puts("[UNICAM] CLKGATE post-CPE: wrote=0x5A000015 readback=");
-        uart_hex(cg_after); uart_puts("\n");
 #else
         g_sim_state.clkgate_enabled = true;
         g_sim_state.reg_clkgate = clkgate_val;
-        uart_puts("[UNICAM] CLKGATE=0x5A000015 (2-lane, post-CPE per Linux order)\n");
+        uart_puts("[UNICAM] CLKGATE=0x5A000015 (V147: 2-lane, post-CPE per Linux order)\n");
 #endif
     }
 
@@ -831,30 +787,10 @@ static void setup_unicam_block(volatile uint32_t* U1) {
      */
     U_SETBITS(U_ICTL, U_ICTL_LIP);   /* ICTL = 0x00D80007 | 0x20 = 0x00D80027 */
 
-    uart_puts("[UNICAM] V111 init complete. CTRL=");
-    uart_hex(U_READ(U_CTRL));
-    uart_puts(" IDI0=");
-    uart_hex(U_READ(U_IDI0));
-    uart_puts(" IPIPE=");
-    uart_hex(U_READ(U_IPIPE));
+    uart_puts("[UNICAM] V154 (deshift bounded to real maxWP rows) init OK. IBLS=");
+    uart_hex(U_READ(U_IBLS));
     uart_puts(" IBSA0=");
     uart_hex(U_READ(U_IBSA0));
-    uart_puts("\n");
-    uart_puts("[UNICAM] IBEA0=");
-    uart_hex(U_READ(U_IBEA0));
-    uart_puts(" MISC=");
-    uart_hex(U_READ(U_MISC));
-    uart_puts(" ICTL=");
-    uart_hex(U_READ(U_ICTL));
-    uart_puts(" CLK=");
-    uart_hex(U_READ(U_CLK));
-    uart_puts("\n");
-    uart_puts("[UNICAM] CLT=");
-    uart_hex(U_READ(U_CLT));
-    uart_puts(" DLT=");
-    uart_hex(U_READ(U_DLT));
-    uart_puts(" ANA=");
-    uart_hex(U_READ(U_ANA));
     uart_puts("\n");
 }
 
@@ -893,9 +829,7 @@ void unicam_init() {
         mbox[5] = 14; mbox[6] = 0; mbox[7] = 0;
         mbox_flush_to_vc(8);
         int get_ok = mbox_call(8);
-        uart_puts("[UNICAM] V108 DOMAIN GET resp="); uart_hex(mbox[1]);
-        uart_puts(" state="); uart_hex(mbox[6]);
-        uart_puts(get_ok ? " OK\n" : " FAILED\n");
+        (void)get_ok;
 
         /* SET_DOMAIN_STATE(domain=14, on=1) */
         mbox[0] = 8 * 4; mbox[1] = 0;
@@ -903,9 +837,7 @@ void unicam_init() {
         mbox[5] = 14; mbox[6] = 1; mbox[7] = 0;
         mbox_flush_to_vc(8);
         int set_ok = mbox_call(8);
-        uart_puts("[UNICAM] V108 DOMAIN SET resp="); uart_hex(mbox[1]);
-        uart_puts(" state="); uart_hex(mbox[6]);
-        uart_puts(set_ok ? " OK\n" : " FAILED\n");
+        if (!set_ok) uart_puts("[UNICAM] WARN: DOMAIN SET failed\n");
 
         /* SET_CLOCK_RATE(clock_id=4, rate=250MHz) — CORE clock */
         mbox[0] = 9 * 4; mbox[1] = 0;
@@ -913,9 +845,7 @@ void unicam_init() {
         mbox[5] = 4; mbox[6] = 250000000; mbox[7] = 0; mbox[8] = 0;
         mbox_flush_to_vc(9);
         int clk_ok = mbox_call(8);
-        uart_puts("[UNICAM] V108 CLK_RATE SET resp="); uart_hex(mbox[1]);
-        uart_puts(" rate="); uart_hex(mbox[6]);
-        uart_puts(clk_ok ? " OK\n" : " FAILED\n");
+        if (!clk_ok) uart_puts("[UNICAM] WARN: CLK_RATE SET failed\n");
     }
 
     /* ── Step 0A: Configure CM_CAM1CTL (Unicam1 digital backend clock) ─────
@@ -924,8 +854,7 @@ void unicam_init() {
      * Read current value first — print for diagnostics, then configure 100 MHz.
      * Source: PLLD=6 (500 MHz), DIVI=5 → 100 MHz.
      */
-    uart_puts("[UNICAM] CM_CAM1CTL before: "); uart_dec((int)*CM_CAM1CTL);
-    uart_puts(" CM_CAM1DIV: "); uart_dec((int)*CM_CAM1DIV); uart_puts("\n");
+    /* Read current CM_CAM1 state (pre-configure) */
 
     /* Stop CM_CAM1 before changing divisor (BCM2835 clock manager requirement) */
     *CM_CAM1CTL = CM_PASSWD | 6u;          /* SRC=PLLD, ENAB=0 */
@@ -937,23 +866,19 @@ void unicam_init() {
     *CM_CAM1CTL = CM_PASSWD | (1u << 4) | 6u;  /* ENAB=1, SRC=PLLD */
     for (volatile int i = 0; i < 100000; i++) asm volatile("nop");  /* settle */
 
-    uart_puts("[UNICAM] CM_CAM1CTL after:  "); uart_dec((int)*CM_CAM1CTL);
-    uart_puts(" (BUSY="); uart_dec((int)((*CM_CAM1CTL >> 7) & 1));
-    uart_puts(")\n");
+    /* CM_CAM1 configured: 100MHz from PLLD */
 #endif
 
     /* ── Step 0B: CLKGATE diagnostic pre-read (V107: actual write moved to Step 14B) */
 #ifndef SIMULATION
-    {
-        uint32_t cg_before = *UNICAM1_CLKGATE;
-        uart_puts("[UNICAM] CLKGATE pre-read: "); uart_hex(cg_before); uart_puts("\n");
-    }
+    /* CLKGATE pre-read (moved to Step 14B) */
 #endif
 
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
     setup_unicam_block(U1);
 }
 
+/* V136 diagnostic: dump raw bytes at key rows to reveal buffer structure. */
 bool unicam_capture_frame() {
     g_sim_state.frame_number++;
 
@@ -1158,59 +1083,57 @@ bool unicam_capture_frame() {
     return true;
 
 #else
-    /* ── Hardware capture: V121 FS-to-FS (restored from proven V118) ──── */
+    /* ── HW capture: continuous-DMA ping-pong (camara_direct V162 pattern) ─
+     * CPE stays on the whole time. Each call:
+     *   1. Stage next_buf in IBSA0 (queued; only takes effect at LIP).
+     *   2. Wait for two FSIs. At FSI 1, strobe LIP → DMA flips to next_buf;
+     *      the buffer that WAS active before LIP is now frozen and holds the
+     *      just-completed frame. At FSI 2, that frame's full sensor period
+     *      has elapsed and the staged buffer is mid-fill of the new frame.
+     *   3. Swap active/completed pointers and invalidate the completed
+     *      buffer's cache lines so the CPU sees DMA writes. */
     volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
 
-    restart_unicam_dma();
+    uint8_t* next_buf = (g_active_buf == g_raw_a) ? g_raw_b : g_raw_a;
+    const uint32_t bus_next = 0xC0000000u | (uint32_t)(uintptr_t)next_buf;
+    U1[U_IBSA0/4] = bus_next;
+    U1[U_IBEA0/4] = bus_next + FRAME_SZ;
 
-    U1[U_STA/4]  = 0xFFFFFFFFu;
+    U1[U_CTRL/4] |= U_CTRL_CPE;
+    *UNICAM1_CLKGATE = 0x5A000015u;
+    U1[U_MISC/4] |= (1u << 6) | (1u << 9);
+    asm volatile("dsb st" ::: "memory");
+
     U1[U_ISTA/4] = 0xFFFFFFFFu;
 
-    /* Wait for FS1 (frame start), trigger LIP to reset write pointer,
-     * then wait for FS2 (next frame start). Between FS1 and FS2,
-     * exactly one complete frame was written. Stop DMA at FS2. */
     int fs_count = 0;
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
-
         uint32_t ista = U1[U_ISTA/4];
 
         if (ista & U_ISTA_FSI) {
             fs_count++;
-            if (fs_count == 1) {
-                /* First FS: trigger LIP to reset IBWP to buffer start */
-                U1[U_ICTL/4] |= U_ICTL_LIP;
-                U1[U_STA/4]  = 0xFFFFFFFFu;
-                U1[U_ISTA/4] = 0xFFFFFFFFu;
-            } else {
-                /* Second FS: complete frame in buffer, stop NOW */
-                stop_unicam_dma();
-                invalidate_frame_dcache();
+            U1[U_ISTA/4] = 0xFFFFFFFFu;
 
-                uint32_t ibwp  = U1[U_IBWP/4];
-                uint32_t ibsa0 = U1[U_IBSA0/4];
-                uart_puts("[UNICAM] V121: FS-to-FS capture OK\n");
-                uart_puts("[DIAG] IBWP="); uart_hex(ibwp);
-                uart_puts(" delta="); uart_dec((int)(ibwp - ibsa0));
-                uart_puts(" lines="); uart_dec((int)((ibwp - ibsa0) / FRAME_W));
-                uart_puts("\n");
+            if (fs_count == 1) {
+                U1[U_ICTL/4] |= U_ICTL_LIP;
+                asm volatile("dsb sy" ::: "memory");
+            } else {
+                uint8_t* prev_buf = g_active_buf;
+                g_active_buf    = next_buf;
+                g_completed_buf = prev_buf;
+                /* Invalidate prev_buf cache lines so CPU sees DMA's writes. */
+                unsigned long addr = (unsigned long)(void*)prev_buf;
+                unsigned long end  = addr + FRAME_SZ;
+                for (unsigned long a = addr & ~63UL; a < end; a += 64)
+                    asm volatile("dc civac, %0" :: "r"(a) : "memory");
+                asm volatile("dsb sy" ::: "memory");
                 return true;
             }
         }
-
-        if (i > 0 && i % 10000000 == 0) {
-            uart_puts("[UNICAM] t="); uart_dec((int)(i / 10000000));
-            uart_puts("00ms: ISTA="); uart_hex(ista);
-            uart_puts(" WP="); uart_hex(U1[U_IBWP/4]);
-            uart_puts(" fs="); uart_dec(fs_count);
-            uart_puts("\n");
-        }
     }
 
-    uart_puts("[UNICAM] TIMEOUT — no complete frame in ~500ms\n");
-    uart_puts("[UNICAM] IBWP="); uart_hex(U1[U_IBWP/4]);
-    uart_puts("  STA="); uart_hex(U1[U_STA/4]);
-    uart_puts("  ISTA="); uart_hex(U1[U_ISTA/4]); uart_puts("\n");
+    uart_puts("[CAP] TIMEOUT\n");
     return false;
 #endif
 }
@@ -1228,7 +1151,7 @@ void unicam_print_lane_state(const char* tag) {
     uart_puts("\n");
 }
 
-const uint8_t* unicam_frame_ptr() { return g_raw_frame; }
+const uint8_t* unicam_frame_ptr() { return g_completed_buf; }
 int unicam_frame_w() { return FRAME_W; }      /* byte stride (1920) */
-int unicam_frame_h() { return FRAME_H; }      /* 864 */
+int unicam_frame_h() { return FRAME_H; }      /* 864 (V136) */
 int unicam_pixel_w() { return 1536; }         /* actual pixel columns */

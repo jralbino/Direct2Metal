@@ -1,7 +1,7 @@
 # Direct2Metal — Plan de Desarrollo
 
-> Última actualización: 2026-03-18
-> Estado: **V118** — BGGR fix + FS-to-FS capture + brightness stretch. Barras y shift pendientes.
+> Última actualización: 2026-05-10
+> Estado: **V163 (camera-only)** — V162 ISP/lane fixes portados desde `camara_direct/`, pipeline async multi-core, 52 fps con YOLO desactivado. Cámara byte-exact con libcamera. Siguiente: re-integrar YOLO.
 
 ---
 
@@ -30,45 +30,50 @@ Barras horizontales y shift izquierda-derecha persisten — causa no es captura 
 | V115 | LIP-after-FS: elimina barras horizontales del frame anterior |
 | V116 | BGGR Bayer fix (R↔B corregido), watchdog 8s+3 kicks, SD card save |
 | V117 | Sim BGGR fix, tech debt T1/T2/T3 resueltos |
-| **V118** | **Base V111 + BGGR + FS-to-FS capture + brightness stretch** |
+| V118 | Base V111 + BGGR + FS-to-FS capture + brightness stretch |
+| V119–V162 | (Subproyecto `camara_direct/`) — debug del lane-swap, ISP libcamera, multi-core debayer. Ver `camara_direct/PROGRESS.md`. |
+| **V163** | **Back-port V162 al padre: BGGR flip 0x0101=0x03, HS clock continuo 0x0310=0x01, LSC LUT, ISP libcamera, lanes runtime-correctos, ping-pong DMA, multi-core debayer async, YOLO desactivado → 52 fps cámara-sólo.** |
 
 ---
 
-## Estado actual — V118
+## Estado actual — V163 (camera-only)
 
-### Resueltos
-- ✅ **BGGR Bayer fix**: R↔B corregido en 3 debayer paths (NEON, scalar, FB)
-- ✅ **FS-to-FS capture**: frame completo 864/864 líneas (delta=0 confirmado)
-- ✅ **Brightness stretch**: resta black level 16, ganancia 4× en FB path
-- ✅ **Boot fill negro**: elimina residuo de green fill previo
-- ✅ **Video flush inmediato**: flush FB después de render, antes de YOLO overlay
+### Resueltos en V163
+- ✅ **Lane swap**: `DAT1=0x06000005` (clock-pattern, no data) + `0x0310=0x01` (HS continuo). Escenas reales sin bytes mezclados.
+- ✅ **ISP libcamera byte-exact**: BLC=16 (MSB8) → WB Q8 (535,256,455) → CCM Q10 4640K → gamma sRGB LUT 256 entradas (51 puntos `rpi.contrast`). Reemplaza el `(v-16)*4/*2/*4` AWB heurístico.
+- ✅ **Lens-shading correction**: 108-reg LUT (`k_imx708_lsc[]`) entre common e init. Esquinas dejan de oscurecerse.
+- ✅ **Bayer BGGR** post-flip H+V 0x0101=0x03 — color natural, sin piel azul.
+- ✅ **CMP0 = 0x80000301** (libcamera runtime). El V134 disable era erróneo.
+- ✅ **Continuous DMA ping-pong** (V158 pattern): dos buffers `g_raw_a/b`, LIP por iter, CPE nunca cae. FSI wait ≈ 19 ms estricto.
+- ✅ **Multi-core debayer async**: nuevo `TASK_DEBAYER`. Cores 1-3 procesan bandas de 120 rows del FB en paralelo con el FSI wait del core 0. `parallel_debayer_start/wait`.
+- ✅ **AE on CIT**: P-controller con group-hold I2C, slew ±32 líneas, periodo 4 frames.
 
-### Pendientes — Barras horizontales y shift
-- ⬜ **Barras horizontales verdes**: persisten con boot negro + flush inmediato + FS-to-FS. NO son de cache, boot fill, ni captura incompleta. Causa desconocida — posible stride mismatch o framebuffer pixel format issue.
-- ⬜ **Shift izquierda-derecha**: imagen partida verticalmente en el centro. Misma causa que barras. Persiste con LIP-after-FS y FS-to-FS.
-- ⬜ **Verde dominante**: sensor G > R,B (Gr/Gb=29-31 vs R=22,B=23). Necesita AWB estático.
-- ⬜ **FEI never fires**: aún inexplicado pero no bloqueante.
+### Métricas HW (2026-05-10, YOLO disabled)
+```
+[CAM] cap=19 sync+flush=0 disp=0 total=19 fps=52
+```
+Supera al subproyecto (`wait=21 fps=47.61`) porque el padre debayera 640×480 en lugar de 1920×1080.
 
-### Descartados como causa
-- ❌ Boot fill verde (cambiado a negro, sin efecto)
-- ❌ Cache coherency / flush timing (video_flush inmediato, sin efecto)
-- ❌ PI0 frame corto (FS-to-FS da delta=0, sin efecto en barras)
-- ❌ LIP timing (LIP-after-FS probado, sin efecto en barras)
-- ❌ Buffer clear (probado, causó watchdog reset por lentitud)
+### Eliminado (legacy/workaround/diag)
+- ❌ `deshift_halfline_pass` + `DeshiftState` (clasificador 4-state). Estaba reparando un bug de transporte que ya no existe; estaba *dañando* frames buenos.
+- ❌ `diag_dump_frame` + `DIAG136/144` por-row dumps.
+- ❌ `debayer_diag_*`, `debayer_split_view_fb`, `debayer_test_pattern_fb`.
+- ❌ `dump_unicam_regs`, `stop_unicam_dma`, `restart_unicam_dma`, `invalidate_frame_dcache`.
+
+### Pendiente
+- ⬜ **YOLO re-integration** (siguiente sesión). YOLO usa cores 1-3 para conv2d/conv1x1 — colisión con el debayer async actual. Plan en `memory/camara_direct_parent_port_done.md`.
 
 ---
 
-## Track A — Cámara: próximos pasos
+## Track A — YOLO re-enable (siguiente paso)
 
-### Investigar barras horizontales
-1. Renderizar test pattern directo al FB (sin cámara) → confirmar si FB format es correcto
-2. Verificar que `debayer_raw10_to_fb` escribe TODOS los pixels correctamente
-3. Probar mapear framebuffer como Device memory (sin cache) → lento pero elimina coherency
-4. Comparar output del debayer con datos RAW conocidos (test pattern sensor)
-
-### AWB (white balance)
-- Gains estáticos: R×1.8, B×1.5 (típico IMX708 daylight)
-- Aplicar en debayer FB path después de brightness stretch
+1. Re-rutear `kernel_main` a `run_yolo_complete()` (o un híbrido).
+2. Decidir cómo compartir cores 1-3 entre debayer y conv2d:
+   - **(a)** Secuencial: debayer FB → sync → YOLO inference → bbox overlay. Simple. fps colapsa a la inferencia (~2 fps con YOLOv5n NEON).
+   - **(b)** YOLO posee cores 1-3, FB se dibuja directo desde el chw320 (calidad menor) o se omite el render full-res.
+   - **(c)** Interleave: debayer FB durante un período del sensor, YOLO durante el siguiente. Complejo.
+3. Primera versión: opción (a). La inferencia domina el budget — el throughput del pipeline cámara importa solo para tener input fresco a YOLO.
+4. Overlay de bboxes con `draw_rect` debe ser DESPUÉS de `parallel_debayer_wait()` para no ser sobrescrito.
 
 ---
 
@@ -85,15 +90,16 @@ Barras horizontales y shift izquierda-derecha persisten — causa no es captura 
 
 ## Métricas
 
-| Métrica | V118 (actual) |
-|:--------|:-------------|
-| FPS | ~1.7 FPS (592ms/frame) |
-| Capture | FS-to-FS, delta=0 |
-| Debayer FB | ~92ms (post-cache) |
-| Frame | 864/864 líneas |
-| Bayer | BGGR (correcto) |
-| Color | Verde dominante (sin AWB) |
-| Barras | **SÍ — causa desconocida** |
+| Métrica | V118 (camera bug) | V163 (camera-only, YOLO off) |
+|:--------|:------------------|:------------------------------|
+| FPS | ~1.7 FPS (592ms/frame) | **52 FPS (19 ms/frame)** |
+| Capture | FS-to-FS DMA-stop, delta=0 | Continuous DMA ping-pong, 2-FSI wait |
+| Debayer FB | ~92 ms single-core | ~7 ms en 3 cores paralelo (escondido en FSI wait) |
+| Frame | 864/864 líneas | 864/864 líneas |
+| Bayer | BGGR (correcto) | BGGR + ISP libcamera-exact |
+| Color | Verde dominante (sin AWB) | WB+CCM+gamma libcamera, AE en CIT activo |
+| Barras / lane-swap | **SÍ** | ✅ Resueltas (lanes runtime-correctos, HS clock continuo) |
+| YOLO | Single-buffer + fp32 conv NEON | **Desactivado** — siguiente paso |
 
 ---
 

@@ -6,6 +6,10 @@
 #include <arm_neon.h>
 
 extern void uart_puts(const char* s);
+/* Forward decl with C++ linkage — must be at file scope, not inside an
+ * extern "C" block, so it matches the mangled symbol in camera_debayer.cpp. */
+void debayer_raw10_to_fb_band(const unsigned char* raw, unsigned char* fb,
+                              unsigned int pitch, int disp_y_start, int disp_y_end);
 extern "C" void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in,
                                          const float* w, const float* b,
                                          int C_out_start, int C_out_end, int C_out_total,
@@ -261,6 +265,16 @@ extern "C" void secondary_main() {
             ops_neon_conv1x1_kernel((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
                                     (const float*)parallel_task.w1x1, (const float*)parallel_task.bias, start, end,
                                     parallel_task.C_out, parallel_task.do_silu, (float*)parallel_task.out);
+        } else if (type == TASK_DEBAYER) {
+            /* Cores 1,2,3 → bands 0,1,2 of the DISP image area (360 rows / 3 cores = 120 rows each).
+             * Core 0 stays free to handle the camera FSI wait in parallel. */
+            int my_band = core_id - 1;            /* 1,2,3 → 0,1,2 */
+            int y0 = my_band * 120;
+            int y1 = (my_band == 2) ? 360 : (y0 + 120);
+            debayer_raw10_to_fb_band((const unsigned char*)parallel_task.raw_in,
+                                     (unsigned char*)parallel_task.fb_out,
+                                     parallel_task.fb_pitch_b,
+                                     y0, y1);
         }
         __atomic_fetch_add((int*)&done_count, 1, __ATOMIC_RELEASE); asm volatile("sev");
     }
@@ -325,6 +339,31 @@ void parallel_conv1x1(const float* in, int H, int W, int C_in, const float* w, c
     parallel_task.do_silu = do_silu; parallel_task.out = out;
     dispatch_task_and_wait();
     int chunk = C_out / 4; ops_neon_conv1x1_kernel(in, H, W, C_in, w, b, 0, chunk, C_out, do_silu, out);
+    wait_for_workers();
+}
+
+/* Async camera debayer dispatch. Sets task fields, increments epoch, returns.
+ * Caller does its own work (typically the next camera FSI wait), then calls
+ * parallel_debayer_wait() before reading the framebuffer. If secondaries are
+ * not ready (probe fails), debayer runs synchronously on core 0. */
+void parallel_debayer_start(const uint8_t* raw, uint8_t* fb, uint32_t pitch) {
+    probe_multicore();
+    if (!multicore_available) {
+        debayer_raw10_to_fb_band(raw, fb, pitch, 0, 360);
+        return;
+    }
+    parallel_task.type       = TASK_DEBAYER;
+    parallel_task.raw_in     = raw;
+    parallel_task.fb_out     = fb;
+    parallel_task.fb_pitch_b = pitch;
+    __atomic_store_n((int*)&done_count, 0, __ATOMIC_RELAXED);
+    asm volatile("dsb ish" ::: "memory");
+    __atomic_fetch_add((int*)&task_epoch, 1, __ATOMIC_RELEASE);
+    asm volatile("sev");
+}
+
+void parallel_debayer_wait() {
+    if (!multicore_available) return;
     wait_for_workers();
 }
 

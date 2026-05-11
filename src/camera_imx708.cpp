@@ -52,50 +52,33 @@ bool imx708_init() {
         uart_puts("[IMX708] Probe FAILED — sensor not found\n");
         return false;
     }
-    uart_puts("[IMX708] Probe OK (ID=0x0708)\n");
+    uart_puts("[IMX708] OK (0x0708) 1536x864 2lane RAW10\n");
 
-    uart_puts("[IMX708] Writing common registers...\n");
-    for (int i = 0; i < k_imx708_common_len; i++) {
+    for (int i = 0; i < k_imx708_common_len; i++)
         i2c_write_reg16(IMX708_ADDR, k_imx708_common[i].reg, k_imx708_common[i].val);
-    }
 
-    uart_puts("[IMX708] Writing mode registers (1536x864 binned)...\n");
-    for (int i = 0; i < k_imx708_init_len; i++) {
+    /* V162 port: lens-shading correction LUT, applied between common and
+     * mode blocks (matches libcamera ordering). Compensates for vignetting
+     * in the IMX708 — corners are dim without these writes. */
+    for (int i = 0; i < k_imx708_lsc_len; i++)
+        i2c_write_reg16(IMX708_ADDR, k_imx708_lsc[i].reg, k_imx708_lsc[i].val);
+
+    /* V150: SPC PDAF gain writes still skipped (PDAF disabled in common regs). */
+    uart_puts("[IMX708] V150 HDR/DOL+PDAF disabled — skipping SPC gain writes\n");
+
+    for (int i = 0; i < k_imx708_init_len; i++)
         i2c_write_reg16(IMX708_ADDR, k_imx708_init[i].reg, k_imx708_init[i].val);
-    }
 
-    /* V91: Use native RAW10 — k_imx708_common already sets 0x0114=0x01 (2-lane)
-     * and 0x0112=0x0A (RAW10). IDI0=0x2B, IBLS=1920 match this format. */
+    /* V148: TEST PATTERN DISABLED — real scene capture.
+     * V147 SOLID test proved Unicam/CSI-2/DMA transport is clean (every row
+     * matched expected bytes perfectly, no banding or shift). The 960-byte cyclic
+     * shift seen in V145 color bars was intrinsic to the IMX708 test pattern
+     * generator + 2x2 binning pipeline, not a transport bug. */
+    i2c_write_reg16(IMX708_ADDR, 0x0600, 0x00);
+    i2c_write_reg16(IMX708_ADDR, 0x0601, 0x00);
+    uart_puts("[IMX708] V150 HDR/DOL+PDAF+embedded OFF, test pattern OFF (real scene)\n");
 
-    /* V103: Restore 2-lane mode — Pi OS uses 2-lane (0x0114=0x01).
-     * k_imx708_common sets 0x0114=0x01 (2-lane) — no override needed.
-     * V94 forced 1-lane (0x0114=0x00) as diagnostic — falsified, reverting.
-     * Unicam side: DAT1=0x05 (DLE|DLLPE), matching Pi OS exactly. */
     i2c_write_reg16(IMX708_ADDR, 0x0100, 0x00);  /* standby until stream_on() */
-
-    uint8_t lane_mode    = i2c_read_reg16(IMX708_ADDR, 0x0114);
-    uint8_t pixel_fmt    = i2c_read_reg16(IMX708_ADDR, 0x0112);
-    uart_puts("[IMX708] V104: 0x0114="); uart_dec((int)lane_mode);
-    uart_puts(" (1=2lane expected)  0x0112="); uart_dec((int)pixel_fmt);
-    uart_puts(" (10=RAW10 expected)\n");
-
-    /* V97 A3 / V104: Extended register readback to verify sensor configuration.
-     * 0x0900 = binning enable (expect 0x01=on), 0x0901 = binning type (expect 0x22).
-     * 0x0310 = MIPI clock mode: 0x00=non-continuous (expect), 0x01=continuous (WRONG). */
-    {
-        uint8_t mode_sel   = i2c_read_reg16(IMX708_ADDR, 0x0100);
-        uint8_t bin_en     = i2c_read_reg16(IMX708_ADDR, 0x0900);
-        uint8_t bin_type   = i2c_read_reg16(IMX708_ADDR, 0x0901);
-        uint8_t fmt_hi     = i2c_read_reg16(IMX708_ADDR, 0x0112);
-        uint8_t fmt_lo     = i2c_read_reg16(IMX708_ADDR, 0x0113);
-        uint8_t clk_mode   = i2c_read_reg16(IMX708_ADDR, 0x0310);
-        uart_puts("[IMX708] V97 A3: mode="); uart_dec((int)mode_sel);
-        uart_puts(" fmt="); uart_hex(((uint32_t)fmt_hi << 8) | fmt_lo);
-        uart_puts(" bin_en="); uart_dec((int)bin_en);
-        uart_puts(" bin_type="); uart_hex(bin_type);
-        uart_puts("\n[IMX708] V104: 0x0310(clk_mode)="); uart_dec((int)clk_mode);
-        uart_puts(" (expect 0=non-continuous; 1=continuous=WRONG)\n");
-    }
     return true;
 }
 

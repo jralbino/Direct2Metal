@@ -78,7 +78,7 @@ bool probe_address(uint8_t addr) {
 }
 
 void bsc_init_and_find() {
-    uart_puts("[CAM] Iniciando Secuencia de Hard-Reset...\n");
+    /* Hard-reset sequence: MCLK → XSHUTDOWN → I2C probe */
 
     uint32_t fsel4 = *GPFSEL4;
     fsel4 &= ~((7u << 0) | (7u << 3) | (7u << 6) | (7u << 12));
@@ -96,7 +96,7 @@ void bsc_init_and_find() {
     // FIX V24: reconfiguramos CM_GP2 a SRC=PLLD (500MHz), DIVI=20 → 25MHz (dentro ±5%).
     // DEBE hacerse ANTES de que XSHUTDOWN suba (GPSET1) para que el sensor arranque
     // con MCLK correcto desde el primer ciclo interno.
-    uart_puts("      > Configurando GPCLK2 (25MHz, SRC=PLLD) en GPIO43...\n");
+    /* Configure GPCLK2 (25MHz, SRC=PLLD) on GPIO43 */
     {
         // Detener CM_GP2 antes de cambiar divisor (requisito BCM2835 clock manager).
         *CM_GP2CTL = CM_PASSWD | 6u;  // ENAB=0, SRC=PLLD (pre-seleccionar fuente)
@@ -109,8 +109,7 @@ void bsc_init_and_find() {
         *CM_GP2DIV = CM_PASSWD | (20u << 12) | 853u;
         *CM_GP2CTL = CM_PASSWD | (1u << 9) | (1u << 4) | 6u;  // MASH=1, ENAB, SRC=PLLD
         delay_ms(2);  // PLL settle antes de XSHUTDOWN
-        uart_puts("      > CM_GP2CTL="); uart_dec((int)*CM_GP2CTL);
-        uart_puts(" CM_GP2DIV="); uart_dec((int)*CM_GP2DIV); uart_puts("\n");
+        /* CM_GP2 configured */
     }
     // ────────────────────────────────────────────────────────────────────────────
 
@@ -132,18 +131,12 @@ void bsc_init_and_find() {
 
     // ── XSHUTDOWN HIGH — sensor arranca con MCLK correcto (25MHz) ───────────────
     *GPSET1 = (1u << (40-32)) | (1u << (41-32)) | (1u << (42-32)) | (1u << (44-32));
-    uart_puts("      > Pines 40/41/42/44 HIGH (Wake up con MCLK=25MHz)...\n");
     delay_ms(300);
 
     // Verificar estado final de GPIO43 y CM_GP2
     {
         uint32_t gpio43_fsel = (*GPFSEL4 >> 9) & 7u;
-        uint32_t gp2ctl = *CM_GP2CTL;
-        uart_puts("[CAM] GPIO43 FSEL="); uart_dec((int)gpio43_fsel);
-        uart_puts(" CM_GP2CTL="); uart_dec((int)gp2ctl);
-        uart_puts(gp2ctl & (1u<<7) ? " (BUSY=OK)\n" : " (BUSY=0 ERROR!)\n");
         if (gpio43_fsel != 4u) {
-            uart_puts("[CAM] WARNING: GPIO43 no es GPCLK2! Forzando ALT0...\n");
             uint32_t fsel4_fix = *GPFSEL4;
             fsel4_fix &= ~(7u << 9);
             fsel4_fix |=  (4u << 9);
@@ -151,14 +144,13 @@ void bsc_init_and_find() {
         }
     }
 
-    uart_puts("[CAM] Probando Bus 1 (GPIO 44/45 via BSC1)...\n");
     select_bus(1);
     if (probe_address(0x1A)) {
-        uart_puts("      > ENCONTRADO! Sensor en Bus 1.\n");
+        uart_puts("[CAM] Sensor found on BSC1\n");
         return;
     }
 
-    uart_puts("[CAM] ERROR: Sensor no encontrado.\n");
+    uart_puts("[CAM] ERROR: Sensor not found\n");
     select_bus(1);   
 }
 

@@ -238,9 +238,7 @@ static int global_frame_counter = 1;
 void run_yolo_complete() {
     watchdog_kick();
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
-    uart_puts("\n=== YOLOv5n DECODER ENGINE [Frame: ");
-    uart_dec(global_frame_counter);
-    uart_puts("] ===\n");
+    uart_puts("[F"); uart_dec(global_frame_counter); uart_puts("] ");
     global_frame_counter++;
     
     WeightStream ws(weights_start); num_preds = 0;
@@ -357,13 +355,24 @@ void run_yolo_complete() {
         }
     }
 
-    // Render frame at maximum resolution.
-    // V124 camera mode: debayer RAW10 RGGB 1536×864 → 640×360 centered vertically
-    //   (60-px top/bottom black letterbox) for native 16:9 full FoV display.
-    // Test mode: upscale 320×320 float tensor to 640×480.
+    // V138: 4-way rotation every ~40 frames to isolate the row-half-swap:
+    //   phase 0: debayer normal   (reads DMA buffer, Bayer interp)
+    //   phase 1: raw grayscale    (reads DMA buffer byte-for-byte)
+    //   phase 2: synthetic L-R    (NO DMA read — pure fb write test)
+    //   phase 3: synthetic gray   (uses grayscale loop BUT computes src values,
+    //                              no DRAM read, no Bayer) — isolates loop bug.
+    extern void debayer_diag_raw_grayscale_fb(uint8_t* fb, uint32_t pitch);
+    extern void debayer_diag_gradient_fb(uint8_t* fb, uint32_t pitch);
+    extern void debayer_diag_synthetic_gray_fb(uint8_t* fb, uint32_t pitch);
     if (g_use_camera) {
+        /* V153: V152 proved HDMI path is clean (synthetic L-dark/R-bright rendered
+         * perfectly). Re-enable normal camera render; the V153 deshift pass now
+         * does 4-state classification + row-clone fallback before debayer runs. */
         camera_render_fullres((uint8_t*)lfb, pitch);
-        video_flush();  /* V118: flush immediately after render to reduce tearing */
+        (void)debayer_diag_raw_grayscale_fb;
+        (void)debayer_diag_gradient_fb;
+        (void)debayer_diag_synthetic_gray_fb;
+        video_flush();
     } else {
         draw_fill(0xFF222222);
         draw_tensor_image_fullscreen(input_img);
@@ -380,13 +389,14 @@ void run_yolo_complete() {
     const int   disp_right  = disp_xoff + (g_use_camera ? CAM_DISP_W : 640);
     const int   disp_bottom = disp_yoff + (g_use_camera ? CAM_DISP_H : 480);
 
-    uart_puts("\n>>> OBJETOS DETECTADOS <<<\n"); int valid_boxes = 0;
+    int valid_boxes = 0;
 
     for (int ii = 0; ii < num_preds; ii++) {
         if (preds[ii].conf > CONF_THRESH) {
             valid_boxes++;
-            uart_puts("Clase: "); uart_dec(preds[ii].cls); uart_puts(" | Conf: "); uart_dec((int)(preds[ii].conf * 100));
-            uart_puts(" | Pos: ["); uart_dec((int)preds[ii].x); uart_puts(","); uart_dec((int)preds[ii].y); uart_puts("]\n");
+            uart_puts("[DET] c="); uart_dec(preds[ii].cls);
+            uart_puts(" %="); uart_dec((int)(preds[ii].conf * 100));
+            uart_puts("\n");
 
             int box_w = (int)(preds[ii].w * disp_scale);
             int box_h = (int)(preds[ii].h * disp_scaleY);
@@ -407,7 +417,7 @@ void run_yolo_complete() {
             }
         }
     }
-    if (valid_boxes == 0) uart_puts("Ningun objeto detectado con confianza suficiente.\n");
+    if (valid_boxes == 0) uart_puts("[DET] none\n");
 
     // Heartbeat indicator: bottom-right corner of the framebuffer (always visible).
     int hb_x = 640 - 50;
@@ -431,48 +441,94 @@ void run_yolo_complete() {
     }
     num_preds = 0; video_flush();
 
-    uart_puts(">> Tiempo RGB: "); uart_dec((t_rgb - t_start)*1000/f); uart_puts(" ms\n");
-    uart_puts(">> Tiempo L0 (K=6): "); uart_dec((t_l0 - t_rgb)*1000/f); uart_puts(" ms\n");
-    uart_puts(">> Tiempo Backbone L1-L8: "); uart_dec((t_backbone - t_l0)*1000/f); uart_puts(" ms\n");
-    uart_puts(">> Tiempo Neck y Heads: "); uart_dec((t_neck - t_backbone)*1000/f); uart_puts(" ms\n");
-    uart_puts(">> Tiempo Decode + NMS: "); uart_dec((t_end - t_nms)*1000/f); uart_puts(" ms\n");
-    uart_puts("TOTAL TIME: "); uart_dec((t_end-t_start)*1000/f); uart_puts(" ms\n--------------------------------\n");
+    uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
+}
+
+/* Camera-only pipeline mirroring camara_direct V162:
+ *
+ *   prime:   capture frame 0; dispatch its debayer async (cores 1-3)
+ *   steady:  capture frame N+1  ──▶ runs in parallel with debayer of frame N
+ *            sync workers       ──▶ frame N now rendered to FB
+ *            flush              ──▶ frame N displayed
+ *            dispatch debayer of N+1, swap "previous frame" pointer
+ *
+ * Cost per iter ≈ max(FSI wait ≈21 ms, 3-core debayer ≈7 ms) + flush.
+ * Expected total ≈22 ms (≈45 fps). */
+extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
+extern const uint8_t* unicam_frame_ptr();
+
+static void run_camera_only() {
+    static bool s_primed = false;
+    if (!s_primed) {
+        if (g_use_camera) {
+            debayer_letterbox_clear((uint8_t*)lfb, pitch);
+            camera_capture();
+            parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
+        } else {
+            draw_fill(0xFF202020);
+            video_flush();
+        }
+        s_primed = true;
+        return;
+    }
+
+    watchdog_kick();
+    const unsigned long f  = get_timer_freq();
+    const unsigned long t0 = get_timer_count();
+
+    if (g_use_camera) {
+        camera_capture();                          /* FSI wait, overlaps with prev debayer */
+    }
+    const unsigned long t1 = get_timer_count();
+
+    if (g_use_camera) {
+        parallel_debayer_wait();                   /* sync: prev frame fully rendered */
+        video_flush();                             /* show prev frame */
+    } else {
+        draw_fill(0xFF202020);
+        video_flush();
+    }
+    const unsigned long t2 = get_timer_count();
+
+    if (g_use_camera) {
+        parallel_debayer_start(unicam_frame_ptr(), (uint8_t*)lfb, pitch);
+    }
+    const unsigned long t3 = get_timer_count();
+
+    const unsigned long cap_ms     = (t1 - t0) * 1000UL / f;
+    const unsigned long flush_ms   = (t2 - t1) * 1000UL / f;
+    const unsigned long disp_ms    = (t3 - t2) * 1000UL / f;
+    const unsigned long tot_ms     = (t3 - t0) * 1000UL / f;
+    uart_puts("[CAM] cap=");    uart_dec((int)cap_ms);
+    uart_puts(" sync+flush=");  uart_dec((int)flush_ms);
+    uart_puts(" disp=");        uart_dec((int)disp_ms);
+    uart_puts(" total=");       uart_dec((int)tot_ms);
+    if (tot_ms > 0) { uart_puts(" fps="); uart_dec((int)(1000UL / tot_ms)); }
+    uart_puts("\n");
 }
 
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal: MOTOR IA EN TIEMPO REAL ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V163 (camera-only, YOLO disabled) ===\r\n");
 
-    // --- PRUEBA DEL MAILBOX Y FIRMWARE DE GPU ---
-    uart_puts("[GPU] Solicitando Firmware Revision...\n");
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
-    if (mbox_call(MBOX_CH_PROP)) {
-        uart_puts("[GPU] EXITO! Firmware de VideoCore IV detectado: 0x"); uart_dec((int)mbox[5]); uart_puts("\n");
-    } else {
-        uart_puts("[GPU] ERROR FATAL: No hay respuesta del Mailbox.\n");
-    }
-    // --------------------------------------------
-
-    uart_puts("[HW] Despertando nucleos desde Spin Tables...\n");
+    if (!mbox_call(MBOX_CH_PROP)) uart_puts("[GPU] ERROR: No mailbox response\n");
     *(volatile uint64_t*)0xE0 = (uint64_t)&_start; *(volatile uint64_t*)0xE8 = (uint64_t)&_start; *(volatile uint64_t*)0xF0 = (uint64_t)&_start;
     asm volatile("sev");
     extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4);
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
-    video_init(); draw_fill(0xFF00FF00); video_flush(); uart_puts("Hardware de Video Listo (V124 verde).\n");
+    video_init(); draw_fill(0xFF00FF00); video_flush();
     init_mmu();
-    if (!camera_init()) uart_puts("[CAM] No camera found, using test_image\r\n");
+    if (!camera_init()) uart_puts("[CAM] No camera — test mode\n");
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
 #ifdef SIMULATION
-    /* In simulation mode: run 3 frames to verify the pipeline, then exit QEMU
-     * cleanly via AArch64 semihosting HLT #0xF000 (QEMU processes this as
-     * ADP_Stopped_ApplicationExit and terminates with return code 0). */
-    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_yolo_complete();
+    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_camera_only();
     uart_puts("[SIM] All simulation frames complete — exiting QEMU.\n");
-    register uint64_t _x0 asm("x0") = 0x20026; /* ADP_Stopped_ApplicationExit */
-    register uint64_t _x1 asm("x1") = 0;       /* exit code 0 = success */
+    register uint64_t _x0 asm("x0") = 0x20026;
+    register uint64_t _x1 asm("x1") = 0;
     asm volatile("hlt #0xf000" :: "r"(_x0), "r"(_x1));
     __builtin_unreachable();
 #else
-    while(1) run_yolo_complete();
+    while(1) run_camera_only();
 #endif
 }

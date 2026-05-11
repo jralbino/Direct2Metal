@@ -21,7 +21,7 @@ uint32_t width, height, pitch, isrgb;
 unsigned char* lfb = 0; 
 
 void video_init() {
-    uart_puts("\n--- INICIANDO PROTOCOLO HDMI (640x480) ---\n");
+    uart_puts("\n[VIDEO] Init 640x480...\n");
 
     mbox[0] = 35 * 4; 
     mbox[1] = 0;      
@@ -57,10 +57,12 @@ void video_init() {
         height = mbox[6];
         pitch = mbox[33]; 
 
-        uart_puts("EXITO! Framebuffer mapeado en: "); uart_hex(mbox[28]); uart_puts("\n");
-        uart_puts("Pitch real: "); uart_dec(pitch); uart_puts(" bytes.\n");
+        uart_puts("[VIDEO] FB="); uart_hex(mbox[28]);
+        uart_puts(" pitch="); uart_dec(pitch);
+        if (pitch != 2560) uart_puts(" WARN:pitch!=2560");
+        uart_puts("\n");
     } else {
-        uart_puts("ERROR FATAL: La GPU rechazo el mensaje.\n");
+        uart_puts("[VIDEO] ERROR: GPU rejected mailbox\n");
     }
 }
 
