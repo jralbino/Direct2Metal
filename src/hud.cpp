@@ -6,8 +6,8 @@ extern void draw_pixel(int x, int y, uint32_t color);
 extern void draw_rect(int x, int y, int w, int h, uint32_t color, int thickness);
 extern void draw_text(int x, int y, const char* s, uint32_t fg, uint32_t bg, int scale);
 
-/* ── COCO 80 (Ultralytics YOLOv5 order) ─────────────────────────────────────
- * Used by YOLOv5n.pt and weights.bin. */
+/* ── COCO 80 (Ultralytics order) ────────────────────────────────────────────
+ * Same class indices across YOLOv5/YOLOv8. Used by weights.bin. */
 const char* const coco_names[80] = {
     "person","bicycle","car","motorcycle","airplane","bus","train","truck",
     "boat","traffic light","fire hydrant","stop sign","parking meter","bench",

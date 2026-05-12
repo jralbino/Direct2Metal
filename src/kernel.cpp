@@ -59,25 +59,33 @@ unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_
 extern "C" const float weights_start[]; extern "C" const float weights_end[];
 extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
 
-/* B1 — YOLO inference resolution. Must be divisible by stride 32. 192 is
- * 2.7× cheaper than 320 in FLOPs but the model's discrimination drops a lot
- * — at 192² distant/small objects are <5×5 px in the P3 grid (stride 8).
- * Bumped back to 320 to A/B-test whether false positives were a resolution
- * issue or a model-capacity issue. fps cost: ~5.2 → ~1.9. */
-#define YOLO_IN  320
+/* V170 — YOLOv8n @ 256². v8 head is heavier than v5 (3 convs × 3 levels for
+ * box+cls), so dropping from 320 to 256 buys ~1.5× compute without much
+ * mAP loss. Stride 32 → S32=8, all spatial dims stay integer. */
+#define YOLO_IN  256
 #define YOLO_S2  (YOLO_IN / 2)
 #define YOLO_S4  (YOLO_IN / 4)
 #define YOLO_S8  (YOLO_IN / 8)
 #define YOLO_S16 (YOLO_IN / 16)
 #define YOLO_S32 (YOLO_IN / 32)
 
+#define DFL_REG_MAX 16   /* v8 default; box ch = 4 * REG_MAX */
+
 static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000];
 static float cam_frame[3 * YOLO_IN * YOLO_IN];
-static float save_L4[64 * YOLO_S8 * YOLO_S8];   static float save_L6[128 * YOLO_S16 * YOLO_S16];
-static float save_Neck_P5[128 * YOLO_S32 * YOLO_S32];
-static float save_Neck_P4[64 * YOLO_S16 * YOLO_S16];
-static float save_P3_Head[64 * YOLO_S8 * YOLO_S8];
-static float save_P4_Head[128 * YOLO_S16 * YOLO_S16];
+
+/* Skip connections + per-level head inputs (v8 PAN). */
+static float save_L4   [64  * YOLO_S8  * YOLO_S8];    /* L4 (P3 backbone)     */
+static float save_L6   [128 * YOLO_S16 * YOLO_S16];   /* L6 (P4 backbone)     */
+static float save_SPPF [256 * YOLO_S32 * YOLO_S32];   /* L9 SPPF out          */
+static float save_P4mid[128 * YOLO_S16 * YOLO_S16];   /* L12 (mid neck)       */
+static float save_P3   [64  * YOLO_S8  * YOLO_S8];    /* L15 → P3 head input  */
+static float save_P4   [128 * YOLO_S16 * YOLO_S16];   /* L18 → P4 head input  */
+
+/* Head per-level scratch. Sized for P3 (largest spatial grid). */
+static float head_box [64 * YOLO_S8 * YOLO_S8];
+static float head_cls [80 * YOLO_S8 * YOLO_S8];
+static float head_tmp [80 * YOLO_S8 * YOLO_S8];
 
 static float mini_exp(float x) {
     if (x > 88.0f) { return 3.40282347e+38f; } // <--- Corregido el warning de indentación
@@ -137,65 +145,129 @@ static float calculate_iou(const Box& a, const Box& b) {
     float area_int = w_int * h_int; return area_int / (a.w * a.h + b.w * b.h - area_int);
 }
 
-static void decode_yolo_grid(float* tensor, int grid_h, int grid_w, int stride, float anchors[3][2]) {
-    int grd = grid_h * grid_w;
-    for (int a = 0; a < 3; a++) {
-        int base_ch = a * 85;
-        for (int cy = 0; cy < grid_h; cy++) {
-            for (int cx = 0; cx < grid_w; cx++) {
-                int idx = cy * grid_w + cx;
-                float obj_conf = fast_sigmoid(tensor[(base_ch + 4) * grd + idx]);
-                if (obj_conf <= OBJ_PRE_THRESH) continue;
-                float max_cls_prob = 0.0f; int best_cls = -1;
-                for (int c = 0; c < NUM_CLASSES; c++) {
-                    float prob = fast_sigmoid(tensor[(base_ch + 5 + c) * grd + idx]);
-                    if (prob > max_cls_prob) { max_cls_prob = prob; best_cls = c; }
-                }
-                float score = obj_conf * max_cls_prob;
-                if (score > OBJ_PRE_THRESH && num_preds < MAX_PREDS) {
-                    float tx = tensor[(base_ch + 0) * grd + idx]; float ty = tensor[(base_ch + 1) * grd + idx];
-                    float tw = tensor[(base_ch + 2) * grd + idx]; float th = tensor[(base_ch + 3) * grd + idx];
-                    preds[num_preds].x = (fast_sigmoid(tx) * 2.0f - 0.5f + cx) * stride;
-                    preds[num_preds].y = (fast_sigmoid(ty) * 2.0f - 0.5f + cy) * stride;
-                    float sw = fast_sigmoid(tw) * 2.0f; float sh = fast_sigmoid(th) * 2.0f;
-                    preds[num_preds].w = (sw * sw) * anchors[a][0]; preds[num_preds].h = (sh * sh) * anchors[a][1];
-                    preds[num_preds].conf = score; preds[num_preds].cls = best_cls; num_preds++;
-                }
+/* ------------------------------------------------------------------ *
+ * YOLOv8 anchor-free DFL decoder.
+ *
+ * Reads the per-level box (64ch, CHW) and class (80ch, CHW, raw logits)
+ * grids produced by Detect.cv2[i] and Detect.cv3[i]. For every cell we:
+ *   1. find argmax over 80 raw cls logits, sigmoid it, prefilter.
+ *   2. for each of 4 sides (l, t, r, b), softmax over 16 bins and take
+ *      the integral E[k] = Σ k * softmax(box[s*16:(s+1)*16]).
+ *   3. recover (x, y, w, h) in YOLO_IN-space using anchor at cell centre.
+ * Pushes preds onto the shared preds[] buffer (consumed by NMS below).
+ * ------------------------------------------------------------------ */
+static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
+                          int gh, int gw, int stride) {
+    int grd = gh * gw;
+    for (int cy = 0; cy < gh; cy++) {
+        for (int cx = 0; cx < gw; cx++) {
+            int idx = cy * gw + cx;
+
+            float max_logit = -1e30f; int best_cls = -1;
+            for (int c = 0; c < NUM_CLASSES; c++) {
+                float v = cls_chw[c * grd + idx];
+                if (v > max_logit) { max_logit = v; best_cls = c; }
             }
+            float p = fast_sigmoid(max_logit);
+            if (p <= OBJ_PRE_THRESH) continue;
+            if (num_preds >= MAX_PREDS) return;
+
+            float dist[4];
+            for (int s = 0; s < 4; s++) {
+                float lmax = -1e30f;
+                for (int k = 0; k < DFL_REG_MAX; k++) {
+                    float lv = box_chw[(s * DFL_REG_MAX + k) * grd + idx];
+                    if (lv > lmax) lmax = lv;
+                }
+                float exps[DFL_REG_MAX]; float esum = 0.0f;
+                for (int k = 0; k < DFL_REG_MAX; k++) {
+                    float e = mini_exp(box_chw[(s * DFL_REG_MAX + k) * grd + idx] - lmax);
+                    exps[k] = e; esum += e;
+                }
+                float inv = 1.0f / esum; float integral = 0.0f;
+                for (int k = 0; k < DFL_REG_MAX; k++) integral += exps[k] * (float)k * inv;
+                dist[s] = integral;
+            }
+            float l = dist[0], t = dist[1], r = dist[2], b = dist[3];
+            float ax = (float)cx + 0.5f, ay = (float)cy + 0.5f;
+            float x_min = ax - l, y_min = ay - t;
+            float x_max = ax + r, y_max = ay + b;
+            preds[num_preds].x = (x_min + x_max) * 0.5f * (float)stride;
+            preds[num_preds].y = (y_min + y_max) * 0.5f * (float)stride;
+            preds[num_preds].w = (x_max - x_min) * (float)stride;
+            preds[num_preds].h = (y_max - y_min) * (float)stride;
+            preds[num_preds].conf = p;
+            preds[num_preds].cls  = best_cls;
+            num_preds++;
         }
     }
 }
 
-void c3_real_inference(float* in, float* out, float* temp, int h, int w, int c_in, int c_out, int n_depth, bool shortcut, WeightStream& ws, const char* prefix) {
-    int c_hidden = c_out / 2; int hw = h * w; int hw_hidden = hw * c_hidden;
-    const float* w_cv1 = ws.next(c_in * c_hidden, "C3_CV1_W"); const float* b_cv1 = ws.next(c_hidden, "C3_CV1_B");
-    const float* w_cv2 = ws.next(c_in * c_hidden, "C3_CV2_W"); const float* b_cv2 = ws.next(c_hidden, "C3_CV2_B");
-    const float* w_cv3 = ws.next(c_hidden * 2 * c_out, "C3_CV3_W"); const float* b_cv3 = ws.next(c_out, "C3_CV3_B");
+/* ------------------------------------------------------------------ *
+ * YOLOv8 C2f block.
+ *
+ * forward(x):
+ *     y = cv1(x)                         # 1x1, c_in → 2*c_hidden
+ *     a, b = split(y, c_hidden, dim=1)
+ *     outs = [a, b]
+ *     for m in bottlenecks:
+ *         b = m(b)                       # b may be added to its input
+ *                                        # via residual when shortcut=True
+ *         outs.append(b)
+ *     return cv2(cat(outs, dim=1))       # 1x1, (2+n)*c_hidden → c_out
+ *
+ * Layout in temp[]:
+ *   [0 .. c_hidden*hw)            slot 0 = a
+ *   [c_hidden*hw .. 2*c_hidden*hw) slot 1 = b
+ *   [2*c_hidden*hw .. 3*c_hidden*hw) slot 2 = m0(b)
+ *   ...
+ *   total length = (2 + n_depth) * c_hidden * hw floats
+ *
+ * The two 3x3 Bottleneck convs alternate `out` and the slot buffer; `in`,
+ * `out`, `temp` must be three distinct buffers.
+ * ------------------------------------------------------------------ */
+void c2f_real_inference(float* in, float* out, float* temp,
+                        int h, int w, int c_in, int c_out, int n_depth,
+                        bool shortcut, WeightStream& ws, const char* prefix) {
+    (void)prefix;
+    int c_hidden = c_out / 2;
+    int hw = h * w;
+    int hw_h = hw * c_hidden;
+    int c_concat = (2 + n_depth) * c_hidden;
 
-    float* branch_a = temp;
-    parallel_conv1x1(in, h, w, c_in, w_cv1, b_cv1, c_hidden, true, branch_a);
-    float* branch_b = temp + hw_hidden;
-    parallel_conv1x1(in, h, w, c_in, w_cv2, b_cv2, c_hidden, true, branch_b);
+    const float* w_cv1 = ws.next(c_in * (2 * c_hidden), "C2f_CV1_W");
+    const float* b_cv1 = ws.next(2 * c_hidden,          "C2f_CV1_B");
+    const float* w_cv2 = ws.next(c_concat * c_out,      "C2f_CV2_W");
+    const float* b_cv2 = ws.next(c_out,                 "C2f_CV2_B");
 
-    float* b_in = branch_a; float* b_out = out;
+    /* cv1: writes (a | b) contiguously into temp slots 0 and 1. */
+    parallel_conv1x1(in, h, w, c_in, w_cv1, b_cv1, 2 * c_hidden, true, temp);
+
     for (int i = 0; i < n_depth; i++) {
-        const float* w_b1 = ws.next(c_hidden * c_hidden, "Bot_CV1_W"); const float* b_b1 = ws.next(c_hidden, "Bot_CV1_B");
-        const float* w_b2 = ws.next(c_hidden * c_hidden * 9, "Bot_CV2_W"); const float* b_b2 = ws.next(c_hidden, "Bot_CV2_B");
+        const float* w_b1 = ws.next(c_hidden * c_hidden * 9, "Bot_CV1_W");
+        const float* b_b1 = ws.next(c_hidden,                "Bot_CV1_B");
+        const float* w_b2 = ws.next(c_hidden * c_hidden * 9, "Bot_CV2_W");
+        const float* b_b2 = ws.next(c_hidden,                "Bot_CV2_B");
 
-        parallel_conv1x1(b_in, h, w, c_hidden, w_b1, b_b1, c_hidden, true, b_out);
-        float* bot_res = b_out + hw_hidden;
-        parallel_conv2d(b_out, h, w, c_hidden, w_b2, b_b2, c_hidden, 3, 1, 1, true, bot_res);
+        float* x_in  = temp + (1 + i) * hw_h;          /* previous slot */
+        float* x_mid = out;                            /* scratch */
+        float* x_out = temp + (2 + i) * hw_h;          /* new slot */
+
+        parallel_conv2d(x_in,  h, w, c_hidden, w_b1, b_b1, c_hidden, 3, 1, 1, true, x_mid);
+        parallel_conv2d(x_mid, h, w, c_hidden, w_b2, b_b2, c_hidden, 3, 1, 1, true, x_out);
 
         if (shortcut) {
             int k = 0;
-            for (; k <= hw_hidden - 4; k += 4) {
-                float32x4_t a = vld1q_f32(b_in + k); float32x4_t b_vec = vld1q_f32(bot_res + k);
-                vst1q_f32(b_in + k, vaddq_f32(a, b_vec));
+            for (; k <= hw_h - 4; k += 4) {
+                float32x4_t a = vld1q_f32(x_in  + k);
+                float32x4_t v = vld1q_f32(x_out + k);
+                vst1q_f32(x_out + k, vaddq_f32(a, v));
             }
-            for (; k < hw_hidden; k++) b_in[k] += bot_res[k];
-        } else copy_tensor(bot_res, b_in, hw_hidden);
+            for (; k < hw_h; k++) x_out[k] += x_in[k];
+        }
     }
-    parallel_conv1x1(temp, h, w, c_out, w_cv3, b_cv3, c_out, true, out);
+
+    parallel_conv1x1(temp, h, w, c_concat, w_cv2, b_cv2, c_out, true, out);
 }
 
 void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c, WeightStream& ws) {
@@ -293,79 +365,116 @@ void run_yolo_complete() {
     }
     unsigned long t_rgb = get_timer_count();
 
-    const float* w0 = ws.next(16*3*6*6, "L0_W"); const float* b0 = ws.next(16, "L0_B");
-    parallel_conv2d(buf_B, YOLO_IN, YOLO_IN, 3, w0, b0, 16, 6, 2, 2, true, buf_A);
+    /* ── Backbone ─────────────────────────────────────────────────────── */
+    const float* w0 = ws.next(16*3*3*3, "L0_W");  const float* b0 = ws.next(16, "L0_B");
+    parallel_conv2d(buf_B, YOLO_IN, YOLO_IN, 3, w0, b0, 16, 3, 2, 1, true, buf_A);
     unsigned long t_l0 = get_timer_count();
 
     const float* w1 = ws.next(32*16*3*3, "L1_W"); const float* b1 = ws.next(32, "L1_B");
     parallel_conv2d(buf_A, YOLO_S2, YOLO_S2, 16, w1, b1, 32, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
 
     const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
     parallel_conv2d(buf_A, YOLO_S4, YOLO_S4, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
     copy_tensor(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
 
     const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
     parallel_conv2d(buf_A, YOLO_S8, YOLO_S8, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 3, true, ws, "L6");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 2, true, ws, "L6");
     copy_tensor(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
 
     const float* w7 = ws.next(256*128*3*3, "L7_W"); const float* b7 = ws.next(256, "L7_B");
     parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
-    c3_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
+    copy_tensor(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
 
     unsigned long t_backbone = get_timer_count();
 
-    const float* w10 = ws.next(128*256, "L10_W"); const float* b10 = ws.next(128, "L10_B");
-    parallel_conv1x1(buf_B, YOLO_S32, YOLO_S32, 256, w10, b10, 128, true, buf_A);
-    copy_tensor(buf_A, save_Neck_P5, 128 * YOLO_S32 * YOLO_S32);
+    /* ── Neck (PAN). v8 differs from v5: no extra 1x1 reductions between
+     *    upsamples — the C2f modules handle the channel reduction. ───── */
 
-    upsample2x_nearest(buf_A, buf_B, YOLO_S32, YOLO_S32, 128);
-    concat_tensor(buf_B, 128, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
-    c3_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 256, 128, 1, false, ws, "L13");
-    copy_tensor(buf_A, save_Neck_P4, 64 * YOLO_S16 * YOLO_S16);
+    /* L10 upsample(SPPF) → L11 concat with L6 → L12 C2f → mid-P4 */
+    upsample2x_nearest(buf_B, buf_A, YOLO_S32, YOLO_S32, 256);
+    concat_tensor(buf_A, 256, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 384, 128, 1, false, ws, "L12");
+    copy_tensor(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);
 
-    const float* w14 = ws.next(64*128, "L14_W"); const float* b14 = ws.next(64, "L14_B");
-    parallel_conv1x1(buf_A, YOLO_S16, YOLO_S16, 128, w14, b14, 64, true, buf_B);
-    copy_tensor(buf_B, save_Neck_P4, 64 * YOLO_S16 * YOLO_S16);
+    /* L13 upsample → L14 concat with L4 → L15 C2f → P3 head input */
+    upsample2x_nearest(buf_A, buf_B, YOLO_S16, YOLO_S16, 128);
+    concat_tensor(buf_B, 128, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S8, YOLO_S8, 192, 64, 1, false, ws, "L15");
+    copy_tensor(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);
 
-    upsample2x_nearest(buf_B, buf_A, YOLO_S16, YOLO_S16, 64);
-    concat_tensor(buf_A, 64, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
-    c3_real_inference(scratch, buf_B, buf_A, YOLO_S8, YOLO_S8, 128, 64, 1, false, ws, "L17");
-    copy_tensor(buf_B, save_P3_Head, 64 * YOLO_S8 * YOLO_S8);
+    /* L16 conv 3x3 s=2 → L17 concat with mid-P4 → L18 C2f → P4 head input */
+    const float* w16 = ws.next(64*64*3*3, "L16_W"); const float* b16 = ws.next(64, "L16_B");
+    parallel_conv2d(buf_A, YOLO_S8, YOLO_S8, 64, w16, b16, 64, 3, 2, 1, true, buf_B);
+    concat_tensor(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 192, 128, 1, false, ws, "L18");
+    copy_tensor(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);
 
-    const float* w18 = ws.next(64*64*3*3, "L18_W"); const float* b18 = ws.next(64, "L18_B");
-    parallel_conv2d(buf_B, YOLO_S8, YOLO_S8, 64, w18, b18, 64, 3, 2, 1, true, buf_A);
-
-    concat_tensor(buf_A, 64, save_Neck_P4, 64, scratch, YOLO_S16 * YOLO_S16);
-    c3_real_inference(scratch, buf_B, buf_A, YOLO_S16, YOLO_S16, 128, 128, 1, false, ws, "L20");
-    copy_tensor(buf_B, save_P4_Head, 128 * YOLO_S16 * YOLO_S16);
-
-    const float* w21 = ws.next(128*128*3*3, "L21_W"); const float* b21 = ws.next(128, "L21_B");
-    parallel_conv2d(buf_B, YOLO_S16, YOLO_S16, 128, w21, b21, 128, 3, 2, 1, true, buf_A);
-
-    concat_tensor(buf_A, 128, save_Neck_P5, 128, scratch, YOLO_S32 * YOLO_S32);
-    c3_real_inference(scratch, buf_B, buf_A, YOLO_S32, YOLO_S32, 256, 256, 1, false, ws, "L23");
+    /* L19 conv 3x3 s=2 → L20 concat with SPPF → L21 C2f → P5 head input */
+    const float* w19 = ws.next(128*128*3*3, "L19_W"); const float* b19 = ws.next(128, "L19_B");
+    parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w19, b19, 128, 3, 2, 1, true, buf_B);
+    concat_tensor(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
+    /* buf_A holds P5 head input (256, S32, S32) — used immediately below. */
 
     unsigned long t_neck = get_timer_count();
 
-    const float* w_det_p3 = ws.next(255*64, "Det_P3_W"); const float* b_det_p3 = ws.next(255, "Det_P3_B");
-    const float* w_det_p4 = ws.next(255*128, "Det_P4_W"); const float* b_det_p4 = ws.next(255, "Det_P4_B");
-    const float* w_det_p5 = ws.next(255*256, "Det_P5_W"); const float* b_det_p5 = ws.next(255, "Det_P5_B");
+    /* ── Detect head (anchor-free DFL).
+     * Per level: cv2 (box, 64 ch) and cv3 (cls, 80 ch), each a 3-conv stack
+     * (3x3 → 3x3 → 1x1). Run P5 first while buf_A still holds it. ── */
 
-    parallel_conv1x1(save_P3_Head, YOLO_S8, YOLO_S8, 64, w_det_p3, b_det_p3, 255, false, scratch);
-    float anchors_p3[3][2] = {{10,13}, {16,30}, {33,23}};
-    decode_yolo_grid(scratch, YOLO_S8, YOLO_S8, 8, anchors_p3);
+    /* All cv2 weights first (in P3, P4, P5 order — same as export). */
+    const float* wb_p3_0 = ws.next(64*64*9, "P3_BOX_0_W"); const float* bb_p3_0 = ws.next(64, "P3_BOX_0_B");
+    const float* wb_p3_1 = ws.next(64*64*9, "P3_BOX_1_W"); const float* bb_p3_1 = ws.next(64, "P3_BOX_1_B");
+    const float* wb_p3_2 = ws.next(64*64,   "P3_BOX_2_W"); const float* bb_p3_2 = ws.next(64, "P3_BOX_2_B");
+    const float* wb_p4_0 = ws.next(64*128*9,"P4_BOX_0_W"); const float* bb_p4_0 = ws.next(64, "P4_BOX_0_B");
+    const float* wb_p4_1 = ws.next(64*64*9, "P4_BOX_1_W"); const float* bb_p4_1 = ws.next(64, "P4_BOX_1_B");
+    const float* wb_p4_2 = ws.next(64*64,   "P4_BOX_2_W"); const float* bb_p4_2 = ws.next(64, "P4_BOX_2_B");
+    const float* wb_p5_0 = ws.next(64*256*9,"P5_BOX_0_W"); const float* bb_p5_0 = ws.next(64, "P5_BOX_0_B");
+    const float* wb_p5_1 = ws.next(64*64*9, "P5_BOX_1_W"); const float* bb_p5_1 = ws.next(64, "P5_BOX_1_B");
+    const float* wb_p5_2 = ws.next(64*64,   "P5_BOX_2_W"); const float* bb_p5_2 = ws.next(64, "P5_BOX_2_B");
 
-    parallel_conv1x1(save_P4_Head, YOLO_S16, YOLO_S16, 128, w_det_p4, b_det_p4, 255, false, scratch);
-    float anchors_p4[3][2] = {{30,61}, {62,45}, {59,119}};
-    decode_yolo_grid(scratch, YOLO_S16, YOLO_S16, 16, anchors_p4);
+    /* Then all cv3 weights. */
+    const float* wc_p3_0 = ws.next(80*64*9, "P3_CLS_0_W"); const float* bc_p3_0 = ws.next(80, "P3_CLS_0_B");
+    const float* wc_p3_1 = ws.next(80*80*9, "P3_CLS_1_W"); const float* bc_p3_1 = ws.next(80, "P3_CLS_1_B");
+    const float* wc_p3_2 = ws.next(80*80,   "P3_CLS_2_W"); const float* bc_p3_2 = ws.next(80, "P3_CLS_2_B");
+    const float* wc_p4_0 = ws.next(80*128*9,"P4_CLS_0_W"); const float* bc_p4_0 = ws.next(80, "P4_CLS_0_B");
+    const float* wc_p4_1 = ws.next(80*80*9, "P4_CLS_1_W"); const float* bc_p4_1 = ws.next(80, "P4_CLS_1_B");
+    const float* wc_p4_2 = ws.next(80*80,   "P4_CLS_2_W"); const float* bc_p4_2 = ws.next(80, "P4_CLS_2_B");
+    const float* wc_p5_0 = ws.next(80*256*9,"P5_CLS_0_W"); const float* bc_p5_0 = ws.next(80, "P5_CLS_0_B");
+    const float* wc_p5_1 = ws.next(80*80*9, "P5_CLS_1_W"); const float* bc_p5_1 = ws.next(80, "P5_CLS_1_B");
+    const float* wc_p5_2 = ws.next(80*80,   "P5_CLS_2_W"); const float* bc_p5_2 = ws.next(80, "P5_CLS_2_B");
 
-    parallel_conv1x1(buf_B, YOLO_S32, YOLO_S32, 256, w_det_p5, b_det_p5, 255, false, scratch);
-    float anchors_p5[3][2] = {{116,90}, {156,198}, {373,326}};
-    decode_yolo_grid(scratch, YOLO_S32, YOLO_S32, 32, anchors_p5);
+    /* P5 head — input still in buf_A. scratch is free. */
+    parallel_conv2d(buf_A,   YOLO_S32, YOLO_S32, 256, wb_p5_0, bb_p5_0, 64, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S32, YOLO_S32, 64,  wb_p5_1, bb_p5_1, 64, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S32, YOLO_S32, 64,  wb_p5_2, bb_p5_2, 64, false,    head_box);
+    parallel_conv2d(buf_A,   YOLO_S32, YOLO_S32, 256, wc_p5_0, bc_p5_0, 80, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S32, YOLO_S32, 80,  wc_p5_1, bc_p5_1, 80, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S32, YOLO_S32, 80,  wc_p5_2, bc_p5_2, 80, false,    head_cls);
+    decode_v8_dfl(head_box, head_cls, YOLO_S32, YOLO_S32, 32);
+
+    /* P4 head — input in save_P4. */
+    parallel_conv2d(save_P4, YOLO_S16, YOLO_S16, 128, wb_p4_0, bb_p4_0, 64, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S16, YOLO_S16, 64,  wb_p4_1, bb_p4_1, 64, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S16, YOLO_S16, 64,  wb_p4_2, bb_p4_2, 64, false,    head_box);
+    parallel_conv2d(save_P4, YOLO_S16, YOLO_S16, 128, wc_p4_0, bc_p4_0, 80, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S16, YOLO_S16, 80,  wc_p4_1, bc_p4_1, 80, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S16, YOLO_S16, 80,  wc_p4_2, bc_p4_2, 80, false,    head_cls);
+    decode_v8_dfl(head_box, head_cls, YOLO_S16, YOLO_S16, 16);
+
+    /* P3 head — input in save_P3. */
+    parallel_conv2d(save_P3, YOLO_S8, YOLO_S8, 64, wb_p3_0, bb_p3_0, 64, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S8, YOLO_S8, 64, wb_p3_1, bb_p3_1, 64, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S8, YOLO_S8, 64, wb_p3_2, bb_p3_2, 64, false,    head_box);
+    parallel_conv2d(save_P3, YOLO_S8, YOLO_S8, 64, wc_p3_0, bc_p3_0, 80, 3, 1, 1, true, head_tmp);
+    parallel_conv2d(head_tmp,YOLO_S8, YOLO_S8, 80, wc_p3_1, bc_p3_1, 80, 3, 1, 1, true, scratch);
+    parallel_conv1x1(scratch,YOLO_S8, YOLO_S8, 80, wc_p3_2, bc_p3_2, 80, false,    head_cls);
+    decode_v8_dfl(head_box, head_cls, YOLO_S8, YOLO_S8, 8);
 
     unsigned long t_nms = get_timer_count();
 
@@ -529,7 +638,7 @@ void run_yolo_complete() {
 
 extern "C" void _start();
 extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V168 (YOLO 320×320 A/B test) ===\r\n");
+    uart_init(); uart_puts("\r\n=== Direct2Metal V170 (YOLOv8n 256×256 anchor-free DFL) ===\r\n");
     hud_init();
 
     mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;

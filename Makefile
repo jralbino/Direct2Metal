@@ -47,6 +47,10 @@ sim_elf: $(SIM_OBJS)
 
 # --- COMPILE RULES ---
 
+# data.s incbins the weights/test_image blobs — track them as explicit
+# prerequisites so `make` rebuilds data.o when either changes.
+data.o sim_data.o: src/weights.bin src/test_image.bin
+
 # Hardware ASM (.s -> %.o)
 %.o: src/%.s
 	$(CC) $(CFLAGS) -c $< -o $@
