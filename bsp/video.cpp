@@ -1,9 +1,10 @@
 #include <stdint.h>
+#include "bsp.h"
 
 extern volatile uint32_t mbox[36];
 extern int mbox_call(unsigned char ch);
 extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
-extern void uart_puts(const char* s); 
+extern void uart_puts(const char* s);
 extern void uart_dec(int n);
 
 void uart_hex(uint32_t d) {
@@ -115,6 +116,15 @@ void draw_tensor_image(const float* img, int x_off, int y_off, int img_w, int im
 }
 
 void video_flush() { if (lfb) flush_to_ram((volatile void*)lfb, pitch * height); }
+
+bsp_fb_t bsp_fb_get() {
+    bsp_fb_t fb;
+    fb.pixels = (uint8_t*)lfb;
+    fb.w      = width;
+    fb.h      = height;
+    fb.pitch  = pitch;
+    return fb;
+}
 
 // ---- Bitmap font 5×7 (row-major, bit4=left, bit0=right) ----
 // Extended in V167 to cover full A–Z so COCO class names render readably.

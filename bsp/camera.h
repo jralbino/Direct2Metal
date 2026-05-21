@@ -5,20 +5,13 @@
 // Returns false on QEMU / no-camera hardware (falls back to test_image).
 bool camera_init();
 
-// Capture one RAW8 frame and convert to normalized float32 CHW [3][320][320].
-// dst must point to 3*320*320 floats = 1,228,800 bytes (cam_frame in BSS).
-// Output values are in [0.0, 1.0] (already divided by 255).
-void camera_capture_frame(float* dst);
-
-// Capture-only: blocks until next sensor frame is available, runs AE, no
-// CHW320 build. Use when YOLO is disabled and you only need the framebuffer
-// render. Saves ~5 ms / frame vs camera_capture_frame.
-bool camera_capture();
+// Frame capture moved to bsp.h::bsp_frame_acquire() (Step 3, 2026-05-20).
+// Debayer-to-YOLO-tensor moved to bsp.h::debayer_raw10_to_chw_yolo().
 
 // Render the last captured RAW10 frame directly to the framebuffer at native 16:9.
 // V124: Debayers the full 1536×864 sensor frame into a 640×360 image centered
 // vertically in the 640×480 framebuffer. Top/bottom 60-pixel rows are black
-// letterbox bars. Must be called after camera_capture_frame() for the same frame.
+// letterbox bars. Must be called after bsp_frame_acquire() for the same frame.
 void camera_render_fullres(uint8_t* fb, uint32_t pitch);
 
 // V135: Display geometry (YOLO bounding-box overlay region).

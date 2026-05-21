@@ -1,68 +1,30 @@
-/* File: src/kernel.cpp - CLEAN VERSION (FIXED INCLUDES & WARNINGS) */
+/* src/yolo_v8n.cpp — YOLOv8n COCO model graph + inference loop body.
+ *
+ * Split from kernel.cpp on 2026-05-20 (Step 4 of the BSP/app boundary,
+ * see GOALS.md G1). Will move to app/yolo_v8n_coco/ in Step 5.
+ *
+ * V170 — YOLOv8n @ 256². v8 head is heavier than v5 (3 convs × 3 levels
+ * for box+cls), so dropping from 320 to 256 buys ~1.5× compute without
+ * much mAP loss. Stride 32 → S32=8, all spatial dims stay integer.
+ * YOLO_IN comes from bsp.h (Step 3.5: single source of truth shared with
+ * the debayer). */
 #include <stdint.h>
-#include <cstddef>          // <--- AÑADIDO: Soluciona el error de size_t
+#include <cstddef>
 #include <arm_neon.h>
 #include "ops.h"
-#include "mmu.h"
 #include "multicore.h"
 #include "safety_config.h"
 #include "watchdog.h"
 #include "camera.h"
-#include "mailbox.h"
 #include "hud.h"
+#include "bsp.h"
+#include "yolo_v8n.h"
 
-#ifndef NULL
-#define NULL 0
-#endif
+/* Weight blob + test image — defined by src/data.s via .incbin. */
+extern "C" const float weights_start[];
+extern "C" const float weights_end[];
+extern "C" const float test_image[];
 
-extern void video_init(); extern void draw_pixel(int x, int y, uint32_t color);
-extern void draw_rect(int x, int y, int w, int h, uint32_t color, int thickness);
-extern void draw_fill(uint32_t color); extern void draw_tensor_image(const float* img, int x_off, int y_off, int img_w, int img_h);
-extern void draw_text(int x, int y, const char* s, uint32_t fg, uint32_t bg, int scale);
-extern void video_flush();
-// Framebuffer pointer and pitch exported from video.cpp
-extern unsigned char* lfb;
-extern uint32_t pitch;
-// Multi-core debayer (declared in multicore.h) — needs the raw frame pointer.
-extern const uint8_t* unicam_frame_ptr();
-extern void debayer_letterbox_clear(uint8_t* fb, uint32_t pitch);
-extern "C" uint16_t imx708_ae_cit_get();
-extern const char* const coco_names[80];      /* defined in hud.cpp */
-
-volatile uint32_t* const UART0_DR = (uint32_t*)0x3F201000;
-volatile uint32_t* const UART0_FR = (uint32_t*)0x3F201018;
-volatile uint32_t* const UART0_CR = (uint32_t*)0x3F201030;
-
-void uart_init() {
-    *UART0_CR = 0;
-    *((volatile uint32_t*)0x3F200004) = (*((volatile uint32_t*)0x3F200004) & ~((7 << 12) | (7 << 15))) | ((4 << 12) | (4 << 15));
-    *((volatile uint32_t*)0x3F201044) = 0x7FF;
-    *((volatile uint32_t*)0x3F201024) = 26;
-    *((volatile uint32_t*)0x3F201028) = 3;
-    *((volatile uint32_t*)0x3F20102C) = 0x70;
-    *UART0_CR = 0x301;
-}
-void uart_putc(unsigned char c) { while (*UART0_FR & (1 << 5)); *UART0_DR = c; }
-void uart_puts(const char* s) { while (*s) { if (*s == '\n') uart_putc('\r'); uart_putc(*s++); } }
-extern "C" void uart_puts_c(const char* s) { uart_puts(s); }
-void uart_dec(int n) {
-    if (n < 0) { uart_putc('-'); n = -n; }
-    if (n == 0) { uart_putc('0'); return; }
-    char buf[20]; int i = 0;
-    while (n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; }
-    while (--i >= 0) uart_putc(buf[i]);
-}
-
-unsigned long get_timer_freq() { unsigned long v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
-unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_el0" : "=r"(v)); return v; }
-
-extern "C" const float weights_start[]; extern "C" const float weights_end[];
-extern "C" const float test_image[]; extern "C" void flush_to_ram(volatile void* addr, unsigned long size);
-
-/* V170 — YOLOv8n @ 256². v8 head is heavier than v5 (3 convs × 3 levels for
- * box+cls), so dropping from 320 to 256 buys ~1.5× compute without much
- * mAP loss. Stride 32 → S32=8, all spatial dims stay integer. */
-#define YOLO_IN  256
 #define YOLO_S2  (YOLO_IN / 2)
 #define YOLO_S4  (YOLO_IN / 4)
 #define YOLO_S8  (YOLO_IN / 8)
@@ -88,7 +50,7 @@ static float head_cls [80 * YOLO_S8 * YOLO_S8];
 static float head_tmp [80 * YOLO_S8 * YOLO_S8];
 
 static float mini_exp(float x) {
-    if (x > 88.0f) { return 3.40282347e+38f; } // <--- Corregido el warning de indentación
+    if (x > 88.0f) { return 3.40282347e+38f; }
     if (x < -88.0f) { return 0.0f; }
     float z = x * 1.44269504f; int32_t k = (z >= 0.0f) ? (int32_t)(z + 0.5f) : (int32_t)(z - 0.5f);
     float r = x - (float)k * 0.69314718f;
@@ -315,15 +277,14 @@ static void draw_tensor_image_fullscreen(const float* img) {
             int src_x = (x * YOLO_IN) / 640;
             int idx = src_y * YOLO_IN + src_x;
             int r = (int)(dst_r[idx] * 255.0f); int g = (int)(dst_g[idx] * 255.0f); int b = (int)(dst_b[idx] * 255.0f);
-            
-            // <--- Corregidos los warnings de indentación
+
             if (r < 0) { r = 0; }
             if (r > 255) { r = 255; }
             if (g < 0) { g = 0; }
             if (g > 255) { g = 255; }
             if (b < 0) { b = 0; }
             if (b > 255) { b = 255; }
-            
+
             uint32_t color = 0xFF000000 | (b << 16) | (g << 8) | r; draw_pixel(x, y, color);
         }
     }
@@ -336,7 +297,7 @@ void run_yolo_complete() {
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
     uart_puts("[F"); uart_dec(global_frame_counter); uart_puts("] ");
     global_frame_counter++;
-    
+
     WeightStream ws(weights_start); num_preds = 0;
 
     static bool weights_verified = false;
@@ -347,7 +308,14 @@ void run_yolo_complete() {
         weights_verified = true;
     }
 
-    if (g_use_camera) camera_capture_frame(cam_frame);
+    if (g_use_camera) {
+        if (bsp_frame_acquire()) {
+            debayer_raw10_to_chw_yolo(cam_frame);
+        } else {
+            const int n = 3 * YOLO_IN * YOLO_IN;
+            for (int i = 0; i < n; i++) cam_frame[i] = 0.0f;
+        }
+    }
     const float* input_img = g_use_camera ? cam_frame : test_image;
 
     int hw = YOLO_IN * YOLO_IN;
@@ -419,7 +387,6 @@ void run_yolo_complete() {
     parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w19, b19, 128, 3, 2, 1, true, buf_B);
     concat_tensor(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
-    /* buf_A holds P5 head input (256, S32, S32) — used immediately below. */
 
     unsigned long t_neck = get_timer_count();
 
@@ -427,7 +394,6 @@ void run_yolo_complete() {
      * Per level: cv2 (box, 64 ch) and cv3 (cls, 80 ch), each a 3-conv stack
      * (3x3 → 3x3 → 1x1). Run P5 first while buf_A still holds it. ── */
 
-    /* All cv2 weights first (in P3, P4, P5 order — same as export). */
     const float* wb_p3_0 = ws.next(64*64*9, "P3_BOX_0_W"); const float* bb_p3_0 = ws.next(64, "P3_BOX_0_B");
     const float* wb_p3_1 = ws.next(64*64*9, "P3_BOX_1_W"); const float* bb_p3_1 = ws.next(64, "P3_BOX_1_B");
     const float* wb_p3_2 = ws.next(64*64,   "P3_BOX_2_W"); const float* bb_p3_2 = ws.next(64, "P3_BOX_2_B");
@@ -438,7 +404,6 @@ void run_yolo_complete() {
     const float* wb_p5_1 = ws.next(64*64*9, "P5_BOX_1_W"); const float* bb_p5_1 = ws.next(64, "P5_BOX_1_B");
     const float* wb_p5_2 = ws.next(64*64,   "P5_BOX_2_W"); const float* bb_p5_2 = ws.next(64, "P5_BOX_2_B");
 
-    /* Then all cv3 weights. */
     const float* wc_p3_0 = ws.next(80*64*9, "P3_CLS_0_W"); const float* bc_p3_0 = ws.next(80, "P3_CLS_0_B");
     const float* wc_p3_1 = ws.next(80*80*9, "P3_CLS_1_W"); const float* bc_p3_1 = ws.next(80, "P3_CLS_1_B");
     const float* wc_p3_2 = ws.next(80*80,   "P3_CLS_2_W"); const float* bc_p3_2 = ws.next(80, "P3_CLS_2_B");
@@ -489,7 +454,7 @@ void run_yolo_complete() {
     for (int ii = 0; ii < num_preds; ii++) {
         if (preds[ii].conf <= 0.0f) continue;
         for (int jj = ii + 1; jj < num_preds; jj++) {
-            if (preds[jj].conf <= 0.0f) continue;           
+            if (preds[jj].conf <= 0.0f) continue;
             if (preds[jj].conf < CONF_THRESH * 0.5f) break;
             if (calculate_iou(preds[ii], preds[jj]) > NMS_THRESH) preds[jj].conf = 0.0f;
         }
@@ -521,7 +486,6 @@ void run_yolo_complete() {
         const int THUMB_Y = 64;
         debayer_raw10_to_thumbnail(unicam_frame_ptr(), (uint8_t*)lfb, pitch,
                                    THUMB_X, THUMB_Y, THUMB_W, THUMB_H);
-        /* 1-px accent border around the thumbnail */
         draw_rect(THUMB_X - 1, THUMB_Y - 1, THUMB_W + 2, THUMB_H + 2,
                   0xFF00C0FFu, 1);
     } else {
@@ -560,7 +524,6 @@ void run_yolo_complete() {
             if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
 
             if (box_w > 2 && box_h > 2) {
-                /* Color cycle per class so different objects get different colors. */
                 static const uint32_t bbox_palette[6] = {
                     0xFF00C0FFu, 0xFF00FF80u, 0xFFFF00FFu,
                     0xFFFFC000u, 0xFF80FF00u, 0xFFFF4080u
@@ -580,10 +543,6 @@ void run_yolo_complete() {
                 lbl[ln++] = '0' + (pct % 10);
                 lbl[ln++] = '%';
                 lbl[ln] = '\0';
-                /* Label sits above the bbox if there's room, otherwise inside.
-                 * Scale 2 = 16-px-tall glyphs, readable at typical viewing
-                 * distance. Solid black bg per-glyph (draw_text fills bg) so
-                 * the label is legible against bright bbox content. */
                 int label_y = (top - 18 >= disp_yoff) ? top - 18 : top + 4;
                 draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 2);
             }
@@ -594,9 +553,9 @@ void run_yolo_complete() {
 
     unsigned long t_end = get_timer_count();
 
-    /* B0: per-stage profiling. Prints once per frame so we can see where the
-     * budget goes. cap → rgb prep, l0 → first conv2d, backbone → through L8,
-     * neck → through L23, head → up to NMS, total → end. */
+    /* B0: per-stage profiling. cap → rgb prep, l0 → first conv2d,
+     * backbone → through L8, neck → through L23, head → up to NMS,
+     * total → end. */
     {
         unsigned long ms_cap      = (t_rgb      - t_start)    * 1000UL / f;
         unsigned long ms_l0       = (t_l0       - t_rgb)      * 1000UL / f;
@@ -634,31 +593,4 @@ void run_yolo_complete() {
     num_preds = 0; video_flush();
 
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
-}
-
-extern "C" void _start();
-extern "C" void kernel_main() {
-    uart_init(); uart_puts("\r\n=== Direct2Metal V170 (YOLOv8n 256×256 anchor-free DFL) ===\r\n");
-    hud_init();
-
-    mbox[0] = 7 * 4; mbox[1] = 0; mbox[2] = 0x00000001; mbox[3] = 4; mbox[4] = 0; mbox[5] = 0; mbox[6] = 0;
-    if (!mbox_call(MBOX_CH_PROP)) uart_puts("[GPU] ERROR: No mailbox response\n");
-    *(volatile uint64_t*)0xE0 = (uint64_t)&_start; *(volatile uint64_t*)0xE8 = (uint64_t)&_start; *(volatile uint64_t*)0xF0 = (uint64_t)&_start;
-    asm volatile("sev");
-    extern volatile int bss_ready; bss_ready = 1; flush_to_ram((void*)&bss_ready, 4);
-    asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
-    video_init(); draw_fill(0xFF00FF00); video_flush();
-    init_mmu();
-    if (!camera_init()) uart_puts("[CAM] No camera — test mode\n");
-    if (get_timer_freq() != 62500000UL) watchdog_init(4000);
-#ifdef SIMULATION
-    for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_yolo_complete();
-    uart_puts("[SIM] All simulation frames complete — exiting QEMU.\n");
-    register uint64_t _x0 asm("x0") = 0x20026;
-    register uint64_t _x1 asm("x1") = 0;
-    asm volatile("hlt #0xf000" :: "r"(_x0), "r"(_x1));
-    __builtin_unreachable();
-#else
-    while(1) run_yolo_complete();
-#endif
 }

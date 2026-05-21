@@ -4,72 +4,85 @@ CXX = aarch64-linux-gnu-g++
 LD = aarch64-linux-gnu-ld
 OBJCOPY = aarch64-linux-gnu-objcopy
 
+# --- APPLICATION SELECTOR ---
+# Step 5 (BSP/app split): one image per app. Override with `make APP=other`.
+APP ?= yolo_v8n_coco
+
+# --- INCLUDE PATHS ---
+INC = -Ibsp -Iruntime -Iapp/$(APP)
+
 # --- FLAGS ---
-CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding -Isrc
+CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)
 CXXFLAGS = -Wall -O3 -g -nostdlib -nostartfiles -ffreestanding \
            -mcpu=cortex-a53 -mtune=cortex-a53 \
            -funsafe-math-optimizations -ffast-math \
            -ftree-vectorize \
            -mno-outline-atomics \
            -Wno-array-bounds \
-           -Isrc \
+           $(INC) \
            -Werror=return-type
 
 SIMFLAGS = $(CXXFLAGS) -DSIMULATION
 
 # --- SOURCES ---
-ASM_SRCS = src/start.s src/matmul_neon.s src/data.s src/conv2d_neon.s
-CPP_SRCS = src/kernel.cpp src/ops.cpp src/conv2d.cpp src/mmu.cpp src/multicore.cpp \
-           src/mailbox.cpp src/video.cpp src/watchdog.cpp \
-           src/camera.cpp src/camera_bsc.cpp src/camera_imx708.cpp \
-           src/camera_unicam.cpp src/camera_debayer.cpp \
-           src/hud.cpp
+# Object files are flat at the project root; filenames are globally unique so
+# no collision. VPATH below tells make where to find each source by basename.
+BSP_ASM_SRCS  = bsp/start.s
+BSP_CPP_SRCS  = bsp/kernel.cpp bsp/mmu.cpp bsp/multicore.cpp \
+                bsp/mailbox.cpp bsp/video.cpp bsp/watchdog.cpp \
+                bsp/camera.cpp bsp/camera_bsc.cpp bsp/camera_imx708.cpp \
+                bsp/camera_unicam.cpp bsp/camera_debayer.cpp
 
-# --- HARDWARE OBJECTS ---
-HW_OBJS = $(ASM_SRCS:src/%.s=%.o) $(CPP_SRCS:src/%.cpp=%.o)
+RT_CPP_SRCS   = runtime/ops.cpp runtime/conv2d.cpp
+RT_ASM_SRCS   = runtime/neon/matmul_neon.s runtime/neon/conv2d_neon.s
 
-# --- SIMULATION OBJECTS (separate prefix to avoid stale .o conflicts) ---
-SIM_ASM_OBJS = $(ASM_SRCS:src/%.s=sim_%.o)
-SIM_CPP_OBJS = $(CPP_SRCS:src/%.cpp=sim_%.o)
-SIM_OBJS     = $(SIM_ASM_OBJS) $(SIM_CPP_OBJS)
+APP_ASM_SRCS  = app/$(APP)/data.s
+APP_CPP_SRCS  = app/$(APP)/yolo_v8n.cpp app/$(APP)/hud.cpp
+
+ASM_SRCS = $(BSP_ASM_SRCS) $(RT_ASM_SRCS) $(APP_ASM_SRCS)
+CPP_SRCS = $(BSP_CPP_SRCS) $(RT_CPP_SRCS) $(APP_CPP_SRCS)
+
+# Where to find sources by basename (filenames are globally unique).
+VPATH = bsp:runtime:runtime/neon:app/$(APP)
+
+# --- HARDWARE OBJECTS (flat at project root) ---
+HW_OBJS = $(notdir $(ASM_SRCS:.s=.o)) $(notdir $(CPP_SRCS:.cpp=.o))
+
+# --- SIMULATION OBJECTS (sim_ prefix to avoid stale .o conflicts) ---
+SIM_OBJS = $(addprefix sim_,$(HW_OBJS))
 
 # --- TARGETS ---
 all: kernel8.img
 
-# Simulation build: recompile ALL objects with -DSIMULATION, then run QEMU
 sim: $(SIM_OBJS)
-	$(LD) -T src/linker.ld -o kernel8_sim.elf $(SIM_OBJS)
+	$(LD) -T bsp/linker.ld -o kernel8_sim.elf $(SIM_OBJS)
 	qemu-system-aarch64 -M raspi3b -kernel kernel8_sim.elf -serial stdio -display none
 
-# Build sim ELF without running (for inspection)
 sim_elf: $(SIM_OBJS)
-	$(LD) -T src/linker.ld -o kernel8_sim.elf $(SIM_OBJS)
+	$(LD) -T bsp/linker.ld -o kernel8_sim.elf $(SIM_OBJS)
 
 # --- COMPILE RULES ---
 
-# data.s incbins the weights/test_image blobs — track them as explicit
-# prerequisites so `make` rebuilds data.o when either changes.
-data.o sim_data.o: src/weights.bin src/test_image.bin
+# data.s incbins weights/test_image — rebuild data.o when either changes.
+data.o sim_data.o: app/$(APP)/weights.bin app/$(APP)/test_image.bin
 
-# Hardware ASM (.s -> %.o)
-%.o: src/%.s
+# Hardware ASM/C++ (VPATH-resolved).
+%.o: %.s
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Hardware C++ (.cpp -> %.o)
-%.o: src/%.cpp
+%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Simulation ASM (.s -> sim_%.o)  — no -DSIMULATION needed for ASM
-sim_%.o: src/%.s
+# Simulation ASM/C++ — sim_ prefix, -DSIMULATION for C++.
+sim_%.o: %.s
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Simulation C++ (.cpp -> sim_%.o) — adds -DSIMULATION
-sim_%.o: src/%.cpp
+sim_%.o: %.cpp
 	$(CXX) $(SIMFLAGS) -c $< -o $@
 
 # --- LINK ---
-kernel8.elf: src/linker.ld $(HW_OBJS)
-	$(LD) -T src/linker.ld -o $@ $(HW_OBJS)
+kernel8.elf: bsp/linker.ld $(HW_OBJS)
+	$(LD) -T bsp/linker.ld -o $@ $(HW_OBJS)
 
 # --- FINAL IMAGE ---
 kernel8.img: kernel8.elf

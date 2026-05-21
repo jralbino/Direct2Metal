@@ -1,10 +1,7 @@
 /* HUD chrome — animated top + bottom bars. See hud.h for the layout. */
 #include "hud.h"
 #include <stdint.h>
-
-extern void draw_pixel(int x, int y, uint32_t color);
-extern void draw_rect(int x, int y, int w, int h, uint32_t color, int thickness);
-extern void draw_text(int x, int y, const char* s, uint32_t fg, uint32_t bg, int scale);
+#include "bsp.h"   /* draw_pixel / draw_rect / draw_text */
 
 /* ── COCO 80 (Ultralytics order) ────────────────────────────────────────────
  * Same class indices across YOLOv5/YOLOv8. Used by weights.bin. */

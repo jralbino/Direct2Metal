@@ -1,16 +1,16 @@
 /* RAW10 BGGR debayer + libcamera ISP (BLC/WB/CCM/gamma) for IMX708 binned
  * 1536x864 mode. Two consumers:
- *   - debayer_raw10_to_chw320: 864×864 center crop → 320×320 CHW float32
- *     (YOLO input).
- *   - debayer_raw10_to_fb:     full 1536×864 frame → 640×360 letterboxed
+ *   - debayer_raw10_to_chw_yolo: 864×864 center crop → YOLO_IN² CHW float32
+ *     (YOLO input). YOLO_IN comes from bsp.h.
+ *   - debayer_raw10_to_fb:       full 1536×864 frame → 640×360 letterboxed
  *     in the 640×480 framebuffer (display).
  * Both use the same per-pixel pipeline so YOLO and the user see identical
  * colour. Pipeline + constants ported byte-exact from camara_direct V162. */
 #include <stdint.h>
+#include "bsp.h"   /* unicam_frame_ptr */
 
-extern const uint8_t* unicam_frame_ptr();
-extern int            unicam_frame_w();   /* byte stride (1920) */
-extern int            unicam_frame_h();   /* 864                 */
+extern int            unicam_frame_w();   /* byte stride (1920) — BSP-internal */
+extern int            unicam_frame_h();   /* 864                 — BSP-internal */
 
 /* libcamera ISP constants — verbatim from linux_extract/tuning/imx708.json
  * (camara_direct V162). BlackLevel=64 in 10-bit → 16 in MSB8. WB Q8 from
@@ -101,14 +101,14 @@ static inline void isp_pixel(uint8_t Rin, uint8_t Gin, uint8_t Bin,
 #define SENSOR_BLK_W  (SENSOR_PX_W / 2)   /* 768 Bayer blocks horizontally   */
 #define SENSOR_BLK_H  (SENSOR_PX_H / 2)   /* 432 Bayer blocks vertically     */
 
-/* ── YOLO path: 864×864 center crop → 256×256 ─────────────────────────────── */
-/* Must match YOLO_IN in kernel.cpp. V170: 320→256 to amortise v8n's heavier
- * head (3-conv cv2/cv3 stack per level). STEP_Q8 = 864/256 in Q8 = 864. */
-#define OUT_W    256
-#define OUT_H    256
+/* ── YOLO path: 864×864 center crop → YOLO_IN² ─────────────────────────── */
+/* YOLO_IN is exported by bsp.h so the model and the debayer share one
+ * source of truth. STEP_Q8 = (CROP_SZ << 8) / YOLO_IN. */
+#define OUT_W    YOLO_IN
+#define OUT_H    YOLO_IN
 #define CROP_X   336                      /* (1536 - 864) / 2                */
 #define CROP_SZ  864
-#define STEP_Q8  864                      /* 864/256 = 3.375 in Q8           */
+#define STEP_Q8  ((CROP_SZ << 8) / YOLO_IN)
 
 /* ── Framebuffer path: full 1536×864 → 640×360 letterboxed on 640×480 ──── */
 /* V135: native aspect 1536:864 = 16:9. At 640 wide: 640 × (864/1536) = 360.
@@ -126,7 +126,7 @@ static inline uint8_t raw10_msb8(const uint8_t* row, int col) {
     return row[group * 5 + pos];
 }
 
-/* ── YOLO input: debayer 864×864 center crop → 320×320 CHW float32 ───────
+/* ── YOLO input: debayer 864×864 center crop → YOLO_IN² CHW float32 ──────
  *
  * V162 port: full libcamera-style ISP applied so the model sees the same
  * R/G/B distribution it was trained on.
@@ -137,7 +137,7 @@ static inline uint8_t raw10_msb8(const uint8_t* row, int col) {
  *
  * Per-pixel pipeline: gather 2×2 block → black-level subtract → WB Q8 →
  * CCM Q10 → gamma LUT → divide by 255 into float plane. */
-void debayer_raw10_to_chw320(float* dst) {
+void debayer_raw10_to_chw_yolo(float* dst) {
     if (!k_gamma_ready) build_gamma_lut();
 
     const uint8_t* frame = unicam_frame_ptr();
@@ -232,9 +232,7 @@ void debayer_raw10_to_fb_band(const uint8_t* raw, uint8_t* fb, uint32_t pitch,
     }
 }
 
-/* Single-core convenience wrapper: clear letterbox + debayer full image.
- * Used by the existing camera_render_fullres call site. The multi-core
- * pipeline (parallel_debayer_*) bypasses this and dispatches bands directly. */
+/* Single-core convenience wrapper: clear letterbox + debayer full image. */
 void debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch) {
     debayer_letterbox_clear(fb, pitch);
     debayer_raw10_to_fb_band(unicam_frame_ptr(), fb, pitch, 0, DISP_H);

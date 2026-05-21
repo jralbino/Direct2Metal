@@ -1,6 +1,7 @@
 /* File: src/camera.cpp - V154: deshift bounded to real DMA'd rows + zero stale tail (fixes DUP runaway) */
 #include "camera.h"
 #include <stdint.h>
+#include "bsp.h"   /* unicam_frame_ptr */
 
 extern void uart_puts(const char* s);
 extern void uart_dec(int n);
@@ -11,11 +12,9 @@ extern uint8_t imx708_read_frame_count();
 extern void   unicam_init();
 extern bool   unicam_capture_frame();
 extern void   unicam_print_lane_state(const char* tag);
-extern void   debayer_raw10_to_chw320(float* dst);
 extern void   debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch);
 extern void   watchdog_kick();
 extern void   i2c_write_reg16(uint8_t dev_addr, uint16_t reg, uint8_t val);
-extern const uint8_t* unicam_frame_ptr();
 
 bool g_use_camera = false;
 
@@ -106,21 +105,18 @@ bool camera_init() {
     return true;
 }
 
-void camera_capture_frame(float* dst) {
-    if (unicam_capture_frame()) {
-        debayer_raw10_to_chw320(dst);
-        /* AE runs after the frame is captured — safe to read the completed
-         * buffer. Effect lands on the next frame after the sensor processes
-         * the group-hold I2C update. */
-        ae_step();
-    } else {
-        uart_puts("[CAM] Capture failed — using zero tensor\n");
-        for (int i = 0; i < (3 * 320 * 320); i++) dst[i] = 0.0f;
+/* Step 3 (BSP/app split): single capture entry point. Block until the
+ * sensor delivers a frame, then run AE so the next sensor frame reflects
+ * the new exposure. The app calls debayer_raw10_to_chw_yolo() separately
+ * if it wants the YOLO tensor. */
+bool bsp_frame_acquire() {
+    if (!unicam_capture_frame()) {
+        uart_puts("[CAM] Capture failed\n");
+        return false;
     }
-}
-
-bool camera_capture() {
-    if (!unicam_capture_frame()) return false;
+    /* AE runs after the frame is captured — safe to read the completed
+     * buffer. Effect lands on the next frame after the sensor processes
+     * the group-hold I2C update. */
     ae_step();
     return true;
 }
