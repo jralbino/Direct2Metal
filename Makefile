@@ -63,8 +63,8 @@ sim_elf: $(SIM_OBJS)
 
 # --- COMPILE RULES ---
 
-# data.s incbins weights/test_image — rebuild data.o when either changes.
-data.o sim_data.o: app/$(APP)/weights.bin app/$(APP)/test_image.bin
+# data.s incbins weights/test_image — rebuild data.o when any changes.
+data.o sim_data.o: app/$(APP)/weights.bin app/$(APP)/weights_int8.bin app/$(APP)/test_image.bin
 
 # Hardware ASM/C++ (VPATH-resolved).
 %.o: %.s

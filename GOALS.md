@@ -92,9 +92,27 @@ Reach a frame rate where real-world applications are worth pursuing.
 Today: **1.41 fps** at YOLOv8n 256² FP32 (V170). Track B in PLAN.md
 projects ~13–15 fps after INT8 + frame-skip.
 
-- [ ] **B3 — INT8 quantization** (`tools/B3_INT8_PLAN.md`). Calibrated
-      offline on ~50 real frames, `vmlal_s16` + `vmovl_s8` kernels.
-      *This is the single highest-impact item open on the project.*
+- **B3 — INT8 quantization** (`tools/B3_INT8_PLAN.md`). Calibrated
+  offline on ~50 real frames, `vmlal_s16` + `vmovl_s8` kernels.
+  Three tiers (gain × effort):
+  - **Tier 1 (W8A32, dequant on load) — ×1.2-1.5, ~2-3 days.**
+    - [x] *Slice 1 (2026-05-20)*: data.s wires `weights_int8.bin`
+          (3.17 MB) alongside the FP32 blob; runtime CRC check
+          (`WEIGHTS_INT8_CRC32`) validates the blob shipped intact;
+          `WeightStreamINT8` reader + `dequant_int8_to_fp32_neon` NEON
+          helper added and compile-tested. Image grew 13.9 → 17.0 MB.
+          FP32 path byte-identical, INT8 path unused yet.
+    - [ ] *Slice 2*: `parallel_conv2d_int8` / `parallel_conv1x1_int8`
+          wrappers (dequant into a scratch buffer, then call existing
+          FP32 inner kernels). Validate correctness vs FP32 in QEMU.
+    - [ ] *Slice 3*: gate switch `-DUSE_INT8_WEIGHTS` in Makefile;
+          measure fps gain on HW.
+    - [ ] *Slice 4 (optional)*: merge dequant into the MLA inner loop
+          (no scratch buffer). The real L1 cache win lands here.
+  - **Tier 2 (W8A8, full integer) — ×2-3, 1-2 weeks.** Only after
+    Tier 1 is the bottleneck.
+  - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
+    indefinitely; not justified yet.
 - [ ] **B4 — Frame-skip detection**: infer every N frames, hold bboxes,
       keep the camera + HUD at 52 fps perceived.
 - [ ] Stop point: ~15 fps real / ~25 fps perceived. Beyond that the A53

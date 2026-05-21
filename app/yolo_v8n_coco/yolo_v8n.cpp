@@ -19,11 +19,15 @@
 #include "hud.h"
 #include "bsp.h"
 #include "yolo_v8n.h"
+#include "weights_crc.h"        /* WEIGHTS_CRC32 + SIZE  (FP32 blob) */
+#include "weights_int8_crc.h"   /* WEIGHTS_INT8_CRC32 + SIZE  (INT8 blob, G2 Tier 1) */
 
-/* Weight blob + test image — defined by src/data.s via .incbin. */
-extern "C" const float weights_start[];
-extern "C" const float weights_end[];
-extern "C" const float test_image[];
+/* Weight blobs + test image — defined by app/yolo_v8n_coco/data.s via .incbin. */
+extern "C" const float  weights_start[];
+extern "C" const float  weights_end[];
+extern "C" const int8_t weights_int8_start[];   /* G2 Tier 1 — unused on the FP32 path */
+extern "C" const int8_t weights_int8_end[];
+extern "C" const float  test_image[];
 
 #define YOLO_S2  (YOLO_IN / 2)
 #define YOLO_S4  (YOLO_IN / 4)
@@ -93,6 +97,76 @@ struct WeightStream {
         const float* p = (const float*)ptr; ptr += actual_count * 4; return p;
     }
 };
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * G2 — Tier 1 (W8A32) scaffolding.
+ *
+ * Parallel reader for weights_int8.bin (per export_int8.py format):
+ *
+ *   per Conv2d:
+ *     uint32  n_w     (count of int8 elements, NEON-repacked)
+ *     float   scale   (per-tensor symmetric: w_fp = w_int8 * scale)
+ *     int8    weights[n_w]            ── unaligned tail allowed on AArch64
+ *     uint32  n_b     (= C_out)
+ *     float   bias[n_b]
+ *
+ * Activations + accumulators stay FP32 — only the weight load is int8.
+ * The dequant helper below converts a packed block of int8 weights into
+ * the FP32 layout the existing conv2d_partial_8ch / partial / 1x1 kernels
+ * expect. Tier 1 gain comes from reduced L1 cache pressure on large
+ * layers; the real ×3-4 fps lift waits for Tier 2 (W8A8).
+ * ────────────────────────────────────────────────────────────────────── */
+struct WeightStreamINT8 {
+    struct Layer {
+        int           n_w;
+        float         scale;
+        const int8_t* weights;
+        int           n_b;
+        const float*  bias;
+    };
+    const uint8_t* ptr;
+    WeightStreamINT8(const int8_t* start) : ptr((const uint8_t*)start) {}
+
+    Layer next(int expected_w, int expected_b, const char* layer_name) {
+        Layer L;
+        L.n_w = (int)(*((const uint32_t*)ptr)); ptr += 4;
+        if (L.n_w != expected_w) {
+            uart_puts("\n[FATAL INT8 W] "); uart_puts(layer_name); while (1);
+        }
+        L.scale   = *((const float*)ptr);   ptr += 4;
+        L.weights = (const int8_t*)ptr;     ptr += L.n_w;            /* tail may be unaligned */
+        L.n_b     = (int)(*((const uint32_t*)ptr)); ptr += 4;
+        if (L.n_b != expected_b) {
+            uart_puts("\n[FATAL INT8 B] "); uart_puts(layer_name); while (1);
+        }
+        L.bias    = (const float*)ptr;      ptr += L.n_b * 4;
+        return L;
+    }
+};
+
+/* Dequant: int8[n] * scale → float32[n], 16-lane NEON. n need not be a
+ * multiple of 16 — tail handled scalar. dst must be 16-byte aligned for
+ * the vector stores; the weight buffers are statically aligned via .align
+ * in data.s and the per-layer NEON-repacked layout is already aligned. */
+[[maybe_unused]]
+static void dequant_int8_to_fp32_neon(const int8_t* w_int8, int n, float scale, float* dst) {
+    float32x4_t vscale = vdupq_n_f32(scale);
+    int i = 0;
+    for (; i <= n - 16; i += 16) {
+        int8x16_t  v8   = vld1q_s8(w_int8 + i);
+        int16x8_t  lo16 = vmovl_s8(vget_low_s8(v8));
+        int16x8_t  hi16 = vmovl_s8(vget_high_s8(v8));
+        int32x4_t  a32  = vmovl_s16(vget_low_s16(lo16));
+        int32x4_t  b32  = vmovl_s16(vget_high_s16(lo16));
+        int32x4_t  c32  = vmovl_s16(vget_low_s16(hi16));
+        int32x4_t  d32  = vmovl_s16(vget_high_s16(hi16));
+        vst1q_f32(dst + i +  0, vmulq_f32(vcvtq_f32_s32(a32), vscale));
+        vst1q_f32(dst + i +  4, vmulq_f32(vcvtq_f32_s32(b32), vscale));
+        vst1q_f32(dst + i +  8, vmulq_f32(vcvtq_f32_s32(c32), vscale));
+        vst1q_f32(dst + i + 12, vmulq_f32(vcvtq_f32_s32(d32), vscale));
+    }
+    for (; i < n; i++) dst[i] = (float)w_int8[i] * scale;
+}
 
 struct Box { float x, y, w, h, conf; int cls; };
 static Box preds[MAX_PREDS]; static int num_preds = 0;
@@ -306,6 +380,18 @@ void run_yolo_complete() {
         uint32_t actual = crc32_sw((const uint8_t*)weights_start, wsz);
         SAFETY_ASSERT(actual == WEIGHTS_CRC32, "weights CRC mismatch");
         weights_verified = true;
+    }
+
+    /* G2 Tier 1 — verify INT8 blob shipped intact. Runs once; the actual
+     * INT8 inference path lands in a follow-up commit. */
+    static bool weights_int8_verified = false;
+    if (!weights_int8_verified && WEIGHTS_INT8_CRC32 != 0x00000000U) {
+        size_t sz = (size_t)((const uint8_t*)weights_int8_end - (const uint8_t*)weights_int8_start);
+        SAFETY_ASSERT(sz == WEIGHTS_INT8_SIZE, "weights_int8 size mismatch");
+        uint32_t actual = crc32_sw((const uint8_t*)weights_int8_start, sz);
+        SAFETY_ASSERT(actual == WEIGHTS_INT8_CRC32, "weights_int8 CRC mismatch");
+        uart_puts("[INT8] blob OK\n");
+        weights_int8_verified = true;
     }
 
     if (g_use_camera) {
