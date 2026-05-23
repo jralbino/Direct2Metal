@@ -134,8 +134,29 @@ projects ~13–15 fps after INT8 + frame-skip.
     predicted Tier 1 would be +42% *slower*; real A53 was -2.8%
     *faster*. Any bandwidth-sensitive optimization must be benched on
     silicon, not QEMU.
-  - **Tier 2 (W8A8, full integer) — ×2-3, 1-2 weeks.** Only after
-    Tier 1 is the bottleneck.
+  - **Tier 2 (W8A8, full integer) — ×2-3, 1-2 weeks.**
+    - [x] *Session 1 (2026-05-22)*: `tools/calibrate_int8.py` captures
+          per-tensor symmetric activation scales by running ~50 coco128
+          images through YOLOv8n FP32 with forward hooks on each Conv
+          module's wrapper (post-SiLU). Output:
+          `app/yolo_v8n_coco/weights_int8_w8a8.bin` (3.17 MB) with
+          per-layer (n_w, scale_w, scale_in, scale_out, int8 weights,
+          int32 bias) + CRC header. Bias pre-multiplied by
+          `1/(scale_in * scale_w)` so it's addable to the int32
+          accumulator with no float ops in the hot loop. 63 layers
+          calibrated; sat_w ≈ 0 % (weights not clipped). Smoke tested
+          with 20 images; production run should use ≥ 50.
+    - [ ] *Session 2*: NEON int8 conv kernels in runtime/ops.cpp.
+          `conv2d_partial_int8` uses `vmull_s8` + `vmlal_s16` to int32
+          accumulator (A53 has no SDOT). `conv1x1_int8` likewise.
+          Out stage: `acc_int32 * (scale_in * scale_w)` → fp32 → SiLU
+          (kept fp32 first pass, LUT later) → quant to scale_out int8.
+    - [ ] *Session 3*: full integer pipeline integration —
+          `USE_INT8_W8A8=1` build flag, replace FP32 activations with
+          int8 between layers, residual-add and concat scale handling,
+          SiLU LUT for hot loops.
+    - [ ] *Session 4*: validation — A/B vs FP32 on the same 50
+          calibration frames (correctness, mAP-style). HW bench.
   - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
     indefinitely; not justified yet.
 - [ ] **B4 — Frame-skip detection**: infer every N frames, hold bboxes,
