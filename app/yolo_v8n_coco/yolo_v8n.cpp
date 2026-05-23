@@ -148,7 +148,6 @@ struct WeightStreamINT8 {
  * multiple of 16 — tail handled scalar. dst must be 16-byte aligned for
  * the vector stores; the weight buffers are statically aligned via .align
  * in data.s and the per-layer NEON-repacked layout is already aligned. */
-[[maybe_unused]]
 static void dequant_int8_to_fp32_neon(const int8_t* w_int8, int n, float scale, float* dst) {
     float32x4_t vscale = vdupq_n_f32(scale);
     int i = 0;
@@ -167,6 +166,65 @@ static void dequant_int8_to_fp32_neon(const int8_t* w_int8, int n, float scale, 
     }
     for (; i < n; i++) dst[i] = (float)w_int8[i] * scale;
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * G2 Tier 1 — unified layer handle + macros that switch the stream type
+ * and conv functions at compile time on -DUSE_INT8_WEIGHTS. Both paths
+ * share the same model graph in run_yolo_complete / c2f / sppf.
+ * ────────────────────────────────────────────────────────────────────── */
+#ifdef USE_INT8_WEIGHTS
+/* INT8 path. Dequant scratch is a single shared buffer sized for the
+ * largest layer in YOLOv8n@256 (L7 = 256*128*9 = 294 912 floats). 350 K
+ * floats = 1.4 MB, comfortable margin. The kernel does not need it to
+ * persist between conv calls — each CONV* macro overwrites it. */
+static float dequant_scratch[350000];
+
+typedef WeightStreamINT8::Layer LayerHandle;
+
+static inline void parallel_conv2d_int8(const float* in, int H, int W, int C_in,
+                                        const LayerHandle& L,
+                                        int C_out, int K, int stride, int pad,
+                                        bool do_silu, float* out) {
+    dequant_int8_to_fp32_neon(L.weights, L.n_w, L.scale, dequant_scratch);
+    parallel_conv2d(in, H, W, C_in, dequant_scratch, L.bias, C_out, K, stride, pad, do_silu, out);
+}
+
+static inline void parallel_conv1x1_int8(const float* in, int H, int W, int C_in,
+                                         const LayerHandle& L,
+                                         int C_out, bool do_silu, float* out) {
+    dequant_int8_to_fp32_neon(L.weights, L.n_w, L.scale, dequant_scratch);
+    parallel_conv1x1(in, H, W, C_in, dequant_scratch, L.bias, C_out, do_silu, out);
+}
+
+#define WS_TYPE       WeightStreamINT8
+#define WS_INIT(name) WeightStreamINT8 name(weights_int8_start)
+#define LAYER_LOAD(ws, nw, nb, tag) (ws).next((nw), (nb), (tag))
+#define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
+    parallel_conv2d_int8((in), (H), (W), (ci), (L), (co), (K), (s), (p), (silu), (out))
+#define CONV1X1(in, H, W, ci, L, co, silu, out) \
+    parallel_conv1x1_int8((in), (H), (W), (ci), (L), (co), (silu), (out))
+
+#else
+/* FP32 path. LayerHandle bundles the two ws.next() results so c2f and
+ * sppf can hold them across the bottleneck loop without exposing the
+ * stream API to the macros. */
+struct LayerHandle { const float* w; const float* b; };
+
+static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, const char* tag) {
+    LayerHandle L;
+    L.w = ws.next(nw, tag);
+    L.b = ws.next(nb, tag);
+    return L;
+}
+
+#define WS_TYPE       WeightStream
+#define WS_INIT(name) WeightStream name(weights_start)
+#define LAYER_LOAD(ws, nw, nb, tag) fp32_layer_load((ws), (nw), (nb), (tag))
+#define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
+    parallel_conv2d((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
+#define CONV1X1(in, H, W, ci, L, co, silu, out) \
+    parallel_conv1x1((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
+#endif
 
 struct Box { float x, y, w, h, conf; int cls; };
 static Box preds[MAX_PREDS]; static int num_preds = 0;
@@ -264,33 +322,29 @@ static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
  * ------------------------------------------------------------------ */
 void c2f_real_inference(float* in, float* out, float* temp,
                         int h, int w, int c_in, int c_out, int n_depth,
-                        bool shortcut, WeightStream& ws, const char* prefix) {
+                        bool shortcut, WS_TYPE& ws, const char* prefix) {
     (void)prefix;
     int c_hidden = c_out / 2;
     int hw = h * w;
     int hw_h = hw * c_hidden;
     int c_concat = (2 + n_depth) * c_hidden;
 
-    const float* w_cv1 = ws.next(c_in * (2 * c_hidden), "C2f_CV1_W");
-    const float* b_cv1 = ws.next(2 * c_hidden,          "C2f_CV1_B");
-    const float* w_cv2 = ws.next(c_concat * c_out,      "C2f_CV2_W");
-    const float* b_cv2 = ws.next(c_out,                 "C2f_CV2_B");
+    LayerHandle Lcv1 = LAYER_LOAD(ws, c_in * (2 * c_hidden), 2 * c_hidden, "C2f_CV1");
+    LayerHandle Lcv2 = LAYER_LOAD(ws, c_concat * c_out,      c_out,        "C2f_CV2");
 
     /* cv1: writes (a | b) contiguously into temp slots 0 and 1. */
-    parallel_conv1x1(in, h, w, c_in, w_cv1, b_cv1, 2 * c_hidden, true, temp);
+    CONV1X1(in, h, w, c_in, Lcv1, 2 * c_hidden, true, temp);
 
     for (int i = 0; i < n_depth; i++) {
-        const float* w_b1 = ws.next(c_hidden * c_hidden * 9, "Bot_CV1_W");
-        const float* b_b1 = ws.next(c_hidden,                "Bot_CV1_B");
-        const float* w_b2 = ws.next(c_hidden * c_hidden * 9, "Bot_CV2_W");
-        const float* b_b2 = ws.next(c_hidden,                "Bot_CV2_B");
+        LayerHandle Lb1 = LAYER_LOAD(ws, c_hidden * c_hidden * 9, c_hidden, "Bot_CV1");
+        LayerHandle Lb2 = LAYER_LOAD(ws, c_hidden * c_hidden * 9, c_hidden, "Bot_CV2");
 
         float* x_in  = temp + (1 + i) * hw_h;          /* previous slot */
         float* x_mid = out;                            /* scratch */
         float* x_out = temp + (2 + i) * hw_h;          /* new slot */
 
-        parallel_conv2d(x_in,  h, w, c_hidden, w_b1, b_b1, c_hidden, 3, 1, 1, true, x_mid);
-        parallel_conv2d(x_mid, h, w, c_hidden, w_b2, b_b2, c_hidden, 3, 1, 1, true, x_out);
+        CONV2D(x_in,  h, w, c_hidden, Lb1, c_hidden, 3, 1, 1, true, x_mid);
+        CONV2D(x_mid, h, w, c_hidden, Lb2, c_hidden, 3, 1, 1, true, x_out);
 
         if (shortcut) {
             int k = 0;
@@ -303,19 +357,19 @@ void c2f_real_inference(float* in, float* out, float* temp,
         }
     }
 
-    parallel_conv1x1(temp, h, w, c_concat, w_cv2, b_cv2, c_out, true, out);
+    CONV1X1(temp, h, w, c_concat, Lcv2, c_out, true, out);
 }
 
-void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c, WeightStream& ws) {
+void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c, WS_TYPE& ws) {
     int c_hidden = c / 2; int hw = h * w; int hw_hidden = c_hidden * hw;
-    const float* w_cv1 = ws.next(c * c_hidden, "SPPF_W1"); const float* b_cv1 = ws.next(c_hidden, "SPPF_B1");
-    const float* w_cv2 = ws.next((c_hidden * 4) * c, "SPPF_W2"); const float* b_cv2 = ws.next(c, "SPPF_B2");
+    LayerHandle L1 = LAYER_LOAD(ws, c * c_hidden,            c_hidden, "SPPF_1");
+    LayerHandle L2 = LAYER_LOAD(ws, (c_hidden * 4) * c,      c,        "SPPF_2");
 
-    float* cv1_out = temp; parallel_conv1x1(in, h, w, c, w_cv1, b_cv1, c_hidden, true, cv1_out);
+    float* cv1_out = temp; CONV1X1(in, h, w, c, L1, c_hidden, true, cv1_out);
     float* m1 = temp + hw_hidden; float* m2 = temp + 2*hw_hidden; float* m3 = temp + 3*hw_hidden;
 
     maxpool5x5_s1_p2(cv1_out, m1, h, w, c_hidden); maxpool5x5_s1_p2(m1, m2, h, w, c_hidden); maxpool5x5_s1_p2(m2, m3, h, w, c_hidden);
-    parallel_conv1x1(temp, h, w, c_hidden * 4, w_cv2, b_cv2, c, true, out);
+    CONV1X1(temp, h, w, c_hidden * 4, L2, c, true, out);
 }
 
 static uint32_t crc32_lut[256];
@@ -372,7 +426,7 @@ void run_yolo_complete() {
     uart_puts("[F"); uart_dec(global_frame_counter); uart_puts("] ");
     global_frame_counter++;
 
-    WeightStream ws(weights_start); num_preds = 0;
+    WS_INIT(ws); num_preds = 0;
 
     static bool weights_verified = false;
     if (!weights_verified && WEIGHTS_CRC32 != 0x00000000U) {
@@ -420,26 +474,26 @@ void run_yolo_complete() {
     unsigned long t_rgb = get_timer_count();
 
     /* ── Backbone ─────────────────────────────────────────────────────── */
-    const float* w0 = ws.next(16*3*3*3, "L0_W");  const float* b0 = ws.next(16, "L0_B");
-    parallel_conv2d(buf_B, YOLO_IN, YOLO_IN, 3, w0, b0, 16, 3, 2, 1, true, buf_A);
+    LayerHandle L0 = LAYER_LOAD(ws, 16*3*3*3, 16, "L0");
+    CONV2D(buf_B, YOLO_IN, YOLO_IN, 3, L0, 16, 3, 2, 1, true, buf_A);
     unsigned long t_l0 = get_timer_count();
 
-    const float* w1 = ws.next(32*16*3*3, "L1_W"); const float* b1 = ws.next(32, "L1_B");
-    parallel_conv2d(buf_A, YOLO_S2, YOLO_S2, 16, w1, b1, 32, 3, 2, 1, true, buf_B);
+    LayerHandle L1 = LAYER_LOAD(ws, 32*16*3*3, 32, "L1");
+    CONV2D(buf_A, YOLO_S2, YOLO_S2, 16, L1, 32, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
 
-    const float* w3 = ws.next(64*32*3*3, "L3_W"); const float* b3 = ws.next(64, "L3_B");
-    parallel_conv2d(buf_A, YOLO_S4, YOLO_S4, 32, w3, b3, 64, 3, 2, 1, true, buf_B);
+    LayerHandle L3 = LAYER_LOAD(ws, 64*32*3*3, 64, "L3");
+    CONV2D(buf_A, YOLO_S4, YOLO_S4, 32, L3, 64, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
     copy_tensor(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
 
-    const float* w5 = ws.next(128*64*3*3, "L5_W"); const float* b5 = ws.next(128, "L5_B");
-    parallel_conv2d(buf_A, YOLO_S8, YOLO_S8, 64, w5, b5, 128, 3, 2, 1, true, buf_B);
+    LayerHandle L5 = LAYER_LOAD(ws, 128*64*3*3, 128, "L5");
+    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L5, 128, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 2, true, ws, "L6");
     copy_tensor(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
 
-    const float* w7 = ws.next(256*128*3*3, "L7_W"); const float* b7 = ws.next(256, "L7_B");
-    parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w7, b7, 256, 3, 2, 1, true, buf_B);
+    LayerHandle L7 = LAYER_LOAD(ws, 256*128*3*3, 256, "L7");
+    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L7, 256, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
     copy_tensor(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
@@ -462,15 +516,15 @@ void run_yolo_complete() {
     copy_tensor(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);
 
     /* L16 conv 3x3 s=2 → L17 concat with mid-P4 → L18 C2f → P4 head input */
-    const float* w16 = ws.next(64*64*3*3, "L16_W"); const float* b16 = ws.next(64, "L16_B");
-    parallel_conv2d(buf_A, YOLO_S8, YOLO_S8, 64, w16, b16, 64, 3, 2, 1, true, buf_B);
+    LayerHandle L16 = LAYER_LOAD(ws, 64*64*3*3, 64, "L16");
+    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L16, 64, 3, 2, 1, true, buf_B);
     concat_tensor(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 192, 128, 1, false, ws, "L18");
     copy_tensor(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);
 
     /* L19 conv 3x3 s=2 → L20 concat with SPPF → L21 C2f → P5 head input */
-    const float* w19 = ws.next(128*128*3*3, "L19_W"); const float* b19 = ws.next(128, "L19_B");
-    parallel_conv2d(buf_A, YOLO_S16, YOLO_S16, 128, w19, b19, 128, 3, 2, 1, true, buf_B);
+    LayerHandle L19 = LAYER_LOAD(ws, 128*128*3*3, 128, "L19");
+    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L19, 128, 3, 2, 1, true, buf_B);
     concat_tensor(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
 
@@ -480,51 +534,51 @@ void run_yolo_complete() {
      * Per level: cv2 (box, 64 ch) and cv3 (cls, 80 ch), each a 3-conv stack
      * (3x3 → 3x3 → 1x1). Run P5 first while buf_A still holds it. ── */
 
-    const float* wb_p3_0 = ws.next(64*64*9, "P3_BOX_0_W"); const float* bb_p3_0 = ws.next(64, "P3_BOX_0_B");
-    const float* wb_p3_1 = ws.next(64*64*9, "P3_BOX_1_W"); const float* bb_p3_1 = ws.next(64, "P3_BOX_1_B");
-    const float* wb_p3_2 = ws.next(64*64,   "P3_BOX_2_W"); const float* bb_p3_2 = ws.next(64, "P3_BOX_2_B");
-    const float* wb_p4_0 = ws.next(64*128*9,"P4_BOX_0_W"); const float* bb_p4_0 = ws.next(64, "P4_BOX_0_B");
-    const float* wb_p4_1 = ws.next(64*64*9, "P4_BOX_1_W"); const float* bb_p4_1 = ws.next(64, "P4_BOX_1_B");
-    const float* wb_p4_2 = ws.next(64*64,   "P4_BOX_2_W"); const float* bb_p4_2 = ws.next(64, "P4_BOX_2_B");
-    const float* wb_p5_0 = ws.next(64*256*9,"P5_BOX_0_W"); const float* bb_p5_0 = ws.next(64, "P5_BOX_0_B");
-    const float* wb_p5_1 = ws.next(64*64*9, "P5_BOX_1_W"); const float* bb_p5_1 = ws.next(64, "P5_BOX_1_B");
-    const float* wb_p5_2 = ws.next(64*64,   "P5_BOX_2_W"); const float* bb_p5_2 = ws.next(64, "P5_BOX_2_B");
+    LayerHandle wb_p3_0 = LAYER_LOAD(ws, 64*64*9,  64, "P3_BOX_0");
+    LayerHandle wb_p3_1 = LAYER_LOAD(ws, 64*64*9,  64, "P3_BOX_1");
+    LayerHandle wb_p3_2 = LAYER_LOAD(ws, 64*64,    64, "P3_BOX_2");
+    LayerHandle wb_p4_0 = LAYER_LOAD(ws, 64*128*9, 64, "P4_BOX_0");
+    LayerHandle wb_p4_1 = LAYER_LOAD(ws, 64*64*9,  64, "P4_BOX_1");
+    LayerHandle wb_p4_2 = LAYER_LOAD(ws, 64*64,    64, "P4_BOX_2");
+    LayerHandle wb_p5_0 = LAYER_LOAD(ws, 64*256*9, 64, "P5_BOX_0");
+    LayerHandle wb_p5_1 = LAYER_LOAD(ws, 64*64*9,  64, "P5_BOX_1");
+    LayerHandle wb_p5_2 = LAYER_LOAD(ws, 64*64,    64, "P5_BOX_2");
 
-    const float* wc_p3_0 = ws.next(80*64*9, "P3_CLS_0_W"); const float* bc_p3_0 = ws.next(80, "P3_CLS_0_B");
-    const float* wc_p3_1 = ws.next(80*80*9, "P3_CLS_1_W"); const float* bc_p3_1 = ws.next(80, "P3_CLS_1_B");
-    const float* wc_p3_2 = ws.next(80*80,   "P3_CLS_2_W"); const float* bc_p3_2 = ws.next(80, "P3_CLS_2_B");
-    const float* wc_p4_0 = ws.next(80*128*9,"P4_CLS_0_W"); const float* bc_p4_0 = ws.next(80, "P4_CLS_0_B");
-    const float* wc_p4_1 = ws.next(80*80*9, "P4_CLS_1_W"); const float* bc_p4_1 = ws.next(80, "P4_CLS_1_B");
-    const float* wc_p4_2 = ws.next(80*80,   "P4_CLS_2_W"); const float* bc_p4_2 = ws.next(80, "P4_CLS_2_B");
-    const float* wc_p5_0 = ws.next(80*256*9,"P5_CLS_0_W"); const float* bc_p5_0 = ws.next(80, "P5_CLS_0_B");
-    const float* wc_p5_1 = ws.next(80*80*9, "P5_CLS_1_W"); const float* bc_p5_1 = ws.next(80, "P5_CLS_1_B");
-    const float* wc_p5_2 = ws.next(80*80,   "P5_CLS_2_W"); const float* bc_p5_2 = ws.next(80, "P5_CLS_2_B");
+    LayerHandle wc_p3_0 = LAYER_LOAD(ws, 80*64*9,  80, "P3_CLS_0");
+    LayerHandle wc_p3_1 = LAYER_LOAD(ws, 80*80*9,  80, "P3_CLS_1");
+    LayerHandle wc_p3_2 = LAYER_LOAD(ws, 80*80,    80, "P3_CLS_2");
+    LayerHandle wc_p4_0 = LAYER_LOAD(ws, 80*128*9, 80, "P4_CLS_0");
+    LayerHandle wc_p4_1 = LAYER_LOAD(ws, 80*80*9,  80, "P4_CLS_1");
+    LayerHandle wc_p4_2 = LAYER_LOAD(ws, 80*80,    80, "P4_CLS_2");
+    LayerHandle wc_p5_0 = LAYER_LOAD(ws, 80*256*9, 80, "P5_CLS_0");
+    LayerHandle wc_p5_1 = LAYER_LOAD(ws, 80*80*9,  80, "P5_CLS_1");
+    LayerHandle wc_p5_2 = LAYER_LOAD(ws, 80*80,    80, "P5_CLS_2");
 
     /* P5 head — input still in buf_A. scratch is free. */
-    parallel_conv2d(buf_A,   YOLO_S32, YOLO_S32, 256, wb_p5_0, bb_p5_0, 64, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S32, YOLO_S32, 64,  wb_p5_1, bb_p5_1, 64, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S32, YOLO_S32, 64,  wb_p5_2, bb_p5_2, 64, false,    head_box);
-    parallel_conv2d(buf_A,   YOLO_S32, YOLO_S32, 256, wc_p5_0, bc_p5_0, 80, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S32, YOLO_S32, 80,  wc_p5_1, bc_p5_1, 80, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S32, YOLO_S32, 80,  wc_p5_2, bc_p5_2, 80, false,    head_cls);
+    CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wb_p5_0, 64, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S32, YOLO_S32, 64,  wb_p5_1, 64, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S32, YOLO_S32, 64,  wb_p5_2, 64, false,       head_box);
+    CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wc_p5_0, 80, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S32, YOLO_S32, 80,  wc_p5_1, 80, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S32, YOLO_S32, 80,  wc_p5_2, 80, false,       head_cls);
     decode_v8_dfl(head_box, head_cls, YOLO_S32, YOLO_S32, 32);
 
     /* P4 head — input in save_P4. */
-    parallel_conv2d(save_P4, YOLO_S16, YOLO_S16, 128, wb_p4_0, bb_p4_0, 64, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S16, YOLO_S16, 64,  wb_p4_1, bb_p4_1, 64, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S16, YOLO_S16, 64,  wb_p4_2, bb_p4_2, 64, false,    head_box);
-    parallel_conv2d(save_P4, YOLO_S16, YOLO_S16, 128, wc_p4_0, bc_p4_0, 80, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S16, YOLO_S16, 80,  wc_p4_1, bc_p4_1, 80, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S16, YOLO_S16, 80,  wc_p4_2, bc_p4_2, 80, false,    head_cls);
+    CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wb_p4_0, 64, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S16, YOLO_S16, 64,  wb_p4_1, 64, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S16, YOLO_S16, 64,  wb_p4_2, 64, false,       head_box);
+    CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wc_p4_0, 80, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S16, YOLO_S16, 80,  wc_p4_1, 80, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S16, YOLO_S16, 80,  wc_p4_2, 80, false,       head_cls);
     decode_v8_dfl(head_box, head_cls, YOLO_S16, YOLO_S16, 16);
 
     /* P3 head — input in save_P3. */
-    parallel_conv2d(save_P3, YOLO_S8, YOLO_S8, 64, wb_p3_0, bb_p3_0, 64, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S8, YOLO_S8, 64, wb_p3_1, bb_p3_1, 64, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S8, YOLO_S8, 64, wb_p3_2, bb_p3_2, 64, false,    head_box);
-    parallel_conv2d(save_P3, YOLO_S8, YOLO_S8, 64, wc_p3_0, bc_p3_0, 80, 3, 1, 1, true, head_tmp);
-    parallel_conv2d(head_tmp,YOLO_S8, YOLO_S8, 80, wc_p3_1, bc_p3_1, 80, 3, 1, 1, true, scratch);
-    parallel_conv1x1(scratch,YOLO_S8, YOLO_S8, 80, wc_p3_2, bc_p3_2, 80, false,    head_cls);
+    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  64,  wb_p3_1, 64, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  64,  wb_p3_2, 64, false,       head_box);
+    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);
     decode_v8_dfl(head_box, head_cls, YOLO_S8, YOLO_S8, 8);
 
     unsigned long t_nms = get_timer_count();

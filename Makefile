@@ -8,8 +8,18 @@ OBJCOPY = aarch64-linux-gnu-objcopy
 # Step 5 (BSP/app split): one image per app. Override with `make APP=other`.
 APP ?= yolo_v8n_coco
 
+# --- WEIGHT PRECISION SELECTOR ---
+# G2 Tier 1: `make USE_INT8=1` switches the model to W8A32 (int8 weights,
+# fp32 activations + accumulators). Default 0 keeps the FP32 path.
+USE_INT8 ?= 0
+ifeq ($(USE_INT8),1)
+    INT8_DEF = -DUSE_INT8_WEIGHTS
+else
+    INT8_DEF =
+endif
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)

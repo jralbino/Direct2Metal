@@ -102,13 +102,26 @@ projects ~13–15 fps after INT8 + frame-skip.
           `WeightStreamINT8` reader + `dequant_int8_to_fp32_neon` NEON
           helper added and compile-tested. Image grew 13.9 → 17.0 MB.
           FP32 path byte-identical, INT8 path unused yet.
-    - [ ] *Slice 2*: `parallel_conv2d_int8` / `parallel_conv1x1_int8`
-          wrappers (dequant into a scratch buffer, then call existing
-          FP32 inner kernels). Validate correctness vs FP32 in QEMU.
-    - [ ] *Slice 3*: gate switch `-DUSE_INT8_WEIGHTS` in Makefile;
-          measure fps gain on HW.
-    - [ ] *Slice 4 (optional)*: merge dequant into the MLA inner loop
-          (no scratch buffer). The real L1 cache win lands here.
+    - [x] *Slice 2 + 3 (2026-05-22)*: `parallel_conv2d_int8` /
+          `parallel_conv1x1_int8` wrappers (dequant into a shared 350 K-
+          float scratch then call the existing FP32 kernel); unified
+          `LayerHandle` + `LAYER_LOAD/CONV2D/CONV1X1/WS_INIT/WS_TYPE`
+          macros that specialise FP32 vs INT8 at compile time on
+          `-DUSE_INT8_WEIGHTS`; `c2f_real_inference` and
+          `sppf_real_inference` switched to `WS_TYPE&` + macros;
+          Makefile gained `USE_INT8 ?= 0`. Both flavours build clean;
+          QEMU sim INT8 runs end-to-end (1414 ms/frame vs 995 ms FP32,
+          **+42 % regression**) and emits plausible detections under
+          synthetic input. Correctness path **validated**; performance
+          path **not yet** — see below.
+    - [ ] *Slice 4*: fuse dequant into the conv inner loop. The scratch
+          path doesn't realise the L1 win because the FMA kernel still
+          reads fp32 weights from a dequant scratch buffer of the same
+          size as the original fp32 weights. The real ×1.2-1.5 lift
+          requires dequant inside `conv2d_partial_8ch` / `conv1x1`'s
+          NEON loop so the int8 blob is what crosses L1.
+    - [ ] *HW measurement*: validate Slice 4 on Pi Zero 2 W. QEMU has no
+          cache model so the bandwidth advantage is invisible there.
   - **Tier 2 (W8A8, full integer) — ×2-3, 1-2 weeks.** Only after
     Tier 1 is the bottleneck.
   - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
