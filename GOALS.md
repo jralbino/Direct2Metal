@@ -114,14 +114,26 @@ projects ~13–15 fps after INT8 + frame-skip.
           **+42 % regression**) and emits plausible detections under
           synthetic input. Correctness path **validated**; performance
           path **not yet** — see below.
-    - [ ] *Slice 4*: fuse dequant into the conv inner loop. The scratch
-          path doesn't realise the L1 win because the FMA kernel still
-          reads fp32 weights from a dequant scratch buffer of the same
-          size as the original fp32 weights. The real ×1.2-1.5 lift
-          requires dequant inside `conv2d_partial_8ch` / `conv1x1`'s
-          NEON loop so the int8 blob is what crosses L1.
-    - [ ] *HW measurement*: validate Slice 4 on Pi Zero 2 W. QEMU has no
-          cache model so the bandwidth advantage is invisible there.
+    - [x] *HW measurement (2026-05-22)*: bench on Pi Zero 2 W with
+          `tools/bench_int8_ab.py` over 3 steady-state frames each.
+          FP32 = 725 ms total (268 bb / 145 neck / 268 head); INT8 = 705
+          ms (261 / 141 / 257). **INT8 -2.8% net, all conv stages
+          shave 2-4%.** Detections preserved: same class (person),
+          confidence -2 to -3 pp (83% → 80-83%). The L1/L2 cache
+          benefit on A53 is real but modest at this model size; the
+          FMA throughput ceiling dominates as the plan predicted.
+    - **Tier 1 stopped at Slice 3.** Marginal positive return (×1.028
+      vs the optimistic ×1.2-1.5 in the plan). Slice 4 (dequant fused
+      in `conv2d_partial_8ch` / `conv1x1` NEON inner loop) would add
+      another ~5-10 pp but the effort doesn't justify it when Tier 2
+      promises ×2-3 and reuses none of Tier 1's runtime kernels.
+      `USE_INT8=1` build retained as alternative — runs, is faster, has
+      comparable detection quality.
+
+  - **QEMU lesson learned**: QEMU `raspi3b` has no cache model. It
+    predicted Tier 1 would be +42% *slower*; real A53 was -2.8%
+    *faster*. Any bandwidth-sensitive optimization must be benched on
+    silicon, not QEMU.
   - **Tier 2 (W8A8, full integer) — ×2-3, 1-2 weeks.** Only after
     Tier 1 is the bottleneck.
   - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
