@@ -132,6 +132,40 @@ void maxpool5x5_s1_p2(const float* in, float* out, int H, int W, int C);
 
 void camera_to_tensor_320(const uint32_t* camera_buffer, float* yolo_tensor);
 
+/* ------------------------------------------------------------------
+ * G2 Tier 2 — W8A8 INT8 kernels (runtime/ops_int8.cpp)
+ *
+ * All inputs / outputs / weights are int8. Bias is int32 (pre-multiplied
+ * by 1/(scale_in*scale_w) at calibration time). Out-stage:
+ *   acc_int32 * (scale_w * scale_in) → fp32 → optional SiLU → /scale_out
+ *   → saturate to int8.
+ *
+ * Weight layout matches tools/calibrate_int8.py.
+ * ------------------------------------------------------------------ */
+
+/* 1x1 conv: w_flat[C_out * C_in]. */
+void conv1x1_int8(const int8_t* in, int H, int W, int C_in,
+                  const int8_t* w, const int32_t* bias,
+                  float scale_w, float scale_in, float scale_out,
+                  int C_out, bool do_silu,
+                  int8_t* out);
+
+/* K×K conv, 4 output channels per group (weight layout
+ * int8[C_out/4][C_in*K*K][4]). */
+void conv2d_neon_4ch_int8(const int8_t* in, int H_in, int W_in, int C_in,
+                          const int8_t* w_rep, int C_out, int K, int stride, int pad,
+                          float scale_w, float scale_in, float scale_out,
+                          const int32_t* bias, bool do_silu,
+                          int8_t* out);
+
+/* K×K conv, 8 output channels per group (weight layout
+ * int8[C_out/8][C_in*K*K][8]). */
+void conv2d_neon_8ch_int8(const int8_t* in, int H_in, int W_in, int C_in,
+                          const int8_t* w_rep, int C_out, int K, int stride, int pad,
+                          float scale_w, float scale_in, float scale_out,
+                          const int32_t* bias, bool do_silu,
+                          int8_t* out);
+
 #ifdef __cplusplus
 }
 #endif

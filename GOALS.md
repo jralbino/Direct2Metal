@@ -146,11 +146,17 @@ projects ~13–15 fps after INT8 + frame-skip.
           accumulator with no float ops in the hot loop. 63 layers
           calibrated; sat_w ≈ 0 % (weights not clipped). Smoke tested
           with 20 images; production run should use ≥ 50.
-    - [ ] *Session 2*: NEON int8 conv kernels in runtime/ops.cpp.
-          `conv2d_partial_int8` uses `vmull_s8` + `vmlal_s16` to int32
-          accumulator (A53 has no SDOT). `conv1x1_int8` likewise.
-          Out stage: `acc_int32 * (scale_in * scale_w)` → fp32 → SiLU
-          (kept fp32 first pass, LUT later) → quant to scale_out int8.
+    - [x] *Session 2 (2026-05-22)*: NEON int8 conv kernels in new
+          `runtime/ops_int8.cpp`. Three single-core entry points:
+          `conv1x1_int8` (1×1 flat weights, vectorized over 8 input
+          positions per output channel), `conv2d_neon_4ch_int8` (K×K
+          with 4 co's per group), `conv2d_neon_8ch_int8` (K×K with 8
+          co's per group). All use the `vld1_s8 → vmovl_s8 → vmlal_s16`
+          A53 path (no SDOT on ARMv8.0). Out-stage `int32 → fp32 → SiLU
+          → /scale_out → saturate`. Bias is int32, pre-added directly
+          to the int32 accumulator. Build clean, kernels exported in
+          object file (85 KB), kernel8.img links the new symbols, QEMU
+          smoke test of the FP32 default path shows no regression.
     - [ ] *Session 3*: full integer pipeline integration —
           `USE_INT8_W8A8=1` build flag, replace FP32 activations with
           int8 between layers, residual-add and concat scale handling,

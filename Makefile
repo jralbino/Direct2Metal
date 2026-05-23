@@ -43,7 +43,7 @@ BSP_CPP_SRCS  = bsp/kernel.cpp bsp/mmu.cpp bsp/multicore.cpp \
                 bsp/camera.cpp bsp/camera_bsc.cpp bsp/camera_imx708.cpp \
                 bsp/camera_unicam.cpp bsp/camera_debayer.cpp
 
-RT_CPP_SRCS   = runtime/ops.cpp runtime/conv2d.cpp
+RT_CPP_SRCS   = runtime/ops.cpp runtime/conv2d.cpp runtime/ops_int8.cpp
 RT_ASM_SRCS   = runtime/neon/matmul_neon.s runtime/neon/conv2d_neon.s
 
 APP_ASM_SRCS  = app/$(APP)/data.s
