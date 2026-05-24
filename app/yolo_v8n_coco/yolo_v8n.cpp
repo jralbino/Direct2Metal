@@ -40,21 +40,29 @@ extern "C" const float  test_image[];
 
 #define DFL_REG_MAX 16   /* v8 default; box ch = 4 * REG_MAX */
 
-static float buf_A[2000000]; static float buf_B[2000000]; static float scratch[2000000];
-static float cam_frame[3 * YOLO_IN * YOLO_IN];
+/* Activation element type. W8A8 makes all inter-layer buffers int8; the
+ * model graph's bare-metal control flow is otherwise identical. */
+#ifdef USE_INT8_W8A8
+typedef int8_t act_t;
+#else
+typedef float  act_t;
+#endif
+
+static act_t buf_A[2000000]; static act_t buf_B[2000000]; static act_t scratch[2000000];
+static float cam_frame[3 * YOLO_IN * YOLO_IN];   /* fp32 — debayer/preprocess input */
 
 /* Skip connections + per-level head inputs (v8 PAN). */
-static float save_L4   [64  * YOLO_S8  * YOLO_S8];    /* L4 (P3 backbone)     */
-static float save_L6   [128 * YOLO_S16 * YOLO_S16];   /* L6 (P4 backbone)     */
-static float save_SPPF [256 * YOLO_S32 * YOLO_S32];   /* L9 SPPF out          */
-static float save_P4mid[128 * YOLO_S16 * YOLO_S16];   /* L12 (mid neck)       */
-static float save_P3   [64  * YOLO_S8  * YOLO_S8];    /* L15 → P3 head input  */
-static float save_P4   [128 * YOLO_S16 * YOLO_S16];   /* L18 → P4 head input  */
+static act_t save_L4   [64  * YOLO_S8  * YOLO_S8];    /* L4 (P3 backbone)     */
+static act_t save_L6   [128 * YOLO_S16 * YOLO_S16];   /* L6 (P4 backbone)     */
+static act_t save_SPPF [256 * YOLO_S32 * YOLO_S32];   /* L9 SPPF out          */
+static act_t save_P4mid[128 * YOLO_S16 * YOLO_S16];   /* L12 (mid neck)       */
+static act_t save_P3   [64  * YOLO_S8  * YOLO_S8];    /* L15 → P3 head input  */
+static act_t save_P4   [128 * YOLO_S16 * YOLO_S16];   /* L18 → P4 head input  */
 
 /* Head per-level scratch. Sized for P3 (largest spatial grid). */
-static float head_box [64 * YOLO_S8 * YOLO_S8];
-static float head_cls [80 * YOLO_S8 * YOLO_S8];
-static float head_tmp [80 * YOLO_S8 * YOLO_S8];
+static act_t head_box [64 * YOLO_S8 * YOLO_S8];
+static act_t head_cls [80 * YOLO_S8 * YOLO_S8];
+static act_t head_tmp [80 * YOLO_S8 * YOLO_S8];
 
 static float mini_exp(float x) {
     if (x > 88.0f) { return 3.40282347e+38f; }
@@ -85,10 +93,12 @@ static inline float32x4_t k_neon_sigmoidf4(float32x4_t x) {
     recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
     return recip;
 }
+[[maybe_unused]]
 static void copy_tensor(const float* src, float* dst, int n) {
     int i = 0; for (; i <= n - 4; i += 4) vst1q_f32(dst + i, vld1q_f32(src + i));
     for (; i < n; i++) dst[i] = src[i];
 }
+[[maybe_unused]]
 static void concat_tensor(const float* src1, int c1, const float* src2, int c2, float* dst, int hw) {
     copy_tensor(src1, dst, c1 * hw); copy_tensor(src2, dst + c1 * hw, c2 * hw);
 }
@@ -297,6 +307,10 @@ static void w8a8_residual_add(int8_t* x_out, const int8_t* x_in, int n,
     }
 }
 
+/* Forward decl — decode_v8_dfl is defined further down the file. */
+static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
+                          int gh, int gw, int stride);
+
 /* K-aware conv dispatch — picks the int8 kernel that matches the weight
  * repack layout chosen by tools/calibrate_int8.py::emit_conv_w8a8. */
 [[maybe_unused]]
@@ -317,16 +331,73 @@ static inline void w8a8_conv2d_dispatch(const int8_t* in, int H, int W, int C_in
     }
 }
 
+/* Dequant the int8 head outputs (box + cls) into a fp32 scratch buffer,
+ * then run the existing fp32 DFL decoder. The scratch buffer is the
+ * model's `scratch` array reinterpreted — it's int8 in W8A8 mode but
+ * holds 2 M bytes = 500 K fp32 elements, more than enough for the
+ * largest head grid (P3 = 144 × 1024 = 147 456 fp32). */
+[[maybe_unused]]
+static void w8a8_decode_head(const int8_t* head_box_i8, const int8_t* head_cls_i8,
+                             int gh, int gw, int stride,
+                             float box_scale, float cls_scale,
+                             float* scratch_fp) {
+    int grd = gh * gw;
+    float* hb_fp = scratch_fp;
+    float* hc_fp = scratch_fp + 64 * grd;
+    dequant_int8_to_fp32_neon(head_box_i8, 64 * grd, box_scale, hb_fp);
+    dequant_int8_to_fp32_neon(head_cls_i8, 80 * grd, cls_scale, hc_fp);
+    decode_v8_dfl(hb_fp, hc_fp, gh, gw, stride);
+}
+
+/* FP32 NEON residual add helper — extracted from c2f_real_inference so
+ * the macro path can use it uniformly. */
+[[maybe_unused]]
+static inline void fp32_residual_add_neon(float* x_out, const float* x_in, int n) {
+    int k = 0;
+    for (; k <= n - 4; k += 4) {
+        float32x4_t a = vld1q_f32(x_in  + k);
+        float32x4_t v = vld1q_f32(x_out + k);
+        vst1q_f32(x_out + k, vaddq_f32(a, v));
+    }
+    for (; k < n; k++) x_out[k] += x_in[k];
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
- * G2 Tier 1 — unified layer handle + macros that switch the stream type
- * and conv functions at compile time on -DUSE_INT8_WEIGHTS. Both paths
- * share the same model graph in run_yolo_complete / c2f / sppf.
+ * Unified layer handle + dispatch macros that select the model precision
+ * at compile time. Three modes:
+ *   USE_INT8_W8A8     (Tier 2) — int8 weights + int8 activations
+ *   USE_INT8_WEIGHTS  (Tier 1) — int8 weights, fp32 activations
+ *   (default)                  — fp32 throughout
+ * Same run_yolo_complete / c2f / sppf body services all three.
  * ────────────────────────────────────────────────────────────────────── */
-#ifdef USE_INT8_WEIGHTS
-/* INT8 path. Dequant scratch is a single shared buffer sized for the
- * largest layer in YOLOv8n@256 (L7 = 256*128*9 = 294 912 floats). 350 K
- * floats = 1.4 MB, comfortable margin. The kernel does not need it to
- * persist between conv calls — each CONV* macro overwrites it. */
+#ifdef USE_INT8_W8A8
+
+typedef WeightStreamW8A8::Layer LayerHandle;
+
+#define WS_TYPE       WeightStreamW8A8
+#define WS_INIT(name) WeightStreamW8A8 name(weights_int8_w8a8_start)
+#define LAYER_LOAD(ws, nw, nb, tag) (ws).next((nw), (nb), (tag))
+#define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
+    w8a8_conv2d_dispatch((in), (H), (W), (ci), (L), (co), (K), (s), (p), (silu), (out))
+#define CONV1X1(in, H, W, ci, L, co, silu, out) \
+    conv1x1_int8((in), (H), (W), (ci), (L).weights, (L).bias, \
+                 (L).scale_w, (L).scale_in, (L).scale_out, (co), (silu), (out))
+#define COPY_TENSOR(src, dst, n)               copy_tensor_i8((src), (dst), (n))
+#define CONCAT_TENSOR(s1, c1, s2, c2, dst, hw) concat_tensor_i8((s1), (c1), (s2), (c2), (dst), (hw))
+#define UPSAMPLE2X(in, out, H, W, C)           upsample2x_nearest_i8((in), (out), (H), (W), (C))
+#define MAXPOOL5X5(in, out, H, W, C)           maxpool5x5_s1_p2_i8((in), (out), (H), (W), (C))
+/* Residual: x_out at L_out's scale_out, x_in at L_in's scale_out (the
+ * conv that wrote the previous slot in c2f's temp ring). */
+#define RESIDUAL_ADD(x_out, x_in, n, L_out, L_in) \
+    w8a8_residual_add((x_out), (x_in), (n), (L_out).scale_out, (L_in).scale_out)
+#define DECODE_HEAD(hb, hc, gh, gw, stride, L_box, L_cls) \
+    w8a8_decode_head((hb), (hc), (gh), (gw), (stride), \
+                     (L_box).scale_out, (L_cls).scale_out, (float*)scratch)
+
+#elif defined(USE_INT8_WEIGHTS)
+
+/* Tier 1 W8A32. Dequant scratch sized for the largest layer in
+ * YOLOv8n@256 (L7 = 256*128*9 = 294 912 floats). */
 static float dequant_scratch[350000];
 
 typedef WeightStreamINT8::Layer LayerHandle;
@@ -353,9 +424,18 @@ static inline void parallel_conv1x1_int8(const float* in, int H, int W, int C_in
     parallel_conv2d_int8((in), (H), (W), (ci), (L), (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
     parallel_conv1x1_int8((in), (H), (W), (ci), (L), (co), (silu), (out))
+#define COPY_TENSOR(src, dst, n)               copy_tensor((src), (dst), (n))
+#define CONCAT_TENSOR(s1, c1, s2, c2, dst, hw) concat_tensor((s1), (c1), (s2), (c2), (dst), (hw))
+#define UPSAMPLE2X(in, out, H, W, C)           upsample2x_nearest((in), (out), (H), (W), (C))
+#define MAXPOOL5X5(in, out, H, W, C)           maxpool5x5_s1_p2((in), (out), (H), (W), (C))
+#define RESIDUAL_ADD(x_out, x_in, n, L_out, L_in) \
+    fp32_residual_add_neon((x_out), (x_in), (n))
+#define DECODE_HEAD(hb, hc, gh, gw, stride, L_box, L_cls) \
+    decode_v8_dfl((hb), (hc), (gh), (gw), (stride))
 
 #else
-/* FP32 path. LayerHandle bundles the two ws.next() results so c2f and
+
+/* Pure FP32. LayerHandle bundles the two ws.next() results so c2f and
  * sppf can hold them across the bottleneck loop without exposing the
  * stream API to the macros. */
 struct LayerHandle { const float* w; const float* b; };
@@ -374,6 +454,15 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
     parallel_conv2d((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
     parallel_conv1x1((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
+#define COPY_TENSOR(src, dst, n)               copy_tensor((src), (dst), (n))
+#define CONCAT_TENSOR(s1, c1, s2, c2, dst, hw) concat_tensor((s1), (c1), (s2), (c2), (dst), (hw))
+#define UPSAMPLE2X(in, out, H, W, C)           upsample2x_nearest((in), (out), (H), (W), (C))
+#define MAXPOOL5X5(in, out, H, W, C)           maxpool5x5_s1_p2((in), (out), (H), (W), (C))
+#define RESIDUAL_ADD(x_out, x_in, n, L_out, L_in) \
+    fp32_residual_add_neon((x_out), (x_in), (n))
+#define DECODE_HEAD(hb, hc, gh, gw, stride, L_box, L_cls) \
+    decode_v8_dfl((hb), (hc), (gh), (gw), (stride))
+
 #endif
 
 struct Box { float x, y, w, h, conf; int cls; };
@@ -470,7 +559,7 @@ static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
  * The two 3x3 Bottleneck convs alternate `out` and the slot buffer; `in`,
  * `out`, `temp` must be three distinct buffers.
  * ------------------------------------------------------------------ */
-void c2f_real_inference(float* in, float* out, float* temp,
+void c2f_real_inference(act_t* in, act_t* out, act_t* temp,
                         int h, int w, int c_in, int c_out, int n_depth,
                         bool shortcut, WS_TYPE& ws, const char* prefix) {
     (void)prefix;
@@ -485,40 +574,45 @@ void c2f_real_inference(float* in, float* out, float* temp,
     /* cv1: writes (a | b) contiguously into temp slots 0 and 1. */
     CONV1X1(in, h, w, c_in, Lcv1, 2 * c_hidden, true, temp);
 
+    /* L_prev_out tracks the layer that last wrote into the slot we're
+     * about to consume as x_in. For i==0 that slot is the second half
+     * of cv1's output, so its scale is Lcv1.scale_out. For i>0 it's the
+     * x_out written by the previous iteration (= previous Lb2). Only
+     * matters for the W8A8 residual; FP32 ignores the layer args. */
+    LayerHandle L_prev_out = Lcv1;
+
     for (int i = 0; i < n_depth; i++) {
         LayerHandle Lb1 = LAYER_LOAD(ws, c_hidden * c_hidden * 9, c_hidden, "Bot_CV1");
         LayerHandle Lb2 = LAYER_LOAD(ws, c_hidden * c_hidden * 9, c_hidden, "Bot_CV2");
 
-        float* x_in  = temp + (1 + i) * hw_h;          /* previous slot */
-        float* x_mid = out;                            /* scratch */
-        float* x_out = temp + (2 + i) * hw_h;          /* new slot */
+        act_t* x_in  = temp + (1 + i) * hw_h;          /* previous slot */
+        act_t* x_mid = out;                            /* scratch */
+        act_t* x_out = temp + (2 + i) * hw_h;          /* new slot */
 
         CONV2D(x_in,  h, w, c_hidden, Lb1, c_hidden, 3, 1, 1, true, x_mid);
         CONV2D(x_mid, h, w, c_hidden, Lb2, c_hidden, 3, 1, 1, true, x_out);
 
         if (shortcut) {
-            int k = 0;
-            for (; k <= hw_h - 4; k += 4) {
-                float32x4_t a = vld1q_f32(x_in  + k);
-                float32x4_t v = vld1q_f32(x_out + k);
-                vst1q_f32(x_out + k, vaddq_f32(a, v));
-            }
-            for (; k < hw_h; k++) x_out[k] += x_in[k];
+            RESIDUAL_ADD(x_out, x_in, hw_h, Lb2, L_prev_out);
         }
+        L_prev_out = Lb2;
     }
 
     CONV1X1(temp, h, w, c_concat, Lcv2, c_out, true, out);
 }
 
-void sppf_real_inference(float* in, float* out, float* temp, int h, int w, int c, WS_TYPE& ws) {
+void sppf_real_inference(act_t* in, act_t* out, act_t* temp,
+                         int h, int w, int c, WS_TYPE& ws) {
     int c_hidden = c / 2; int hw = h * w; int hw_hidden = c_hidden * hw;
     LayerHandle L1 = LAYER_LOAD(ws, c * c_hidden,            c_hidden, "SPPF_1");
     LayerHandle L2 = LAYER_LOAD(ws, (c_hidden * 4) * c,      c,        "SPPF_2");
 
-    float* cv1_out = temp; CONV1X1(in, h, w, c, L1, c_hidden, true, cv1_out);
-    float* m1 = temp + hw_hidden; float* m2 = temp + 2*hw_hidden; float* m3 = temp + 3*hw_hidden;
+    act_t* cv1_out = temp; CONV1X1(in, h, w, c, L1, c_hidden, true, cv1_out);
+    act_t* m1 = temp + hw_hidden; act_t* m2 = temp + 2*hw_hidden; act_t* m3 = temp + 3*hw_hidden;
 
-    maxpool5x5_s1_p2(cv1_out, m1, h, w, c_hidden); maxpool5x5_s1_p2(m1, m2, h, w, c_hidden); maxpool5x5_s1_p2(m2, m3, h, w, c_hidden);
+    MAXPOOL5X5(cv1_out, m1, h, w, c_hidden);
+    MAXPOOL5X5(m1, m2, h, w, c_hidden);
+    MAXPOOL5X5(m2, m3, h, w, c_hidden);
     CONV1X1(temp, h, w, c_hidden * 4, L2, c, true, out);
 }
 
@@ -620,6 +714,21 @@ void run_yolo_complete() {
     const float* input_img = g_use_camera ? cam_frame : test_image;
 
     int hw = YOLO_IN * YOLO_IN;
+#ifdef USE_INT8_W8A8
+    /* W8A8: quantize fp32 input → int8 buf_B. The first conv's
+     * scale_in was calibrated against fp32 inputs in [0,1] and is
+     * ≈ 1/127, so the int8 = round(fp32 * 127) mapping matches.
+     * test_image.bin is in [0,255] (V169 fossil) — scale down. */
+    float to_q = (input_img[0] > 1.5f) ? (127.0f / 255.0f) : 127.0f;
+    int n3 = 3 * hw;
+    for (int ii = 0; ii < n3; ii++) {
+        float f = input_img[ii] * to_q;
+        int32_t q = (int32_t)(f + (f >= 0 ? 0.5f : -0.5f));
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        buf_B[ii] = (int8_t)q;
+    }
+#else
     float scale = (input_img[0] > 1.0f) ? (1.0f / 255.0f) : 1.0f;
     float32x4_t vscale = vdupq_n_f32(scale); int i = 0;
     for (; i <= hw - 4; i += 4) {
@@ -632,6 +741,7 @@ void run_yolo_complete() {
         buf_B[1*hw+i] = input_img[1*hw+i] * scale;
         buf_B[2*hw+i] = input_img[2*hw+i] * scale;
     }
+#endif
     unsigned long t_rgb = get_timer_count();
 
     /* ── Backbone ─────────────────────────────────────────────────────── */
@@ -646,18 +756,18 @@ void run_yolo_complete() {
     LayerHandle L3 = LAYER_LOAD(ws, 64*32*3*3, 64, "L3");
     CONV2D(buf_A, YOLO_S4, YOLO_S4, 32, L3, 64, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
-    copy_tensor(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
+    COPY_TENSOR(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
 
     LayerHandle L5 = LAYER_LOAD(ws, 128*64*3*3, 128, "L5");
     CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L5, 128, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 2, true, ws, "L6");
-    copy_tensor(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
 
     LayerHandle L7 = LAYER_LOAD(ws, 256*128*3*3, 256, "L7");
     CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L7, 256, 3, 2, 1, true, buf_B);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
-    copy_tensor(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
+    COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
 
     unsigned long t_backbone = get_timer_count();
 
@@ -665,28 +775,28 @@ void run_yolo_complete() {
      *    upsamples — the C2f modules handle the channel reduction. ───── */
 
     /* L10 upsample(SPPF) → L11 concat with L6 → L12 C2f → mid-P4 */
-    upsample2x_nearest(buf_B, buf_A, YOLO_S32, YOLO_S32, 256);
-    concat_tensor(buf_A, 256, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
+    UPSAMPLE2X(buf_B, buf_A, YOLO_S32, YOLO_S32, 256);
+    CONCAT_TENSOR(buf_A, 256, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 384, 128, 1, false, ws, "L12");
-    copy_tensor(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);
 
     /* L13 upsample → L14 concat with L4 → L15 C2f → P3 head input */
-    upsample2x_nearest(buf_A, buf_B, YOLO_S16, YOLO_S16, 128);
-    concat_tensor(buf_B, 128, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
+    UPSAMPLE2X(buf_A, buf_B, YOLO_S16, YOLO_S16, 128);
+    CONCAT_TENSOR(buf_B, 128, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S8, YOLO_S8, 192, 64, 1, false, ws, "L15");
-    copy_tensor(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);
+    COPY_TENSOR(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);
 
     /* L16 conv 3x3 s=2 → L17 concat with mid-P4 → L18 C2f → P4 head input */
     LayerHandle L16 = LAYER_LOAD(ws, 64*64*3*3, 64, "L16");
     CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L16, 64, 3, 2, 1, true, buf_B);
-    concat_tensor(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
+    CONCAT_TENSOR(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 192, 128, 1, false, ws, "L18");
-    copy_tensor(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);
 
     /* L19 conv 3x3 s=2 → L20 concat with SPPF → L21 C2f → P5 head input */
     LayerHandle L19 = LAYER_LOAD(ws, 128*128*3*3, 128, "L19");
     CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L19, 128, 3, 2, 1, true, buf_B);
-    concat_tensor(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
+    CONCAT_TENSOR(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
 
     unsigned long t_neck = get_timer_count();
@@ -722,7 +832,7 @@ void run_yolo_complete() {
     CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wc_p5_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S32, YOLO_S32, 80,  wc_p5_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S32, YOLO_S32, 80,  wc_p5_2, 80, false,       head_cls);
-    decode_v8_dfl(head_box, head_cls, YOLO_S32, YOLO_S32, 32);
+    DECODE_HEAD(head_box, head_cls, YOLO_S32, YOLO_S32, 32, wb_p5_2, wc_p5_2);
 
     /* P4 head — input in save_P4. */
     CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wb_p4_0, 64, 3, 1, 1, true, head_tmp);
@@ -731,7 +841,7 @@ void run_yolo_complete() {
     CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wc_p4_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S16, YOLO_S16, 80,  wc_p4_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S16, YOLO_S16, 80,  wc_p4_2, 80, false,       head_cls);
-    decode_v8_dfl(head_box, head_cls, YOLO_S16, YOLO_S16, 16);
+    DECODE_HEAD(head_box, head_cls, YOLO_S16, YOLO_S16, 16, wb_p4_2, wc_p4_2);
 
     /* P3 head — input in save_P3. */
     CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);
@@ -740,7 +850,7 @@ void run_yolo_complete() {
     CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);
-    decode_v8_dfl(head_box, head_cls, YOLO_S8, YOLO_S8, 8);
+    DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);
 
     unsigned long t_nms = get_timer_count();
 

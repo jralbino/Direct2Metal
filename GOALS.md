@@ -171,12 +171,30 @@ projects ~13–15 fps after INT8 + frame-skip.
           with `USE_INT8=1`; W8A8 wins). All 3 modes compile; FP32
           default + USE_INT8 builds clean, USE_INT8_W8A8 currently
           runs the FP32 path (no graph switch yet — Phase B).
-    - [ ] *Session 3 — Phase B*: integrate model graph. Conditional
-          `act_t` typedef + int8 buffer declarations, `c2f` / `sppf`
-          signatures parameterised on activation type, extend the
-          dispatch macro block with the W8A8 branch, input preprocess
-          (fp32 → int8 via `scale_in` of L0), output dequant (int8 →
-          fp32 before `decode_v8_dfl`).
+    - [x] *Session 3 — Phase B (2026-05-23)*: model graph wired end
+          to end. Added `act_t` typedef (int8_t in W8A8, float
+          elsewhere), changed every inter-layer buffer
+          (buf_A/B/scratch/save_*/head_*) to `act_t`; cam_frame stays
+          fp32 since the debayer writes fp32. Extracted FP32 residual
+          add into `fp32_residual_add_neon` helper. Macro block split
+          into 3 branches (USE_INT8_W8A8 / USE_INT8_WEIGHTS / FP32),
+          each defining WS_TYPE, WS_INIT, LAYER_LOAD, CONV2D, CONV1X1,
+          COPY_TENSOR, CONCAT_TENSOR, UPSAMPLE2X, MAXPOOL5X5,
+          RESIDUAL_ADD, DECODE_HEAD. `c2f_real_inference` tracks
+          `L_prev_out` across bottleneck iterations so the W8A8
+          residual gets correct `(x_out_scale, x_in_scale)` arguments.
+          `run_yolo_complete` gained conditional input preprocess
+          (fp32 → int8 via 127× scale for [0,1] inputs) and uses
+          `DECODE_HEAD` macro which in W8A8 dequants int8 head outputs
+          into scratch reinterpreted as fp32. QEMU sim: W8A8 runs 3
+          frames cleanly end-to-end with both CRC checks passing
+          (cap=11 l0=54 bb=685 neck=374 head=703 T=1815 ms vs FP32
+          T=989 ms — single-core int8 vs 4-core fp32 explains the
+          slowdown; HW will look different).
+    - [ ] *Session 4*: multicore dispatch for int8 (new
+          `TASK_CONV2D_INT8` / `TASK_CONV1X1_INT8` paths in
+          `bsp/multicore.cpp`) + A/B validation vs FP32 on calibration
+          frames + HW bench.
     - [ ] *Session 4*: validation — A/B vs FP32 on the same 50
           calibration frames (correctness, mAP-style). HW bench.
   - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
