@@ -19,14 +19,17 @@
 #include "hud.h"
 #include "bsp.h"
 #include "yolo_v8n.h"
-#include "weights_crc.h"        /* WEIGHTS_CRC32 + SIZE  (FP32 blob) */
-#include "weights_int8_crc.h"   /* WEIGHTS_INT8_CRC32 + SIZE  (INT8 blob, G2 Tier 1) */
+#include "weights_crc.h"           /* WEIGHTS_CRC32 + SIZE        (FP32 blob) */
+#include "weights_int8_crc.h"      /* WEIGHTS_INT8_CRC32 + SIZE   (Tier 1 W8A32 blob) */
+#include "weights_int8_w8a8_crc.h" /* WEIGHTS_INT8_W8A8_CRC32 + SIZE (Tier 2 W8A8 blob) */
 
 /* Weight blobs + test image — defined by app/yolo_v8n_coco/data.s via .incbin. */
 extern "C" const float  weights_start[];
 extern "C" const float  weights_end[];
-extern "C" const int8_t weights_int8_start[];   /* G2 Tier 1 — unused on the FP32 path */
+extern "C" const int8_t weights_int8_start[];        /* Tier 1 — unused outside USE_INT8_WEIGHTS */
 extern "C" const int8_t weights_int8_end[];
+extern "C" const int8_t weights_int8_w8a8_start[];   /* Tier 2 — unused outside USE_INT8_W8A8  */
+extern "C" const int8_t weights_int8_w8a8_end[];
 extern "C" const float  test_image[];
 
 #define YOLO_S2  (YOLO_IN / 2)
@@ -165,6 +168,153 @@ static void dequant_int8_to_fp32_neon(const int8_t* w_int8, int n, float scale, 
         vst1q_f32(dst + i + 12, vmulq_f32(vcvtq_f32_s32(d32), vscale));
     }
     for (; i < n; i++) dst[i] = (float)w_int8[i] * scale;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * G2 Tier 2 (W8A8) — reader for weights_int8_w8a8.bin.
+ *
+ * Per Conv2d layout (from tools/calibrate_int8.py):
+ *   uint32  n_w
+ *   float   scale_w
+ *   float   scale_in
+ *   float   scale_out
+ *   int8    weights[n_w]
+ *   uint32  n_b
+ *   int32   bias[n_b]    (pre-multiplied by 1/(scale_in*scale_w))
+ * ────────────────────────────────────────────────────────────────────── */
+struct WeightStreamW8A8 {
+    struct Layer {
+        int            n_w;
+        float          scale_w;
+        float          scale_in;
+        float          scale_out;
+        const int8_t*  weights;
+        int            n_b;
+        const int32_t* bias;
+    };
+    const uint8_t* ptr;
+    WeightStreamW8A8(const int8_t* start) : ptr((const uint8_t*)start) {}
+
+    Layer next(int expected_w, int expected_b, const char* layer_name) {
+        Layer L;
+        L.n_w = (int)(*((const uint32_t*)ptr)); ptr += 4;
+        if (L.n_w != expected_w) {
+            uart_puts("\n[FATAL W8A8 W] "); uart_puts(layer_name); while (1);
+        }
+        L.scale_w   = *((const float*)ptr); ptr += 4;
+        L.scale_in  = *((const float*)ptr); ptr += 4;
+        L.scale_out = *((const float*)ptr); ptr += 4;
+        L.weights   = (const int8_t*)ptr;   ptr += L.n_w;
+        L.n_b       = (int)(*((const uint32_t*)ptr)); ptr += 4;
+        if (L.n_b != expected_b) {
+            uart_puts("\n[FATAL W8A8 B] "); uart_puts(layer_name); while (1);
+        }
+        L.bias      = (const int32_t*)ptr;  ptr += L.n_b * 4;
+        return L;
+    }
+};
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * G2 Tier 2 — int8 buffer helpers (concat / copy / upsample / maxpool /
+ * residual) and the K-aware conv dispatch. All are `[[maybe_unused]]`
+ * because they only fire under USE_INT8_W8A8; the FP32 / W8A32 builds
+ * include them as compiled-but-unused symbols (caught early on syntax).
+ * ────────────────────────────────────────────────────────────────────── */
+
+[[maybe_unused]]
+static void copy_tensor_i8(const int8_t* src, int8_t* dst, int n) {
+    int i = 0;
+    for (; i <= n - 16; i += 16) vst1q_s8(dst + i, vld1q_s8(src + i));
+    for (; i < n; i++) dst[i] = src[i];
+}
+
+[[maybe_unused]]
+static void concat_tensor_i8(const int8_t* src1, int c1,
+                             const int8_t* src2, int c2,
+                             int8_t* dst, int hw) {
+    copy_tensor_i8(src1, dst,           c1 * hw);
+    copy_tensor_i8(src2, dst + c1 * hw, c2 * hw);
+}
+
+[[maybe_unused]]
+static void upsample2x_nearest_i8(const int8_t* in, int8_t* out, int H, int W, int C) {
+    int W2 = W * 2;
+    for (int c = 0; c < C; c++) {
+        const int8_t* in_ch  = in  + c * H * W;
+        int8_t*       out_ch = out + c * (H * 2) * W2;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int8_t v = in_ch[y * W + x];
+                out_ch[(y*2  ) * W2 + (x*2  )] = v;
+                out_ch[(y*2  ) * W2 + (x*2+1)] = v;
+                out_ch[(y*2+1) * W2 + (x*2  )] = v;
+                out_ch[(y*2+1) * W2 + (x*2+1)] = v;
+            }
+        }
+    }
+}
+
+[[maybe_unused]]
+static void maxpool5x5_s1_p2_i8(const int8_t* in, int8_t* out, int H, int W, int C) {
+    /* 5×5 stride-1 padding-2 → output size == input size. Out-of-bounds
+     * (negative or ≥ H/W) treated as -128 (int8 minimum, neutral for max). */
+    for (int c = 0; c < C; c++) {
+        const int8_t* in_ch  = in  + c * H * W;
+        int8_t*       out_ch = out + c * H * W;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int8_t m = -128;
+                for (int ky = -2; ky <= 2; ky++) {
+                    int iy = y + ky;
+                    if ((unsigned)iy >= (unsigned)H) continue;
+                    for (int kx = -2; kx <= 2; kx++) {
+                        int ix = x + kx;
+                        if ((unsigned)ix >= (unsigned)W) continue;
+                        int8_t v = in_ch[iy * W + ix];
+                        if (v > m) m = v;
+                    }
+                }
+                out_ch[y * W + x] = m;
+            }
+        }
+    }
+}
+
+/* Residual add: x_out[i] = saturate( x_out[i] + x_in[i] * (x_in_scale /
+ * x_out_scale) ), in-place on x_out. fp32 path because the two operands
+ * may carry different per-tensor scales — saturated int8 add would lose
+ * the relative magnitudes. */
+[[maybe_unused]]
+static void w8a8_residual_add(int8_t* x_out, const int8_t* x_in, int n,
+                              float x_out_scale, float x_in_scale) {
+    float ratio = x_in_scale / x_out_scale;
+    for (int i = 0; i < n; i++) {
+        float s = (float)x_out[i] + (float)x_in[i] * ratio;
+        int32_t q = (int32_t)(s + (s >= 0 ? 0.5f : -0.5f));
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        x_out[i] = (int8_t)q;
+    }
+}
+
+/* K-aware conv dispatch — picks the int8 kernel that matches the weight
+ * repack layout chosen by tools/calibrate_int8.py::emit_conv_w8a8. */
+[[maybe_unused]]
+static inline void w8a8_conv2d_dispatch(const int8_t* in, int H, int W, int C_in,
+                                        const WeightStreamW8A8::Layer& L,
+                                        int C_out, int K, int stride, int pad,
+                                        bool do_silu, int8_t* out) {
+    if (K > 1 && C_out >= 32 && C_out % 8 == 0) {
+        conv2d_neon_8ch_int8(in, H, W, C_in, L.weights, C_out, K, stride, pad,
+                             L.scale_w, L.scale_in, L.scale_out, L.bias, do_silu, out);
+    } else if (K > 1 && C_out % 4 == 0) {
+        conv2d_neon_4ch_int8(in, H, W, C_in, L.weights, C_out, K, stride, pad,
+                             L.scale_w, L.scale_in, L.scale_out, L.bias, do_silu, out);
+    } else {
+        /* K == 1 (only K==1 in YOLOv8n falls into this branch). */
+        conv1x1_int8(in, H, W, C_in, L.weights, L.bias,
+                     L.scale_w, L.scale_in, L.scale_out, C_out, do_silu, out);
+    }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -436,8 +586,7 @@ void run_yolo_complete() {
         weights_verified = true;
     }
 
-    /* G2 Tier 1 — verify INT8 blob shipped intact. Runs once; the actual
-     * INT8 inference path lands in a follow-up commit. */
+    /* G2 Tier 1 — verify INT8 (W8A32) blob shipped intact. */
     static bool weights_int8_verified = false;
     if (!weights_int8_verified && WEIGHTS_INT8_CRC32 != 0x00000000U) {
         size_t sz = (size_t)((const uint8_t*)weights_int8_end - (const uint8_t*)weights_int8_start);
@@ -446,6 +595,18 @@ void run_yolo_complete() {
         SAFETY_ASSERT(actual == WEIGHTS_INT8_CRC32, "weights_int8 CRC mismatch");
         uart_puts("[INT8] blob OK\n");
         weights_int8_verified = true;
+    }
+
+    /* G2 Tier 2 — verify W8A8 blob shipped intact. */
+    static bool weights_w8a8_verified = false;
+    if (!weights_w8a8_verified && WEIGHTS_INT8_W8A8_CRC32 != 0x00000000U) {
+        size_t sz = (size_t)((const uint8_t*)weights_int8_w8a8_end -
+                              (const uint8_t*)weights_int8_w8a8_start);
+        SAFETY_ASSERT(sz == WEIGHTS_INT8_W8A8_SIZE, "weights_int8_w8a8 size mismatch");
+        uint32_t actual = crc32_sw((const uint8_t*)weights_int8_w8a8_start, sz);
+        SAFETY_ASSERT(actual == WEIGHTS_INT8_W8A8_CRC32, "weights_int8_w8a8 CRC mismatch");
+        uart_puts("[W8A8] blob OK\n");
+        weights_w8a8_verified = true;
     }
 
     if (g_use_camera) {

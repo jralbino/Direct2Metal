@@ -19,6 +19,13 @@ weights_int8_start:
 weights_int8_end:
 
 .align 4
+.global weights_int8_w8a8_start
+.global weights_int8_w8a8_end
+weights_int8_w8a8_start:
+    .incbin "app/yolo_v8n_coco/weights_int8_w8a8.bin"
+weights_int8_w8a8_end:
+
+.align 4
 .global test_image
 .global test_image_end
 test_image:

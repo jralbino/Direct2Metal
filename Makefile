@@ -11,8 +11,14 @@ APP ?= yolo_v8n_coco
 # --- WEIGHT PRECISION SELECTOR ---
 # G2 Tier 1: `make USE_INT8=1` switches the model to W8A32 (int8 weights,
 # fp32 activations + accumulators). Default 0 keeps the FP32 path.
+# G2 Tier 2: `make USE_INT8_W8A8=1` switches to full W8A8 (int8 weights +
+# int8 activations + int32 accumulators + fp32 out-stage). Mutually
+# exclusive with USE_INT8=1; if both are set W8A8 wins.
 USE_INT8 ?= 0
-ifeq ($(USE_INT8),1)
+USE_INT8_W8A8 ?= 0
+ifeq ($(USE_INT8_W8A8),1)
+    INT8_DEF = -DUSE_INT8_W8A8
+else ifeq ($(USE_INT8),1)
     INT8_DEF = -DUSE_INT8_WEIGHTS
 else
     INT8_DEF =
@@ -74,7 +80,8 @@ sim_elf: $(SIM_OBJS)
 # --- COMPILE RULES ---
 
 # data.s incbins weights/test_image — rebuild data.o when any changes.
-data.o sim_data.o: app/$(APP)/weights.bin app/$(APP)/weights_int8.bin app/$(APP)/test_image.bin
+data.o sim_data.o: app/$(APP)/weights.bin app/$(APP)/weights_int8.bin \
+                   app/$(APP)/weights_int8_w8a8.bin app/$(APP)/test_image.bin
 
 # Hardware ASM/C++ (VPATH-resolved).
 %.o: %.s

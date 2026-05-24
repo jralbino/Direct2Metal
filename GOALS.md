@@ -157,10 +157,26 @@ projects ~13–15 fps after INT8 + frame-skip.
           to the int32 accumulator. Build clean, kernels exported in
           object file (85 KB), kernel8.img links the new symbols, QEMU
           smoke test of the FP32 default path shows no regression.
-    - [ ] *Session 3*: full integer pipeline integration —
-          `USE_INT8_W8A8=1` build flag, replace FP32 activations with
-          int8 between layers, residual-add and concat scale handling,
-          SiLU LUT for hot loops.
+    - [~] *Session 3 — Phase A (2026-05-23)*: scaffolding without
+          model integration. data.s wires `weights_int8_w8a8.bin` (3.17
+          MB) alongside the FP32 and W8A32 blobs. `WeightStreamW8A8`
+          reader (per-layer `n_w, scale_w, scale_in, scale_out, int8
+          weights, n_b, int32 bias`). `w8a8_conv2d_dispatch` picks
+          4ch/8ch/1x1 kernel based on K and C_out. Int8 helpers added:
+          `copy_tensor_i8`, `concat_tensor_i8`, `upsample2x_nearest_i8`,
+          `maxpool5x5_s1_p2_i8`, `w8a8_residual_add` (fp32-domain with
+          per-tensor scale ratios — int8 saturated add isn't correct
+          when scales differ). Runtime CRC check for the W8A8 blob.
+          Makefile gained `USE_INT8_W8A8=1` flag (mutually exclusive
+          with `USE_INT8=1`; W8A8 wins). All 3 modes compile; FP32
+          default + USE_INT8 builds clean, USE_INT8_W8A8 currently
+          runs the FP32 path (no graph switch yet — Phase B).
+    - [ ] *Session 3 — Phase B*: integrate model graph. Conditional
+          `act_t` typedef + int8 buffer declarations, `c2f` / `sppf`
+          signatures parameterised on activation type, extend the
+          dispatch macro block with the W8A8 branch, input preprocess
+          (fp32 → int8 via `scale_in` of L0), output dequant (int8 →
+          fp32 before `decode_v8_dfl`).
     - [ ] *Session 4*: validation — A/B vs FP32 on the same 50
           calibration frames (correctness, mAP-style). HW bench.
   - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
