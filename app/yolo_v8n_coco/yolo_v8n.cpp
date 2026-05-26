@@ -726,10 +726,31 @@ static int global_frame_counter = 1;
 void run_yolo_complete() {
     watchdog_kick();
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
-    uart_puts("[F"); uart_dec(global_frame_counter); uart_puts("] ");
+
+    /* B4: frame-skip. With YOLO_INFER_EVERY_N == 1 every frame runs the
+     * full graph (current behaviour). With N > 1 only one frame in N
+     * runs inference; the other N-1 reuse the cached preds[] but still
+     * capture + render (camera DMA + AE keep ticking, HUD/bboxes
+     * refresh at the capture cadence). Trades bbox staleness for
+     * perceived smoothness. */
+#if YOLO_INFER_EVERY_N > 1
+    static int skip_counter = 0;
+    bool do_inference = ((skip_counter++ % YOLO_INFER_EVERY_N) == 0);
+#else
+    const bool do_inference = true;
+#endif
+
+    uart_puts("[F"); uart_dec(global_frame_counter);
+#if YOLO_INFER_EVERY_N > 1
+    if (!do_inference) uart_puts("s");
+#endif
+    uart_puts("] ");
     global_frame_counter++;
 
-    WS_INIT(ws); num_preds = 0;
+    /* Stage timer markers — default to t_start so the [P] deltas are 0
+     * on skip frames where the inference block didn't run. */
+    unsigned long t_rgb = t_start, t_l0 = t_start;
+    unsigned long t_backbone = t_start, t_neck = t_start, t_nms = t_start;
 
     static bool weights_verified = false;
     if (!weights_verified && WEIGHTS_CRC32 != 0x00000000U) {
@@ -762,15 +783,29 @@ void run_yolo_complete() {
         weights_w8a8_verified = true;
     }
 
-    if (g_use_camera) {
-        if (bsp_frame_acquire()) {
-            debayer_raw10_to_chw_yolo(cam_frame);
-        } else {
-            const int n = 3 * YOLO_IN * YOLO_IN;
-            for (int i = 0; i < n; i++) cam_frame[i] = 0.0f;
-        }
-    }
+    /* Camera capture always runs — keeps the Unicam DMA + AE loop
+     * ticking even on frames where we won't run inference. The
+     * debayer-to-CHW (which fills cam_frame for YOLO) is inside the
+     * inference block since only that path consumes it. The thumbnail
+     * in the render block reads unicam_frame_ptr() directly. */
+    bool cap_ok = false;
+    if (g_use_camera) cap_ok = bsp_frame_acquire();
+    /* input_img at function scope — render block also reads it for the
+     * test-image fallback path (when g_use_camera == false). */
     const float* input_img = g_use_camera ? cam_frame : test_image;
+
+    if (do_inference) {
+        WS_INIT(ws);
+        num_preds = 0;
+
+        if (g_use_camera) {
+            if (cap_ok) {
+                debayer_raw10_to_chw_yolo(cam_frame);
+            } else {
+                const int n = 3 * YOLO_IN * YOLO_IN;
+                for (int i = 0; i < n; i++) cam_frame[i] = 0.0f;
+            }
+        }
 
     int hw = YOLO_IN * YOLO_IN;
 #ifdef USE_INT8_W8A8
@@ -803,13 +838,13 @@ void run_yolo_complete() {
         buf_B[2*hw+i] = input_img[2*hw+i] * scale;
     }
 #endif
-    unsigned long t_rgb = get_timer_count();
+    t_rgb = get_timer_count();
 
     /* ── Backbone ─────────────────────────────────────────────────────── */
     LayerHandle L0 = LAYER_LOAD(ws, 16*3*3*3, 16, "L0");
     CONV2D(buf_B, YOLO_IN, YOLO_IN, 3, L0, 16, 3, 2, 1, true, buf_A);
     LOG_ABSMAX("L0", buf_A, 16 * YOLO_S2 * YOLO_S2, L0);
-    unsigned long t_l0 = get_timer_count();
+    t_l0 = get_timer_count();
 
     LayerHandle L1 = LAYER_LOAD(ws, 32*16*3*3, 32, "L1");
     CONV2D(buf_A, YOLO_S2, YOLO_S2, 16, L1, 32, 3, 2, 1, true, buf_B);
@@ -833,7 +868,7 @@ void run_yolo_complete() {
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
     COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
 
-    unsigned long t_backbone = get_timer_count();
+    t_backbone = get_timer_count();
 
     /* ── Neck (PAN). v8 differs from v5: no extra 1x1 reductions between
      *    upsamples — the C2f modules handle the channel reduction. ───── */
@@ -863,7 +898,7 @@ void run_yolo_complete() {
     CONCAT_TENSOR(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
 
-    unsigned long t_neck = get_timer_count();
+    t_neck = get_timer_count();
 
     /* ── Detect head (anchor-free DFL).
      * Per level: cv2 (box, 64 ch) and cv3 (cls, 80 ch), each a 3-conv stack
@@ -920,7 +955,7 @@ void run_yolo_complete() {
     LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8 * YOLO_S8, wc_p3_2);
     DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);
 
-    unsigned long t_nms = get_timer_count();
+    t_nms = get_timer_count();
 
     if (num_preds > MAX_PREDS) num_preds = MAX_PREDS;
 
@@ -938,6 +973,7 @@ void run_yolo_complete() {
             if (calculate_iou(preds[ii], preds[jj]) > NMS_THRESH) preds[jj].conf = 0.0f;
         }
     }
+    }  /* end if (do_inference) — render block below reuses preds[] */
 
     /* V167 layout: dark canvas (no full camera image) + bboxes + class labels.
      * Camera shown as a 192×108 thumbnail in the top-right of the canvas.
@@ -1034,8 +1070,9 @@ void run_yolo_complete() {
 
     /* B0: per-stage profiling. cap → rgb prep, l0 → first conv2d,
      * backbone → through L8, neck → through L23, head → up to NMS,
-     * total → end. */
-    {
+     * total → end. Suppressed on skip frames since the model stages
+     * didn't run; t_rgb..t_nms would all equal t_start. */
+    if (do_inference) {
         unsigned long ms_cap      = (t_rgb      - t_start)    * 1000UL / f;
         unsigned long ms_l0       = (t_l0       - t_rgb)      * 1000UL / f;
         unsigned long ms_backbone = (t_backbone - t_l0)       * 1000UL / f;
@@ -1069,7 +1106,9 @@ void run_yolo_complete() {
         hud_render((uint8_t*)lfb, pitch);
     }
 
-    num_preds = 0; video_flush();
+    /* B4: preds[] is NOT cleared here — skip-frame renders reuse it
+     * until the next inference frame overwrites the array. */
+    video_flush();
 
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
 }

@@ -191,19 +191,53 @@ projects ~13–15 fps after INT8 + frame-skip.
           (cap=11 l0=54 bb=685 neck=374 head=703 T=1815 ms vs FP32
           T=989 ms — single-core int8 vs 4-core fp32 explains the
           slowdown; HW will look different).
-    - [ ] *Session 4*: multicore dispatch for int8 (new
-          `TASK_CONV2D_INT8` / `TASK_CONV1X1_INT8` paths in
-          `bsp/multicore.cpp`) + A/B validation vs FP32 on calibration
-          frames + HW bench.
-    - [ ] *Session 4*: validation — A/B vs FP32 on the same 50
-          calibration frames (correctness, mAP-style). HW bench.
-  - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Defer
-    indefinitely; not justified yet.
-- [ ] **B4 — Frame-skip detection**: infer every N frames, hold bboxes,
-      keep the camera + HUD at 52 fps perceived.
-- [ ] Stop point: ~15 fps real / ~25 fps perceived. Beyond that the A53
-      bare-metal target tops out (no SDOT, FP32 NEON 4-wide). Faster
-      requires Pi 4/5 (A72/A76) or a smaller model.
+    - [x] *Session 4 — HW bench + diagnosis (2026-05-26)*.
+          V177 W8A8 on Pi Zero 2 W: **2944 ms total vs FP32 727 ms
+          (×4.05 slower)**. Per-stage ratio ~×4 exact — single-core
+          int8 vs 4-core FP32, with no measurable L1/L2 cache win.
+          **Detections: 0/13 frames vs FP32 4/18.**
+          V178 added per-layer absmax instrumentation
+          (`W8A8_DEBUG=1`) — revealed L6/L7/L8 saturating at i8=127
+          (HW activations > coco128 calibration absmax in mid-backbone),
+          while L1/L2/L21/P5_CLS underuse 36-44 % of int8 range. Tried
+          `--scale_safety_margin 1.5`: L7 still saturated, P5_CLS
+          worsened to 24 % range, still zero detections. A global
+          scale bump can't fix heterogeneous per-layer divergence.
+    - **Tier 2 closed (2026-05-26). Verdict: doesn't beat FP32 on
+      A53.** Two structural reasons:
+        1. *Performance ceiling = FP32*. A53 (ARMv8.0, no SDOT) needs
+           the `vld1_s8 → vmovl_s8 → vmlal_s16` long path. Even with
+           multicore int8 (Session 5 hypothetical) the per-conv
+           overhead matches multicore FP32 — no win.
+        2. *Correctness fragile under per-tensor symmetric quant*.
+           Pi camera + IMX708 ISP produces a different activation
+           distribution from coco128; some mid-backbone layers
+           saturate while others underuse. Fixing requires HW-frame
+           recalibration (needs SD frame-capture tooling) and likely
+           per-channel quantization (~2 sessions more).
+      Both `USE_INT8=1` (Tier 1 W8A32, V173) and `USE_INT8_W8A8=1`
+      (V177) builds are retained as alternative flags — code preserved,
+      not default. Code is also a useful starting point if the project
+      ever moves to a Pi 4/5 (A72/A76, ARMv8.2 with SDOT) where int8
+      MUL is hardware-accelerated and the economics flip.
+  - **Tier 3 (A53-specific layouts) — ×3-4, ≥2 weeks.** Not pursued.
+- **B4 — Frame-skip detection.** Now the primary throughput lever
+  after Tier 2 closed. Camera + HUD continue rendering at their HW
+  rate (~16 fps on the current pipeline) while YOLO inference runs
+  once every N frames; the last detection's bboxes persist on screen
+  until refreshed. Trade-off: bbox staleness × N (e.g. at N=10,
+  detections lag the scene by ~0.7 s) for an order-of-magnitude
+  UX win on perceived smoothness.
+  - [ ] Add `FRAME_SKIP_N ?= 1` Makefile flag → `YOLO_INFER_EVERY_N`.
+        N=1 = no change; N>1 = skip inference on (N-1) of N frames.
+  - [ ] Split `run_yolo_complete` so the capture + render path runs
+        every frame; the heavy graph (preprocess + backbone + neck +
+        head + NMS) runs only on the chosen interval. `preds[]` is
+        the cache between inferences.
+  - [ ] HW measurement of effective frame cadence with N=4 and N=10.
+- [ ] Stop point: ~16 fps real (camera/HUD) at any N; inference fps
+      = 1.4 / N (e.g. N=10 → real inference 0.14 fps but bboxes
+      refreshed at 16 fps). A53 bare-metal target tops out here.
 
 ### G3 — Reproducibility and toolchain stability
 

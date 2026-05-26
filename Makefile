@@ -28,8 +28,14 @@ else
     INT8_DEF =
 endif
 
+# B4: frame-skip detection. `make FRAME_SKIP_N=4` runs YOLO inference
+# every 4 frames; the other 3 reuse the cached preds[] but re-render
+# the camera + HUD at the capture rate. N=1 (default) = no change.
+FRAME_SKIP_N ?= 1
+SKIP_DEF = -DYOLO_INFER_EVERY_N=$(FRAME_SKIP_N)
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)
