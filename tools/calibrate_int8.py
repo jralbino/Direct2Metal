@@ -51,6 +51,13 @@ from export_int8 import repack_int8_4ch, repack_int8_8ch  # noqa: E402
 # here in the export pass.
 _STATS = defaultdict(lambda: {"in_absmax": 0.0, "out_absmax": 0.0})
 
+# Global multiplicative bump applied to every activation scale. Used to
+# add headroom when the calibration set (coco128) underestimates
+# runtime activation magnitudes vs the actual deployment camera. Bias
+# int32 is recomputed against the bumped scales so the chain stays
+# consistent.
+_SCALE_SAFETY = 1.0
+
 
 def setup_hooks(model):
     """Hook every Conv2d's outer module (Ultralytics Conv wrapper if present;
@@ -140,6 +147,13 @@ def emit_conv_w8a8(f, conv, tag):
         scale_out = 1.0 / 127.0
     else:
         scale_out = st["out_absmax"] / 127.0
+
+    # Apply the global safety bump (default 1.0 = no change). Scaling
+    # both ends keeps the layer-to-layer chain consistent: layer N+1's
+    # scale_in matches layer N's scale_out up to whatever ratio the
+    # calibration produced.
+    scale_in  *= _SCALE_SAFETY
+    scale_out *= _SCALE_SAFETY
 
     if K > 1 and C_out % 8 == 0 and C_out >= 32:
         packed = repack_int8_8ch(w_q); layout = "8ch"
@@ -238,18 +252,29 @@ def main():
                     help="'coco128' (auto-download) or a folder of jpg/png images.")
     ap.add_argument("--input_size", type=int, default=256,
                     help="YOLO input resolution; must match YOLO_IN in bsp.h.")
+    ap.add_argument("--scale_safety_margin", type=float, default=1.0,
+                    help="Multiply every activation scale by this factor. "
+                         "Use >1.0 (e.g. 1.5) when HW saturates mid-backbone "
+                         "because deployment camera magnitudes exceed the "
+                         "calibration set's absmax. Trades a bit of int8 "
+                         "precision on under-using layers for headroom on "
+                         "saturating ones.")
     ap.add_argument("--output", type=Path,
                     default=Path("app/yolo_v8n_coco/weights_int8_w8a8.bin"))
     ap.add_argument("--crc_header", type=Path,
                     default=Path("app/yolo_v8n_coco/weights_int8_w8a8_crc.h"))
     args = ap.parse_args()
 
+    global _SCALE_SAFETY
+    _SCALE_SAFETY = args.scale_safety_margin
+
     print("=== Tier 2 W8A8 calibration + export ===")
-    print(f"  source     : {args.source}")
-    print(f"  n_images   : {args.n_images}")
-    print(f"  input_size : {args.input_size}")
-    print(f"  output     : {args.output}")
-    print(f"  crc_header : {args.crc_header}")
+    print(f"  source        : {args.source}")
+    print(f"  n_images      : {args.n_images}")
+    print(f"  input_size    : {args.input_size}")
+    print(f"  safety_margin : {args.scale_safety_margin}")
+    print(f"  output        : {args.output}")
+    print(f"  crc_header    : {args.crc_header}")
 
     print("\nLoading YOLOv8n...")
     yolo = YOLO("yolov8n.pt")

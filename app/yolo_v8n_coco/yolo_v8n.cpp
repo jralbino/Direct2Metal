@@ -331,6 +331,17 @@ static inline void w8a8_conv2d_dispatch(const int8_t* in, int H, int W, int C_in
     }
 }
 
+/* Peek L0's scale_in from the W8A8 bin without consuming the stream.
+ * Bin layout starts with: uint32 n_w + float scale_w + float scale_in, so
+ * scale_in is at byte offset 8. Used by the input preprocess to derive
+ * the fp32→int8 quantization factor (rather than hardcoding 1/127),
+ * which makes the preprocess auto-track any `--scale_safety_margin`
+ * applied in tools/calibrate_int8.py. */
+[[maybe_unused]]
+static inline float w8a8_l0_scale_in() {
+    return *((const float*)(weights_int8_w8a8_start + 8));
+}
+
 /* Dequant the int8 head outputs (box + cls) into a fp32 scratch buffer,
  * then run the existing fp32 DFL decoder. The scratch buffer is the
  * model's `scratch` array reinterpreted — it's int8 in W8A8 mode but
@@ -348,6 +359,52 @@ static void w8a8_decode_head(const int8_t* head_box_i8, const int8_t* head_cls_i
     dequant_int8_to_fp32_neon(head_cls_i8, 80 * grd, cls_scale, hc_fp);
     decode_v8_dfl(hb_fp, hc_fp, gh, gw, stride);
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * G2 Tier 2 — W8A8 debug instrumentation. Built with
+ *   make USE_INT8_W8A8=1 W8A8_DEBUG=1
+ * Prints `[ABS] tag i8=AMAX rt1e3=RT cal1e3=CAL` after each checkpoint,
+ * where AMAX = max|int8| in the output (0..127), RT = AMAX × scale_out
+ * × 1000 (runtime fp32 max in thousandths), CAL = 127 × scale_out × 1000
+ * (the absmax that calibration saw, in thousandths). Comparing AMAX
+ * against 127 and RT against CAL reveals dynamic-range underuse or
+ * activation overshoot vs the offline calibration.
+ * ────────────────────────────────────────────────────────────────────── */
+#if defined(W8A8_DEBUG) && defined(USE_INT8_W8A8)
+static int w8a8_absmax_i8(const int8_t* buf, int n) {
+    int8x16_t v_max = vdupq_n_s8(0);
+    int i = 0;
+    for (; i <= n - 16; i += 16) {
+        int8x16_t v     = vld1q_s8(buf + i);
+        int8x16_t v_neg = vqnegq_s8(v);              /* saturated negate */
+        int8x16_t v_abs = vmaxq_s8(v, v_neg);
+        v_max = vmaxq_s8(v_max, v_abs);
+    }
+    int8_t lanes[16];
+    vst1q_s8(lanes, v_max);
+    int mx = 0;
+    for (int j = 0; j < 16; j++) if (lanes[j] > mx) mx = lanes[j];
+    for (; i < n; i++) {
+        int a = buf[i] < 0 ? -(int)buf[i] : (int)buf[i];
+        if (a > mx) mx = a;
+    }
+    return mx;
+}
+
+static void w8a8_dbg_log_output(const char* tag, const int8_t* buf, int n, float scale_out) {
+    int amax = w8a8_absmax_i8(buf, n);
+    int rt_milli  = (int)((float)amax * scale_out * 1000.0f + 0.5f);
+    int cal_milli = (int)(127.0f      * scale_out * 1000.0f + 0.5f);
+    uart_puts("[ABS] "); uart_puts(tag);
+    uart_puts(" i8=");      uart_dec(amax);
+    uart_puts(" rt1e3=");   uart_dec(rt_milli);
+    uart_puts(" cal1e3=");  uart_dec(cal_milli);
+    uart_puts("\n");
+}
+#define LOG_ABSMAX(tag, buf, n, L) w8a8_dbg_log_output((tag), (buf), (n), (L).scale_out)
+#else
+#define LOG_ABSMAX(tag, buf, n, L) ((void)0)
+#endif
 
 /* FP32 NEON residual add helper — extracted from c2f_real_inference so
  * the macro path can use it uniformly. */
@@ -599,6 +656,7 @@ void c2f_real_inference(act_t* in, act_t* out, act_t* temp,
     }
 
     CONV1X1(temp, h, w, c_concat, Lcv2, c_out, true, out);
+    LOG_ABSMAX(prefix, out, c_out * hw, Lcv2);
 }
 
 void sppf_real_inference(act_t* in, act_t* out, act_t* temp,
@@ -614,6 +672,7 @@ void sppf_real_inference(act_t* in, act_t* out, act_t* temp,
     MAXPOOL5X5(m1, m2, h, w, c_hidden);
     MAXPOOL5X5(m2, m3, h, w, c_hidden);
     CONV1X1(temp, h, w, c_hidden * 4, L2, c, true, out);
+    LOG_ABSMAX("SPPF", out, c * hw, L2);
 }
 
 static uint32_t crc32_lut[256];
@@ -715,11 +774,13 @@ void run_yolo_complete() {
 
     int hw = YOLO_IN * YOLO_IN;
 #ifdef USE_INT8_W8A8
-    /* W8A8: quantize fp32 input → int8 buf_B. The first conv's
-     * scale_in was calibrated against fp32 inputs in [0,1] and is
-     * ≈ 1/127, so the int8 = round(fp32 * 127) mapping matches.
-     * test_image.bin is in [0,255] (V169 fossil) — scale down. */
-    float to_q = (input_img[0] > 1.5f) ? (127.0f / 255.0f) : 127.0f;
+    /* W8A8: quantize fp32 input → int8 buf_B using L0's actual
+     * scale_in from the bin (auto-tracks any --scale_safety_margin
+     * applied in calibrate_int8.py). test_image.bin is in [0,255]
+     * (V169 fossil) — scale down before quantizing. */
+    float l0_si = w8a8_l0_scale_in();
+    float inv_si = 1.0f / l0_si;
+    float to_q = (input_img[0] > 1.5f) ? (inv_si / 255.0f) : inv_si;
     int n3 = 3 * hw;
     for (int ii = 0; ii < n3; ii++) {
         float f = input_img[ii] * to_q;
@@ -747,10 +808,12 @@ void run_yolo_complete() {
     /* ── Backbone ─────────────────────────────────────────────────────── */
     LayerHandle L0 = LAYER_LOAD(ws, 16*3*3*3, 16, "L0");
     CONV2D(buf_B, YOLO_IN, YOLO_IN, 3, L0, 16, 3, 2, 1, true, buf_A);
+    LOG_ABSMAX("L0", buf_A, 16 * YOLO_S2 * YOLO_S2, L0);
     unsigned long t_l0 = get_timer_count();
 
     LayerHandle L1 = LAYER_LOAD(ws, 32*16*3*3, 32, "L1");
     CONV2D(buf_A, YOLO_S2, YOLO_S2, 16, L1, 32, 3, 2, 1, true, buf_B);
+    LOG_ABSMAX("L1", buf_B, 32 * YOLO_S4 * YOLO_S4, L1);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
 
     LayerHandle L3 = LAYER_LOAD(ws, 64*32*3*3, 64, "L3");
@@ -765,6 +828,7 @@ void run_yolo_complete() {
 
     LayerHandle L7 = LAYER_LOAD(ws, 256*128*3*3, 256, "L7");
     CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L7, 256, 3, 2, 1, true, buf_B);
+    LOG_ABSMAX("L7", buf_B, 256 * YOLO_S32 * YOLO_S32, L7);
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
     COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
@@ -832,6 +896,8 @@ void run_yolo_complete() {
     CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wc_p5_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S32, YOLO_S32, 80,  wc_p5_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S32, YOLO_S32, 80,  wc_p5_2, 80, false,       head_cls);
+    LOG_ABSMAX("P5_BOX", head_box, 64 * YOLO_S32 * YOLO_S32, wb_p5_2);
+    LOG_ABSMAX("P5_CLS", head_cls, 80 * YOLO_S32 * YOLO_S32, wc_p5_2);
     DECODE_HEAD(head_box, head_cls, YOLO_S32, YOLO_S32, 32, wb_p5_2, wc_p5_2);
 
     /* P4 head — input in save_P4. */
@@ -850,6 +916,8 @@ void run_yolo_complete() {
     CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);
+    LOG_ABSMAX("P3_BOX", head_box, 64 * YOLO_S8 * YOLO_S8, wb_p3_2);
+    LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8 * YOLO_S8, wc_p3_2);
     DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);
 
     unsigned long t_nms = get_timer_count();

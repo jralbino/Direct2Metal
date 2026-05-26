@@ -16,8 +16,12 @@ APP ?= yolo_v8n_coco
 # exclusive with USE_INT8=1; if both are set W8A8 wins.
 USE_INT8 ?= 0
 USE_INT8_W8A8 ?= 0
+W8A8_DEBUG ?= 0
 ifeq ($(USE_INT8_W8A8),1)
     INT8_DEF = -DUSE_INT8_W8A8
+    ifeq ($(W8A8_DEBUG),1)
+        INT8_DEF += -DW8A8_DEBUG
+    endif
 else ifeq ($(USE_INT8),1)
     INT8_DEF = -DUSE_INT8_WEIGHTS
 else
