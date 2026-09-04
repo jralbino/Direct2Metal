@@ -4,11 +4,14 @@ kernel=kernel8.img
 enable_uart=1
 dtoverlay=disable-bt
 
-# BAJO CONSUMO (Para evitar el rayo/barra de voltaje)
-arm_freq=600
-core_freq=250
-sdram_freq=400
-over_voltage=-2
+# RELOJES (V187, 2026-09-04): stock del Zero 2 W. El perfil de bajo consumo
+# (arm_freq=600 core_freq=250 sdram_freq=400 over_voltage=-2) se usó para evitar
+# el rayo de subvoltaje alimentando desde el PC; con fuente de pared no hace falta.
+# Si el rayo reaparece, volver a esos valores. El UART PL011 no depende de
+# core_freq (init_uart_clock fijo a 48 MHz), así que el bench no se ve afectado.
+arm_freq=1000
+core_freq=400
+sdram_freq=450
 
 # VIDEO VESA ESTÁNDAR (1024x768 @ 60Hz)
 hdmi_force_hotplug=1

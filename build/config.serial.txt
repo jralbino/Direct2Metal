@@ -14,11 +14,13 @@ dtoverlay=disable-bt
 # (SERIAL_BOOT block). Built by tools/pack_data.py.
 initramfs d2m_data.bin 0x08000000
 
-# BAJO CONSUMO (Para evitar el rayo/barra de voltaje)
-arm_freq=600
-core_freq=250
-sdram_freq=400
-over_voltage=-2
+# RELOJES (V187): stock del Zero 2 W — en sincronía con build/config.txt. Los
+# tiempos del bench anteriores a V187 (1276-1288 ms) eran a arm_freq=600; no
+# comparar directamente. Si reaparece el rayo de subvoltaje, volver a
+# arm_freq=600 core_freq=250 sdram_freq=400 over_voltage=-2 en ambos archivos.
+arm_freq=1000
+core_freq=400
+sdram_freq=450
 
 # VIDEO VESA ESTÁNDAR (1024x768 @ 60Hz)
 hdmi_force_hotplug=1
