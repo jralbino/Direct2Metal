@@ -240,7 +240,8 @@ projects ~13–15 fps after INT8 + frame-skip.
       refreshed at 16 fps). A53 bare-metal target tops out here.
 - **V183 (2026-09-03) — first real per-layer HW profile + P8.** With the
   new bench (G3) the fp32 graph at `YOLO_IN=256`, 600 MHz, `test_image`:
-  **1276 ms/frame** — `bb=502 neck=289 head=431`. Where it goes: **P3 head
+  **1276 ms/frame** — `bb=502 neck=289 head=431` (V189 at stock 1 GHz clocks:
+  **799 ms** — `bb=316 neck=186 head=262`, exactly ×1.6; same shape). Where it goes: **P3 head
   260 ms, L2 C2f @S4 154, P4 head 121, L15 C2f @S8 112, L4 82** — the three
   DFL heads are **34%** of the frame and the two highest-resolution C2f
   blocks another 21%. **P8 weight-stationary conv3×3** (ported from D2M:

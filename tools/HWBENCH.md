@@ -80,8 +80,9 @@ script. `--no-golden` skips the diff.
 they converge over the first couple of frames on a static image — always compare
 the last frame, never frame 1.
 
-**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`:
-**3× person + bus = `[(0,71),(0,77),(0,88),(5,85)]`** on `bus.jpg` at 256²) and
+**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`: since
+V189 **a real camera frame** captured with `make capture` — wall clock, **`[(74, 83)]`**;
+V184's `bus.jpg` at 256² gave 3× person + bus `[(0,71),(0,77),(0,88),(5,85)]`) and
 `GOLDEN_ABS` (a per-checkpoint numeric fingerprint): the `SERIAL_BOOT` build re-purposes
 the existing `LOG_ABSMAX` checkpoints (L0, L1, L7, every C2f output, P3/P5 box+cls) to
 print `[ABS] <tag> amax1e3=<max|x|×1000>`; `hwbench.py` diffs them with `--abs-tol`
@@ -114,6 +115,14 @@ head=431 render=29`). A/B against the same image built with `-DD2M_NO_P8`: **135
 ms (−6.1%)** — P3 head 320→260, L4 96→82, L15 119→112, L2 unchanged (its bottleneck is
 16-ch → 4-ch kernel, untouched by P8). Per-layer hot spots: P3 head 260, L2 C2f @S4 154,
 P4 head 121, L15 112, L4 82. Heads = 34% of the frame.
+
+**V189 on HW at stock clocks (2026-09-04):** `config.serial.txt` now runs `arm_freq=1000
+core_freq=400 sdram_freq=450` (V187). Same code, same blob layout, real camera frame as
+`test_image`: **TOTAL 799 ms** (`[P] cap=1 l0=13 bb=316 neck=186 head=262 render=18`),
+`detections: [(74, 83)]`, fingerprint 16/16. That is the 600 MHz figure (1276–1301 ms)
+×1.6 — the graph is compute-bound, clocks scale it linearly. Per-layer at 1 GHz: P3 head
+158, L2 C2f @S4 104, L15 79, P4 head 73, L4 50. Numbers before V187 in this file are at
+600 MHz; don't mix them.
 
 **V184 on HW (2026-09-04):** with the regenerated 256² `test_image` — `detections: PASS
 [(0,71),(0,77),(0,88),(5,85)]`, `fingerprint: PASS (16/16)`, TOTAL 1284 ms (render 29→35 ms

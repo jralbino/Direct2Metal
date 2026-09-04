@@ -42,20 +42,23 @@ except ImportError:
 #     -device loader,file=d2m_data.bin,addr=0x08000000 -serial stdio -display none
 # Regenerate both whenever the model / exporter / test image changes.
 #
-# Detections as (class, conf%) — the [DET] line carries no position. bus.jpg at
-# 256² (V184 — the V169..V183 tensor was a 320² fossil that misaligned the colour
-# planes and gave `[DET] none`): 3× person + 1× bus, same objects D2M's YOLOv5n
-# found at 320².
-GOLDEN = [(0, 71), (0, 77), (0, 88), (5, 85)]
+# Detections as (class, conf%) — the [DET] line carries no position.
+# V189 (2026-09-04): test_image.bin is a REAL IMX708 frame captured with
+# `make capture` (frame 90, AE highlight-protected + AWB, scene = wall clock),
+# so this is class 74 "clock". History: V184 used bus.jpg at 256²
+# (3× person + bus = [(0,71),(0,77),(0,88),(5,85)]); V169..V183 shipped a 320²
+# fossil that gave `[DET] none`.
+GOLDEN = [(74, 83)]
 # Per-checkpoint max|activation| x 1000 (int), from the [ABS] lines. Compared with
 # --abs-tol (default 1 = one thousandth) to absorb the x1000 rounding.
-# V184, QEMU raspi3b, kernel8_serial.img + d2m_data.bin (weights.bin CRC 0x176A3D5A,
-# WEIGHTS_SIZE 12608056; test_image.bin 786432 B = bus.jpg → [3][256][256] via
-# tools/convert_image.py). Identical on frames 1/2.
+# V189, real HW (Pi Zero 2 W @ 1 GHz), kernel8_serial.img + d2m_data.bin
+# (weights.bin CRC 0x176A3D5A, WEIGHTS_SIZE 12608056; test_image.bin 786432 B =
+# captured camera frame, blob md5 ca135c74…). Taken with --print-golden on frame 4;
+# fp32 is deterministic so QEMU gives the same values.
 GOLDEN_ABS = {
-    "L0": 44475, "L1": 104883, "L2": 11016, "L4": 10433, "L6": 8294, "L7": 6740,
-    "L8": 4555, "SPPF": 3929, "L12": 4929, "L15": 5007, "L18": 6814, "L21": 5779,
-    "P5_BOX": 11541, "P5_CLS": 29104, "P3_BOX": 15950, "P3_CLS": 25018,
+    "L0": 36703, "L1": 66787, "L2": 7109, "L4": 5509, "L6": 8372, "L7": 4013,
+    "L8": 4468, "SPPF": 3900, "L12": 3822, "L15": 6076, "L18": 7867, "L21": 6295,
+    "P5_BOX": 11241, "P5_CLS": 18614, "P3_BOX": 20600, "P3_CLS": 25319,
 }
 
 # HW line is "[DET] id=<track> c=<cls> %=<conf>[ miss=<n>]" (tracker output);

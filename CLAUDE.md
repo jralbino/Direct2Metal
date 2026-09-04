@@ -7,9 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **~518 ms / ~1.9 FPS** with live
-camera detections at `YOLO_IN=192` (V164); **1276 ms/frame** at `YOLO_IN=256` on
-`test_image`, 600 MHz low-power profile, fp32 (V183 bench — heads 34%, L2 C2f @S4 12%).
+the Pi Camera Module 3 (IMX708). Real-hardware results: **799 ms/frame** at `YOLO_IN=256`,
+fp32, stock 1 GHz clocks (V189 bench, heads 33 %, L2 C2f @S4 13 %); the same build was
+1276 ms at the old 600 MHz low-power profile (V183); **~518 ms** at `YOLO_IN=192` with live
+camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at the
+capture rate and boxes update every 4th frame.
 This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub repo (V76)
 — do not develop there.
 
@@ -64,8 +66,9 @@ against `GOLDEN` in `tools/hwbench.py`. FP32 weights + `test_image` live on the 
 RTS-only — never power-cycle (the CH340 re-enumerates). Do not pass `--reset-invert`.
 
 Correctness regression for any kernel/graph change: on the last captured frame the
-`(class, conf%)` set must equal `GOLDEN` — **`bus.jpg` → 3× person + bus, `[(0,71),(0,77),
-(0,88),(5,85)]`** — **and** the `[ABS] <tag> amax1e3=` fingerprints (the `LOG_ABSMAX`
+`(class, conf%)` set must equal `GOLDEN` — since V189 **a real captured camera frame
+(wall clock) → `[(74, 83)]`**; V184's `bus.jpg` gave `[(0,71),(0,77),(0,88),(5,85)]` — **and**
+the `[ABS] <tag> amax1e3=` fingerprints (the `LOG_ABSMAX`
 checkpoints, printed on the fp32 path only under `SERIAL_BOOT`) must match `GOLDEN_ABS`
 within `--abs-tol`. Regenerate both from the SERIAL_BOOT build in QEMU (`-device
 loader,file=d2m_data.bin,addr=0x08000000`, or `make bench BENCHFLAGS=--print-golden` on
