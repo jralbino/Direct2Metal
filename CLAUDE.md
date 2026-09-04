@@ -62,12 +62,14 @@ against `GOLDEN` in `tools/hwbench.py`. FP32 weights + `test_image` live on the 
 RTS-only — never power-cycle (the CH340 re-enumerates). Do not pass `--reset-invert`.
 
 Correctness regression for any kernel/graph change: on the last captured frame the
-`(class, conf%)` set must equal `GOLDEN` **and** the `[ABS] <tag> amax1e3=` fingerprints
-(the `LOG_ABSMAX` checkpoints, printed on the fp32 path only under `SERIAL_BOOT`) must
-match `GOLDEN_ABS` within `--abs-tol`. `test_image.bin` gives no detections above
-threshold, so the fingerprint is the check that actually bites. Regenerate both from the
-SERIAL_BOOT build in QEMU (`-device loader,file=d2m_data.bin,addr=0x08000000`, or
-`make bench BENCHFLAGS=--print-golden` on HW) after model/exporter/test-image changes.
+`(class, conf%)` set must equal `GOLDEN` — **`bus.jpg` → 3× person + bus, `[(0,71),(0,77),
+(0,88),(5,85)]`** — **and** the `[ABS] <tag> amax1e3=` fingerprints (the `LOG_ABSMAX`
+checkpoints, printed on the fp32 path only under `SERIAL_BOOT`) must match `GOLDEN_ABS`
+within `--abs-tol`. Regenerate both from the SERIAL_BOOT build in QEMU (`-device
+loader,file=d2m_data.bin,addr=0x08000000`, or `make bench BENCHFLAGS=--print-golden` on
+HW) after model/exporter/test-image changes. **`test_image.bin` must be 3·YOLO_IN² floats**
+(786 432 B at 256): V169–V183 shipped a 320² fossil that misaligned the colour planes and
+produced `[DET] none` — if detections vanish after a resolution change, check this first.
 
 **Per-layer profiler** (`bsp/kernel.cpp`, declared in `bsp/bsp.h`): `prof_reset()` /
 `prof_mark("name")` / `prof_dump()`. Marks are placed in `run_yolo_complete` after every
@@ -80,11 +82,17 @@ Weights + test image are `.incbin`'d via `app/yolo_v8n_coco/data.s` (4 blobs: fp
 w8a8, image). After touching the model or exporters:
 
 ```bash
-tools/env/bin/python tools/export_model.py    # -> weights.bin + weights_crc.h
-tools/env/bin/python tools/export_int8.py     # -> weights_int8*.bin + *_crc.h  (only if INT8 matters)
-tools/env/bin/python tools/convert_image.py   # -> test_image.bin (CHW float32)
+python3 tools/convert_image.py                # -> app/<APP>/test_image.bin, [3][YOLO_IN][YOLO_IN]
+                                               #    (Pillow + numpy; reads YOLO_IN from bsp/bsp.h)
+tools/env/bin/python tools/export_model.py    # -> weights.bin + weights_crc.h   (needs torch)
+tools/env/bin/python tools/export_int8.py     # -> weights_int8*.bin + *_crc.h   (only if INT8 matters)
 make d2m_data.bin                              # -> d2m_data.bin for the bench (recopy to SD)
 ```
+
+**`tools/env` is broken** (2026-09-03): `tools/env/bin/python{,3,3.13}` are 0-byte files
+(dated 2026-07-08), so the torch-based exporters cannot run until the venv is recreated
+(`python3 -m venv tools/env && tools/env/bin/pip install -r tools/requirements.txt`).
+`convert_image.py` deliberately needs only system `python3`.
 
 The kernel CRC-checks each blob at boot and halts on mismatch. Weight layout selection
 (exporter ↔ `bsp/multicore.cpp` unpack) must stay in sync:

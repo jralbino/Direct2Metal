@@ -42,18 +42,20 @@ except ImportError:
 #     -device loader,file=d2m_data.bin,addr=0x08000000 -serial stdio -display none
 # Regenerate both whenever the model / exporter / test image changes.
 #
-# Detections as (class, conf%) — the [DET] line carries no position. test_image
-# currently yields none above CONF_THRESH, so this set is empty and the
-# fingerprint below is the real correctness check.
-GOLDEN = []
+# Detections as (class, conf%) — the [DET] line carries no position. bus.jpg at
+# 256² (V184 — the V169..V183 tensor was a 320² fossil that misaligned the colour
+# planes and gave `[DET] none`): 3× person + 1× bus, same objects D2M's YOLOv5n
+# found at 320².
+GOLDEN = [(0, 71), (0, 77), (0, 88), (5, 85)]
 # Per-checkpoint max|activation| x 1000 (int), from the [ABS] lines. Compared with
 # --abs-tol (default 1 = one thousandth) to absorb the x1000 rounding.
-# V183 bring-up, QEMU raspi3b, kernel8_serial.img + d2m_data.bin (weights.bin CRC
-# 0x176A3D5A, WEIGHTS_SIZE 12608056). Identical on frames 1/2/3.
+# V184, QEMU raspi3b, kernel8_serial.img + d2m_data.bin (weights.bin CRC 0x176A3D5A,
+# WEIGHTS_SIZE 12608056; test_image.bin 786432 B = bus.jpg → [3][256][256] via
+# tools/convert_image.py). Identical on frames 1/2.
 GOLDEN_ABS = {
-    "L0": 58666, "L1": 99427, "L2": 9530, "L4": 3103, "L6": 2227, "L7": 4399,
-    "L8": 3370, "SPPF": 2130, "L12": 2455, "L15": 3154, "L18": 2334, "L21": 2702,
-    "P5_BOX": 9393, "P5_CLS": 18194, "P3_BOX": 12922, "P3_CLS": 18596,
+    "L0": 44475, "L1": 104883, "L2": 11016, "L4": 10433, "L6": 8294, "L7": 6740,
+    "L8": 4555, "SPPF": 3929, "L12": 4929, "L15": 5007, "L18": 6814, "L21": 5779,
+    "P5_BOX": 11541, "P5_CLS": 29104, "P3_BOX": 15950, "P3_CLS": 25018,
 }
 
 # HW line is "[DET] id=<track> c=<cls> %=<conf>[ miss=<n>]" (tracker output);

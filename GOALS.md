@@ -255,6 +255,17 @@ projects ~13–15 fps after INT8 + frame-skip.
   - [ ] Winograd F(2×2,3×3) for the remaining 3×3s (~1.8× on those layers).
   - Not a lever: INT8 (Tier 2 verdict above), FMLA interleave, contiguous
     output store — all measured 0 ms on this SoC.
+- **V184 (2026-09-03) — `test_image.bin` was a 320² fossil.** Since V169
+  (`YOLO_IN` 320→256) the tensor stayed 3×320×320; the kernel reads the first
+  3·N² floats, so the colour planes were misaligned and the deterministic
+  path saw striped garbage — `[DET] none` with huge class logits. Every
+  test-image result from V169 to V183 (incl. the W8A8 "calibration mismatch"
+  diagnosis, which used this input) should be re-read with that in mind.
+  Fixed by regenerating from `bus.jpg` at `YOLO_IN` (`tools/convert_image.py`
+  now reads it from `bsp/bsp.h`). fp32 now detects **person 88 / bus 85 /
+  person 77 / person 71** — the same four objects as YOLOv5n@320 in the old
+  clone. Goldens regenerated; the bench is now a real YOLO check, not just a
+  kernel-numerics check.
 
 ### G3 — Reproducibility and toolchain stability
 

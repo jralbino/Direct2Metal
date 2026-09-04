@@ -80,15 +80,21 @@ script. `--no-golden` skips the diff.
 they converge over the first couple of frames on a static image — always compare
 the last frame, never frame 1.
 
-**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`) and
-`GOLDEN_ABS` (a per-checkpoint numeric fingerprint). `test_image.bin` currently yields
-**no detections** above `CONF_THRESH` on the FP32 path, so `GOLDEN` is empty and the
-fingerprint is the real check: the `SERIAL_BOOT` build re-purposes the existing
-`LOG_ABSMAX` checkpoints (L0, L1, L7, every C2f output, P3/P5 box+cls) to print
-`[ABS] <tag> amax1e3=<max|x|×1000>`; `hwbench.py` diffs them with `--abs-tol` (default
-±1). Same binary in QEMU and on HW → they match to the thousandth. Regenerate both sets
-after any model / exporter / test-image change (`make bench BENCHFLAGS=--print-golden`
-prints paste-ready literals; or from QEMU):
+**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`:
+**3× person + bus = `[(0,71),(0,77),(0,88),(5,85)]`** on `bus.jpg` at 256²) and
+`GOLDEN_ABS` (a per-checkpoint numeric fingerprint): the `SERIAL_BOOT` build re-purposes
+the existing `LOG_ABSMAX` checkpoints (L0, L1, L7, every C2f output, P3/P5 box+cls) to
+print `[ABS] <tag> amax1e3=<max|x|×1000>`; `hwbench.py` diffs them with `--abs-tol`
+(default ±1). Same binary in QEMU and on HW → they match to the thousandth. Regenerate
+both sets after any model / exporter / test-image change (`make bench
+BENCHFLAGS=--print-golden` prints paste-ready literals; or from QEMU):
+
+> **V184 fix:** until V183 `test_image.bin` was a **320² fossil** (3×320×320 floats) fed to
+> the 256² model — the kernel reads the first 3·N² floats, so the colour planes were
+> misaligned and the graph saw striped garbage → `[DET] none` despite huge class logits.
+> `tools/convert_image.py` now reads `YOLO_IN` from `bsp/bsp.h` (needs only Pillow +
+> numpy; the `tools/env` venv has 0-byte interpreters and is unusable). Regenerating the
+> tensor is what made detections appear — nothing in the graph changed.
 ```
 make kernel8_serial.img d2m_data.bin
 qemu-system-aarch64 -M raspi3b -kernel kernel8_serial.img \
