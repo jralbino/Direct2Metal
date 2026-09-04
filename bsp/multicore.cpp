@@ -145,10 +145,83 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                 const float* wg = w_rep + (long)g * CinKK * 8;
                 float32x4_t v_bl = bias ? vld1q_f32(bias + co)     : vdupq_n_f32(0.0f);
                 float32x4_t v_bh = bias ? vld1q_f32(bias + co + 4) : vdupq_n_f32(0.0f);
-                float* o0 = out+(co+0)*HW_out; float* o1 = out+(co+1)*HW_out;
-                float* o2 = out+(co+2)*HW_out; float* o3 = out+(co+3)*HW_out;
-                float* o4 = out+(co+4)*HW_out; float* o5 = out+(co+5)*HW_out;
-                float* o6 = out+(co+6)*HW_out; float* o7 = out+(co+7)*HW_out;
+                float* oc[8];
+                for (int c = 0; c < 8; c++) oc[c] = out + (long)(co + c) * HW_out;
+                int tw = x_end - x_tile, th = y_end - y_tile, npos = tw * th;
+
+                /* -DD2M_NO_P8 disables the fast path (A/B baseline for `make bench`). */
+#ifdef D2M_NO_P8
+                const bool kP8 = false;
+#else
+                const bool kP8 = true;
+#endif
+                if (kP8 && K == 3 && pad == 1 && stride == 1 &&
+                    y_tile >= 1 && y_end <= H_out - 1 && x_tile >= 1 && x_end <= W_out - 1) {
+                    /* V183 / P8 — weight-stationary K=3 path (ported from D2M).
+                     * ci is the OUTER loop: each ci's 288 B of weights is read once
+                     * per tile and applied to every position from L1 (the original
+                     * loop re-read the ~18 KB group weights from L2 for all 32
+                     * positions — they spill the 32 KB L1D next to the input tile).
+                     * Accumulators live in a 1 KB tile buffer, hot in L1. Measured on
+                     * D2M HW: bot 3x3 @20 11.8 → 10.5 ms (−11%). Keeps the B2 PRFM
+                     * on next-ci weights + input rows. Interior tiles only; edge
+                     * tiles and strided convs fall through to the original path. */
+                    float accl[TILE_H * TILE_W][4];
+                    float acch[TILE_H * TILE_W][4];
+                    for (int p = 0; p < npos; p++) { vst1q_f32(accl[p], vdupq_n_f32(0.0f)); vst1q_f32(acch[p], vdupq_n_f32(0.0f)); }
+
+                    for (int ci = 0; ci < C_in; ci++) {
+                        const float* ipc = in + ci * HW_in;
+                        const float* wci = wg + ci * 72;
+                        if (ci + 1 < C_in) {
+                            __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
+                            __builtin_prefetch(in + (ci+1)*HW_in + (y_tile-1)*W_in + (x_tile-1), 0, 3);
+                        }
+                        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 8), w2=vld1q_f32(wci+16);
+                        float32x4_t w3=vld1q_f32(wci+24), w4=vld1q_f32(wci+32), w5=vld1q_f32(wci+40);
+                        float32x4_t w6=vld1q_f32(wci+48), w7=vld1q_f32(wci+56), w8=vld1q_f32(wci+64);
+                        float32x4_t W0=vld1q_f32(wci+ 4), W1=vld1q_f32(wci+12), W2=vld1q_f32(wci+20);
+                        float32x4_t W3=vld1q_f32(wci+28), W4=vld1q_f32(wci+36), W5=vld1q_f32(wci+44);
+                        float32x4_t W6=vld1q_f32(wci+52), W7=vld1q_f32(wci+60), W8=vld1q_f32(wci+68);
+                        int p = 0;
+                        for (int oy = y_tile; oy < y_end; oy++) {
+                            const float* r0 = ipc + (oy - 1) * W_in;
+                            const float* r1 = r0 + W_in;
+                            const float* r2 = r1 + W_in;
+                            for (int ox = x_tile; ox < x_end; ox++, p++) {
+                                int b = ox - 1;
+                                float32x4_t al = vld1q_f32(accl[p]);
+                                float32x4_t ah = vld1q_f32(acch[p]);
+                                al=vmlaq_n_f32(al,w0,r0[b]);   ah=vmlaq_n_f32(ah,W0,r0[b]);
+                                al=vmlaq_n_f32(al,w1,r0[b+1]); ah=vmlaq_n_f32(ah,W1,r0[b+1]);
+                                al=vmlaq_n_f32(al,w2,r0[b+2]); ah=vmlaq_n_f32(ah,W2,r0[b+2]);
+                                al=vmlaq_n_f32(al,w3,r1[b]);   ah=vmlaq_n_f32(ah,W3,r1[b]);
+                                al=vmlaq_n_f32(al,w4,r1[b+1]); ah=vmlaq_n_f32(ah,W4,r1[b+1]);
+                                al=vmlaq_n_f32(al,w5,r1[b+2]); ah=vmlaq_n_f32(ah,W5,r1[b+2]);
+                                al=vmlaq_n_f32(al,w6,r2[b]);   ah=vmlaq_n_f32(ah,W6,r2[b]);
+                                al=vmlaq_n_f32(al,w7,r2[b+1]); ah=vmlaq_n_f32(ah,W7,r2[b+1]);
+                                al=vmlaq_n_f32(al,w8,r2[b+2]); ah=vmlaq_n_f32(ah,W8,r2[b+2]);
+                                vst1q_f32(accl[p], al);
+                                vst1q_f32(acch[p], ah);
+                            }
+                        }
+                    }
+
+                    int p = 0;
+                    for (int oy = y_tile; oy < y_end; oy++) {
+                        for (int ox = x_tile; ox < x_end; ox++, p++) {
+                            float32x4_t al = vaddq_f32(vld1q_f32(accl[p]), v_bl);
+                            float32x4_t ah = vaddq_f32(vld1q_f32(acch[p]), v_bh);
+                            if (do_silu) { al = neon_silu(al); ah = neon_silu(ah); }
+                            int pos = oy*W_out + ox;
+                            oc[0][pos]=vgetq_lane_f32(al,0); oc[1][pos]=vgetq_lane_f32(al,1);
+                            oc[2][pos]=vgetq_lane_f32(al,2); oc[3][pos]=vgetq_lane_f32(al,3);
+                            oc[4][pos]=vgetq_lane_f32(ah,0); oc[5][pos]=vgetq_lane_f32(ah,1);
+                            oc[6][pos]=vgetq_lane_f32(ah,2); oc[7][pos]=vgetq_lane_f32(ah,3);
+                        }
+                    }
+                    continue;
+                }
 
                 for (int oy = y_tile; oy < y_end; oy++) {
                     for (int ox = x_tile; ox < x_end; ox++) {
@@ -215,10 +288,10 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
 
                         if (do_silu) { al = neon_silu(al); ah = neon_silu(ah); }
                         int pos = oy*W_out + ox;
-                        o0[pos]=vgetq_lane_f32(al,0); o1[pos]=vgetq_lane_f32(al,1);
-                        o2[pos]=vgetq_lane_f32(al,2); o3[pos]=vgetq_lane_f32(al,3);
-                        o4[pos]=vgetq_lane_f32(ah,0); o5[pos]=vgetq_lane_f32(ah,1);
-                        o6[pos]=vgetq_lane_f32(ah,2); o7[pos]=vgetq_lane_f32(ah,3);
+                        oc[0][pos]=vgetq_lane_f32(al,0); oc[1][pos]=vgetq_lane_f32(al,1);
+                        oc[2][pos]=vgetq_lane_f32(al,2); oc[3][pos]=vgetq_lane_f32(al,3);
+                        oc[4][pos]=vgetq_lane_f32(ah,0); oc[5][pos]=vgetq_lane_f32(ah,1);
+                        oc[6][pos]=vgetq_lane_f32(ah,2); oc[7][pos]=vgetq_lane_f32(ah,3);
                     }
                 }
             }

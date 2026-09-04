@@ -202,73 +202,9 @@ void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const floa
     }
 }
 
-// RESTAURANDO KERNELS 3x3 Y FALLBACKS QUE NECESITA CONV2D.CPP
-void conv2d_neon_4ch_group(const float* in, int H_in, int W_in, int C_in, const float* wg, int group_idx, int H_out, int W_out, int K, int stride, int pad, float* out) {
-    int HW_out = H_out * W_out, HW_in = H_in * W_in;
-    float *o0 = out + (group_idx*4+0)*HW_out, *o1 = out + (group_idx*4+1)*HW_out, *o2 = out + (group_idx*4+2)*HW_out, *o3 = out + (group_idx*4+3)*HW_out;
-    for (int i = 0; i < HW_out; i++) { o0[i]=0; o1[i]=0; o2[i]=0; o3[i]=0; }
-
-    for (int oy = 0; oy < H_out; oy++) {
-        for (int ox = 0; ox < W_out; ox++) {
-            float32x4_t acc = vdupq_n_f32(0.0f);
-            for (int ci = 0; ci < C_in; ci++) {
-                const float* in_ch = in + ci * HW_in;
-                const float* wci = wg + ci * K * K * 4;
-                for (int ky = 0; ky < K; ky++) {
-                    int iy = oy * stride + ky - pad;
-                    if ((unsigned)iy >= (unsigned)H_in) continue;
-                    for (int kx = 0; kx < K; kx++) {
-                        int ix = ox * stride + kx - pad;
-                        if ((unsigned)ix < (unsigned)W_in)
-                            acc = vmlaq_n_f32(acc, vld1q_f32(wci + (ky*K+kx)*4), in_ch[iy * W_in + ix]);
-                    }
-                }
-            }
-            int pos = oy * W_out + ox;
-            o0[pos] = vgetq_lane_f32(acc, 0); o1[pos] = vgetq_lane_f32(acc, 1);
-            o2[pos] = vgetq_lane_f32(acc, 2); o3[pos] = vgetq_lane_f32(acc, 3);
-        }
-    }
-}
-
-void conv2d_cpp(const float* in, int H_in, int W_in, int C_in, const float* w, int C_out, int K, int stride, int pad, float* out) {
-    int H_out = H_in / stride;
-    int W_out = W_in / stride;
-    int HW_out = H_out * W_out;
-    for (int co = 0; co < C_out; co++) {
-        float* och = out + co * HW_out;
-        const float* w_filter = w + co * C_in * K * K;
-        for (int i = 0; i < HW_out; i++) och[i] = 0.0f;
-        for (int ci = 0; ci < C_in; ci++) {
-            const float* in_ch = in + ci * H_in * W_in;
-            const float* w_ch = w_filter + ci * K * K;
-            for (int oy = 0; oy < H_out; oy++) {
-                for (int ox = 0; ox < W_out; ox++) {
-                    float acc = 0.0f;
-                    for (int ky = 0; ky < K; ky++) {
-                        int iy = oy * stride + ky - pad;
-                        if (iy < 0 || iy >= H_in) continue;
-                        for (int kx = 0; kx < K; kx++) {
-                            int ix = ox * stride + kx - pad;
-                            if (ix < 0 || ix >= W_in) continue;
-                            acc += in_ch[iy * W_in + ix] * w_ch[ky * K + kx];
-                        }
-                    }
-                    och[oy * W_out + ox] += acc;
-                }
-            }
-        }
-    }
-}
-
 } // FIN DE EXTERN "C"
 
-// --- COMPATIBILITY WRAPPERS & POOLING (Fuera de extern "C") ---
-void conv2d_neon_4ch(const float* in, int H_in, int W_in, int C_in, const float* w_rep, int C_out, int K, int stride, int pad, float* out) {
-    int H_out = H_in / stride; int W_out = W_in / stride;
-    for (int g = 0; g < C_out/4; g++) conv2d_neon_4ch_group(in, H_in, W_in, C_in, w_rep + g*C_in*K*K*4, g, H_out, W_out, K, stride, pad, out);
-}
-
+// --- POOLING / RESAMPLING (Fuera de extern "C") ---
 void upsample2x_nearest(const float* in, float* out, int H, int W, int C) {
     for (int c = 0; c < C; c++) {
         const float* in_ch = in + c * H * W;
@@ -327,37 +263,6 @@ void maxpool5x5_s1_p2(const float* in, float* out, int H, int W, int C) {
                     out_ch[oy * W + ox] = max_val;
                 }
             }
-        }
-    }
-}
-
-// --- PUENTE DE CÁMARA (640x480 ARGB -> 320x320 Tensor Planar FP32) ---
-// Convierte un Framebuffer de cámara a un Tensor YOLO en ~1-2 milisegundos
-void camera_to_tensor_320(const uint32_t* camera_buffer, float* yolo_tensor) {
-    // Escala precalculada (1/255)
-    const float scale = 0.0039215686f; 
-    
-    // Punteros a los canales planos de YOLO (C, H, W)
-    float* dst_r = yolo_tensor;
-    float* dst_g = yolo_tensor + (320 * 320);
-    float* dst_b = yolo_tensor + (2 * 320 * 320);
-
-    for (int y = 0; y < 320; y++) {
-        for (int x = 0; x < 320; x++) {
-            // Nearest Neighbor: Mapeamos (y, x) a (y*2, x*2) en la cámara
-            // Asumimos pitch de 640 pixeles
-            uint32_t pixel = camera_buffer[(y * 2) * 640 + (x * 2)];
-
-            // Extracción de bytes rápida (Asumiendo formato estándar BGRA o ARGB de la Pi)
-            // Modificar el shift (>>, &) dependiendo del formato final que entregue la GPU
-            float b = (float)( pixel        & 0xFF) * scale;
-            float g = (float)((pixel >> 8)  & 0xFF) * scale;
-            float r = (float)((pixel >> 16) & 0xFF) * scale;
-            
-            int out_idx = y * 320 + x;
-            dst_r[out_idx] = r;
-            dst_g[out_idx] = g;
-            dst_b[out_idx] = b;
         }
     }
 }

@@ -30,6 +30,13 @@ extern "C" void uart_puts_c(const char* s);
 unsigned long get_timer_freq();
 unsigned long get_timer_count();
 
+/* Per-layer profiler (kernel.cpp, V183). prof_reset() at the start of the
+ * timed graph, prof_mark("name") after each stage of interest, prof_dump()
+ * after the frame's [T]/[P] lines. Up to 48 marks; extra marks are dropped. */
+void prof_reset();
+void prof_mark(const char* name);
+void prof_dump();
+
 /* ── Cache (multicore.cpp) ───────────────────────────────────────────────── */
 
 /* Clean D-cache to PoC over [addr, addr+size). NULL/zero-size safe.

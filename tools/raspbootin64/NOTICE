@@ -1,0 +1,11 @@
+This directory vendors the AArch64 serial bootloader from:
+
+  bztsrc/raspi3-tutorial — tutorial 14 "raspbootin64"
+  https://github.com/bztsrc/raspi3-tutorial/tree/master/14_raspbootin64
+  Copyright (C) 2018 bzt (bztsrc@github) — MIT License
+
+itself a 64-bit rewrite of mrvn/raspbootin.
+
+Files start.S, uart.c, uart.h, mbox.c, mbox.h, gpio.h, link.ld are used
+verbatim; each carries the upstream MIT header. main.c is modified — see the
+header comment in that file.

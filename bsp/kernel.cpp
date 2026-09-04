@@ -40,6 +40,30 @@ void uart_dec(int n) {
 unsigned long get_timer_freq() { unsigned long v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
 unsigned long get_timer_count() { unsigned long v; asm volatile("mrs %0, cntpct_el0" : "=r"(v)); return v; }
 
+/* ── Per-layer profiler (V183, ported from D2M) ─────────────────────────────
+ * prof_mark() records the delta since the previous mark into a table; the
+ * app calls prof_dump() AFTER its [T]/[P] lines so the marks never inflate
+ * the stage buckets. Only meaningful on real HW (QEMU has no cache model). */
+#define PROF_MAX 48
+static const char*   prof_names[PROF_MAX];
+static unsigned long prof_cyc[PROF_MAX];
+static int           prof_n = 0;
+static unsigned long prof_last = 0;
+void prof_reset() { prof_n = 0; prof_last = get_timer_count(); }
+void prof_mark(const char* name) {
+    unsigned long now = get_timer_count();
+    if (prof_n < PROF_MAX) { prof_names[prof_n] = name; prof_cyc[prof_n] = now - prof_last; prof_n++; }
+    prof_last = now;
+}
+void prof_dump() {
+    unsigned long fq = get_timer_freq();
+    uart_puts("--- PER-LAYER PROFILE ---\n");
+    for (int i = 0; i < prof_n; i++) {
+        uart_puts("  "); uart_puts(prof_names[i]); uart_puts(": ");
+        uart_dec((int)(prof_cyc[i] * 1000000ULL / fq)); uart_puts(" us\n");
+    }
+}
+
 extern "C" void _start();
 
 extern "C" void kernel_main() {
@@ -54,7 +78,14 @@ extern "C" void kernel_main() {
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
     video_init(); draw_fill(0xFF00FF00); video_flush();
     init_mmu();
+#ifdef SERIAL_BOOT
+    /* V183 bench build: hwbench.py diffs detections against the golden set
+     * for test_image — never the camera. Skip camera_init() so g_use_camera
+     * stays false and timing/detections are deterministic. */
+    uart_puts("[CAM] SERIAL_BOOT: camera disabled, running test_image\n");
+#else
     if (!camera_init()) uart_puts("[CAM] No camera — test mode\n");
+#endif
     if (get_timer_freq() != 62500000UL) watchdog_init(4000);
 #ifdef SIMULATION
     for (int _sim_frame = 0; _sim_frame < 3; _sim_frame++) run_yolo_complete();

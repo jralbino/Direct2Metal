@@ -1,0 +1,37 @@
+# --- D2M SERIAL-BOOT config.txt (tools/hwbench.py workflow, V183) ---
+# SD holds: raspbootin64.img (as kernel8.img) + this file + d2m_data.bin.
+# The real code kernel (kernel8_serial.img, -DSERIAL_BOOT) is streamed over
+# UART each iteration by hwbench.py. Everything below `initramfs` mirrors
+# build/config.txt — keep the two in sync.
+
+arm_64bit=1
+kernel=kernel8.img            # <- this is tools/raspbootin64/raspbootin64.img
+enable_uart=1
+dtoverlay=disable-bt
+
+# FP32 weights + test image, loaded by the VPU before the kernel starts.
+# Address must match D2M_BLOB_ADDR in app/yolo_v8n_coco/yolo_v8n.cpp
+# (SERIAL_BOOT block). Built by tools/pack_data.py.
+initramfs d2m_data.bin 0x08000000
+
+# BAJO CONSUMO (Para evitar el rayo/barra de voltaje)
+arm_freq=600
+core_freq=250
+sdram_freq=400
+over_voltage=-2
+
+# VIDEO VESA ESTÁNDAR (1024x768 @ 60Hz)
+hdmi_force_hotplug=1
+hdmi_group=2
+hdmi_mode=4
+hdmi_drive=2
+config_hdmi_boost=7
+disable_overscan=1
+gpu_mem=128
+
+# CAMERA (Pi Camera v3 / IMX708) — see build/config.txt for the rationale.
+# Kept identical so the VPU-level D-PHY calibration / MCLK / GPIO setup is
+# the same as the production image even though the SERIAL_BOOT kernel skips
+# camera_init() and runs the golden test_image.
+start_x=1
+dtoverlay=imx708

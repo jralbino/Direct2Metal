@@ -1,8 +1,9 @@
 # --- TOOLCHAIN ---
-CC = aarch64-linux-gnu-gcc
-CXX = aarch64-linux-gnu-g++
-LD = aarch64-linux-gnu-ld
-OBJCOPY = aarch64-linux-gnu-objcopy
+CROSS   ?= aarch64-linux-gnu-
+CC       = $(CROSS)gcc
+CXX      = $(CROSS)g++
+LD       = $(CROSS)ld
+OBJCOPY  = $(CROSS)objcopy
 
 # --- APPLICATION SELECTOR ---
 # Step 5 (BSP/app split): one image per app. Override with `make APP=other`.
@@ -66,17 +67,17 @@ BSP_CPP_SRCS  = bsp/kernel.cpp bsp/mmu.cpp bsp/multicore.cpp \
                 bsp/camera.cpp bsp/camera_bsc.cpp bsp/camera_imx708.cpp \
                 bsp/camera_unicam.cpp bsp/camera_debayer.cpp
 
-RT_CPP_SRCS   = runtime/ops.cpp runtime/conv2d.cpp runtime/ops_int8.cpp
-RT_ASM_SRCS   = runtime/neon/matmul_neon.s runtime/neon/conv2d_neon.s
+# V183: runtime/conv2d.cpp + runtime/neon/*.s (Phase 1-2 legacy) removed — no callers.
+RT_CPP_SRCS   = runtime/ops.cpp runtime/ops_int8.cpp
 
 APP_ASM_SRCS  = app/$(APP)/data.s
 APP_CPP_SRCS  = app/$(APP)/yolo_v8n.cpp app/$(APP)/hud.cpp
 
-ASM_SRCS = $(BSP_ASM_SRCS) $(RT_ASM_SRCS) $(APP_ASM_SRCS)
+ASM_SRCS = $(BSP_ASM_SRCS) $(APP_ASM_SRCS)
 CPP_SRCS = $(BSP_CPP_SRCS) $(RT_CPP_SRCS) $(APP_CPP_SRCS)
 
 # Where to find sources by basename (filenames are globally unique).
-VPATH = bsp:runtime:runtime/neon:app/$(APP)
+VPATH = bsp:runtime:app/$(APP)
 
 # --- HARDWARE OBJECTS (flat at project root) ---
 HW_OBJS = $(notdir $(ASM_SRCS:.s=.o)) $(notdir $(CPP_SRCS:.cpp=.o))
@@ -122,6 +123,54 @@ kernel8.elf: bsp/linker.ld $(HW_OBJS)
 kernel8.img: kernel8.elf
 	$(OBJCOPY) -O binary $< $@
 
+# =====================================================================
+#  V183 — Serial-boot / unattended-bench workflow  (tools/HWBENCH.md)
+#
+#  kernel8_serial.img : code-only image (-DSERIAL_BOOT, no data.s) streamed
+#                       over UART by tools/hwbench.py each iteration (~5 s).
+#  d2m_data.bin       : FP32 weights + test_image, lives on the SD, loaded by
+#                       the VPU at 0x08000000 via `initramfs` (config.serial.txt).
+#  raspbootin64.img   : 936 B serial chain-loader, goes on the SD AS kernel8.img.
+#  bench              : reset (RTS->RUN) + upload + capture + parse + golden diff.
+# =====================================================================
+SERFLAGS  = $(CXXFLAGS) -DSERIAL_BOOT
+SER_OBJS  = $(addprefix ser_,$(filter-out data.o,$(HW_OBJS)))
+
+ser_%.o: %.s
+	$(CC) $(CFLAGS) -c $< -o $@
+
+ser_%.o: %.cpp
+	$(CXX) $(SERFLAGS) -c $< -o $@
+
+kernel8_serial.img: bsp/linker.ld $(SER_OBJS)
+	$(LD) -T bsp/linker.ld -o kernel8_serial.elf $(SER_OBJS)
+	$(OBJCOPY) -O binary kernel8_serial.elf $@
+	@echo "kernel8_serial.img = $$(stat -c %s $@) bytes"
+serial-kernel: kernel8_serial.img
+
+d2m_data.bin: app/$(APP)/weights.bin app/$(APP)/test_image.bin tools/pack_data.py
+	python3 tools/pack_data.py
+
+raspbootin: tools/raspbootin64/raspbootin64.img
+tools/raspbootin64/raspbootin64.img:
+	$(MAKE) -C tools/raspbootin64 CROSS=$(CROSS)
+
+# One-time SD prep: stage everything that goes on the card into ./sdcard/.
+sdcard: raspbootin d2m_data.bin
+	mkdir -p sdcard
+	cp tools/raspbootin64/raspbootin64.img sdcard/kernel8.img
+	cp build/config.serial.txt sdcard/config.txt
+	cp d2m_data.bin sdcard/d2m_data.bin
+	@echo "sdcard/ ready — add RPi firmware files, copy all to the SD boot partition"
+
+# One unattended iteration: rebuild the code image, flash, capture, parse.
+PORT       ?= /dev/ttyUSB0
+FRAMES     ?= 3
+BENCHFLAGS ?=
+bench: kernel8_serial.img
+	python3 tools/hwbench.py --port $(PORT) --kernel kernel8_serial.img --frames $(FRAMES) $(BENCHFLAGS)
+
 # --- CLEAN ---
 clean:
 	rm -f *.o *.elf *.img
+	$(MAKE) -C tools/raspbootin64 clean 2>/dev/null || true

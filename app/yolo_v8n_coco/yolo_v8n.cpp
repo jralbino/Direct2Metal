@@ -23,6 +23,25 @@
 #include "weights_int8_crc.h"      /* WEIGHTS_INT8_CRC32 + SIZE   (Tier 1 W8A32 blob) */
 #include "weights_int8_w8a8_crc.h" /* WEIGHTS_INT8_W8A8_CRC32 + SIZE (Tier 2 W8A8 blob) */
 
+#ifdef SERIAL_BOOT
+/* V183 serial-boot bench (tools/hwbench.py): the ~60 KB code-only kernel is
+ * streamed over UART and data.s is NOT linked. The FP32 weights + test image
+ * ride the SD as d2m_data.bin (tools/pack_data.py), loaded by the VPU at
+ * D2M_BLOB_ADDR via `initramfs` in build/config.serial.txt. Layout:
+ *   [weights.bin (WEIGHTS_SIZE)] [pad to 16] [test_image.bin]
+ * The bench is fp32-only — the INT8 blobs are not packed. */
+#if defined(USE_INT8_W8A8) || defined(USE_INT8_WEIGHTS)
+#error "SERIAL_BOOT is fp32-only: build without USE_INT8 / USE_INT8_W8A8"
+#endif
+#define D2M_BLOB_ADDR 0x08000000UL
+static const float*  const weights_start          = (const float*)D2M_BLOB_ADDR;
+static const float*  const weights_end            = (const float*)(D2M_BLOB_ADDR + WEIGHTS_SIZE);
+static const float*  const test_image             = (const float*)(D2M_BLOB_ADDR + ((WEIGHTS_SIZE + 15UL) & ~15UL));
+static const int8_t* const weights_int8_start      = nullptr;   /* unused: fp32 bench */
+static const int8_t* const weights_int8_end        = nullptr;
+static const int8_t* const weights_int8_w8a8_start = nullptr;
+static const int8_t* const weights_int8_w8a8_end   = nullptr;
+#else
 /* Weight blobs + test image — defined by app/yolo_v8n_coco/data.s via .incbin. */
 extern "C" const float  weights_start[];
 extern "C" const float  weights_end[];
@@ -31,6 +50,7 @@ extern "C" const int8_t weights_int8_end[];
 extern "C" const int8_t weights_int8_w8a8_start[];   /* Tier 2 — unused outside USE_INT8_W8A8  */
 extern "C" const int8_t weights_int8_w8a8_end[];
 extern "C" const float  test_image[];
+#endif
 
 #define YOLO_S2  (YOLO_IN / 2)
 #define YOLO_S4  (YOLO_IN / 4)
@@ -402,6 +422,25 @@ static void w8a8_dbg_log_output(const char* tag, const int8_t* buf, int n, float
     uart_puts("\n");
 }
 #define LOG_ABSMAX(tag, buf, n, L) w8a8_dbg_log_output((tag), (buf), (n), (L).scale_out)
+#elif defined(SERIAL_BOOT)
+/* V183 bench build (fp32): the same checkpoints print a numeric fingerprint
+ * `[ABS] tag amax1e3=N` (max|x| × 1000 as int). tools/hwbench.py diffs these
+ * against GOLDEN_ABS — a per-layer correctness check that works even when
+ * test_image yields no detections above CONF_THRESH. Same binary in QEMU and
+ * on HW → values should match to the thousandth. */
+static void fp32_dbg_log_output(const char* tag, const float* buf, int n) {
+    float32x4_t v_max = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i <= n - 4; i += 4) v_max = vmaxq_f32(v_max, vabsq_f32(vld1q_f32(buf + i)));
+    float lanes[4]; vst1q_f32(lanes, v_max);
+    float mx = lanes[0];
+    for (int j = 1; j < 4; j++) if (lanes[j] > mx) mx = lanes[j];
+    for (; i < n; i++) { float a = buf[i] < 0 ? -buf[i] : buf[i]; if (a > mx) mx = a; }
+    uart_puts("[ABS] "); uart_puts(tag);
+    uart_puts(" amax1e3="); uart_dec((int)(mx * 1000.0f + 0.5f));
+    uart_puts("\n");
+}
+#define LOG_ABSMAX(tag, buf, n, L) fp32_dbg_log_output((tag), (buf), (n))
 #else
 #define LOG_ABSMAX(tag, buf, n, L) ((void)0)
 #endif
@@ -861,17 +900,22 @@ static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
 void c2f_real_inference(act_t* in, act_t* out, act_t* temp,
                         int h, int w, int c_in, int c_out, int n_depth,
                         bool shortcut, WS_TYPE& ws, const char* prefix) {
-    (void)prefix;
     int c_hidden = c_out / 2;
     int hw = h * w;
     int hw_h = hw * c_hidden;
     int c_concat = (2 + n_depth) * c_hidden;
 
+    /* V183: breakdown profiling for a single C2f instance (L6, the heaviest
+     * backbone block). The marks land between the outer "L5" and "L6" marks,
+     * so their sum ≈ the L6 bucket and the outer L6 mark reads ~0. */
+    const bool CP = (prefix[0] == 'L' && prefix[1] == '6' && prefix[2] == 0);
+    #define C2F_MARK(s) do { if (CP) prof_mark(s); } while (0)
+
     LayerHandle Lcv1 = LAYER_LOAD(ws, c_in * (2 * c_hidden), 2 * c_hidden, "C2f_CV1");
     LayerHandle Lcv2 = LAYER_LOAD(ws, c_concat * c_out,      c_out,        "C2f_CV2");
 
     /* cv1: writes (a | b) contiguously into temp slots 0 and 1. */
-    CONV1X1(in, h, w, c_in, Lcv1, 2 * c_hidden, true, temp);
+    CONV1X1(in, h, w, c_in, Lcv1, 2 * c_hidden, true, temp);                              C2F_MARK("  C2f.cv1 1x1");
 
     /* L_prev_out tracks the layer that last wrote into the slot we're
      * about to consume as x_in. For i==0 that slot is the second half
@@ -888,17 +932,18 @@ void c2f_real_inference(act_t* in, act_t* out, act_t* temp,
         act_t* x_mid = out;                            /* scratch */
         act_t* x_out = temp + (2 + i) * hw_h;          /* new slot */
 
-        CONV2D(x_in,  h, w, c_hidden, Lb1, c_hidden, 3, 1, 1, true, x_mid);
-        CONV2D(x_mid, h, w, c_hidden, Lb2, c_hidden, 3, 1, 1, true, x_out);
+        CONV2D(x_in,  h, w, c_hidden, Lb1, c_hidden, 3, 1, 1, true, x_mid);              C2F_MARK("  C2f.bot cv1 3x3");
+        CONV2D(x_mid, h, w, c_hidden, Lb2, c_hidden, 3, 1, 1, true, x_out);              C2F_MARK("  C2f.bot cv2 3x3");
 
         if (shortcut) {
             RESIDUAL_ADD(x_out, x_in, hw_h, Lb2, L_prev_out);
         }
-        L_prev_out = Lb2;
+        L_prev_out = Lb2;                                                                 C2F_MARK("  C2f.bot residual");
     }
 
-    CONV1X1(temp, h, w, c_concat, Lcv2, c_out, true, out);
+    CONV1X1(temp, h, w, c_concat, Lcv2, c_out, true, out);                                C2F_MARK("  C2f.cv2 1x1");
     LOG_ABSMAX(prefix, out, c_out * hw, Lcv2);
+    #undef C2F_MARK
 }
 
 void sppf_real_inference(act_t* in, act_t* out, act_t* temp,
@@ -1000,6 +1045,7 @@ void run_yolo_complete() {
         weights_verified = true;
     }
 
+#ifndef SERIAL_BOOT   /* INT8 blobs are not packed into d2m_data.bin (fp32 bench) */
     /* G2 Tier 1 — verify INT8 (W8A32) blob shipped intact. */
     static bool weights_int8_verified = false;
     if (!weights_int8_verified && WEIGHTS_INT8_CRC32 != 0x00000000U) {
@@ -1022,6 +1068,7 @@ void run_yolo_complete() {
         uart_puts("[W8A8] blob OK\n");
         weights_w8a8_verified = true;
     }
+#endif /* !SERIAL_BOOT */
 
     /* Camera capture always runs — keeps the Unicam DMA + AE loop
      * ticking even on frames where we won't run inference. The
@@ -1085,28 +1132,29 @@ void run_yolo_complete() {
     CONV2D(buf_B, YOLO_IN, YOLO_IN, 3, L0, 16, 3, 2, 1, true, buf_A);
     LOG_ABSMAX("L0", buf_A, 16 * YOLO_S2 * YOLO_S2, L0);
     t_l0 = get_timer_count();
+    prof_reset();   /* V183 per-layer profile starts after L0 (it has its own bucket) */
 
     LayerHandle L1 = LAYER_LOAD(ws, 32*16*3*3, 32, "L1");
     CONV2D(buf_A, YOLO_S2, YOLO_S2, 16, L1, 32, 3, 2, 1, true, buf_B);
-    LOG_ABSMAX("L1", buf_B, 32 * YOLO_S4 * YOLO_S4, L1);
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");
+    LOG_ABSMAX("L1", buf_B, 32 * YOLO_S4 * YOLO_S4, L1);                                     prof_mark("L1  conv3x3 s2 16->32 @S4");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");  prof_mark("L2  C2f n1  32ch @S4");
 
     LayerHandle L3 = LAYER_LOAD(ws, 64*32*3*3, 64, "L3");
-    CONV2D(buf_A, YOLO_S4, YOLO_S4, 32, L3, 64, 3, 2, 1, true, buf_B);
+    CONV2D(buf_A, YOLO_S4, YOLO_S4, 32, L3, 64, 3, 2, 1, true, buf_B);                     prof_mark("L3  conv3x3 s2 32->64 @S8");
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
-    COPY_TENSOR(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);
+    COPY_TENSOR(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);                                   prof_mark("L4  C2f n2  64ch @S8");
 
     LayerHandle L5 = LAYER_LOAD(ws, 128*64*3*3, 128, "L5");
-    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L5, 128, 3, 2, 1, true, buf_B);
+    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L5, 128, 3, 2, 1, true, buf_B);                    prof_mark("L5  conv3x3 s2 64->128 @S16");
     c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 2, true, ws, "L6");
-    COPY_TENSOR(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);                                prof_mark("L6  C2f n2  128ch @S16");
 
     LayerHandle L7 = LAYER_LOAD(ws, 256*128*3*3, 256, "L7");
     CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L7, 256, 3, 2, 1, true, buf_B);
-    LOG_ABSMAX("L7", buf_B, 256 * YOLO_S32 * YOLO_S32, L7);
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8");
+    LOG_ABSMAX("L7", buf_B, 256 * YOLO_S32 * YOLO_S32, L7);                                prof_mark("L7  conv3x3 s2 128->256 @S32");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8"); prof_mark("L8  C2f n1  256ch @S32");
     sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
-    COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);
+    COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);                              prof_mark("SPPF      256ch @S32");
 
     t_backbone = get_timer_count();
 
@@ -1117,26 +1165,26 @@ void run_yolo_complete() {
     UPSAMPLE2X(buf_B, buf_A, YOLO_S32, YOLO_S32, 256);
     CONCAT_TENSOR(buf_A, 256, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 384, 128, 1, false, ws, "L12");
-    COPY_TENSOR(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);                             prof_mark("L12 up+cat+C2f 384->128 @S16");
 
     /* L13 upsample → L14 concat with L4 → L15 C2f → P3 head input */
     UPSAMPLE2X(buf_A, buf_B, YOLO_S16, YOLO_S16, 128);
     CONCAT_TENSOR(buf_B, 128, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S8, YOLO_S8, 192, 64, 1, false, ws, "L15");
-    COPY_TENSOR(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);
+    COPY_TENSOR(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);                                   prof_mark("L15 up+cat+C2f 192->64 @S8");
 
     /* L16 conv 3x3 s=2 → L17 concat with mid-P4 → L18 C2f → P4 head input */
     LayerHandle L16 = LAYER_LOAD(ws, 64*64*3*3, 64, "L16");
-    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L16, 64, 3, 2, 1, true, buf_B);
+    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L16, 64, 3, 2, 1, true, buf_B);                    prof_mark("L16 conv3x3 s2 64->64 @S16");
     CONCAT_TENSOR(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
     c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 192, 128, 1, false, ws, "L18");
-    COPY_TENSOR(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);
+    COPY_TENSOR(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);                                prof_mark("L18 cat+C2f 192->128 @S16");
 
     /* L19 conv 3x3 s=2 → L20 concat with SPPF → L21 C2f → P5 head input */
     LayerHandle L19 = LAYER_LOAD(ws, 128*128*3*3, 128, "L19");
-    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L19, 128, 3, 2, 1, true, buf_B);
+    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L19, 128, 3, 2, 1, true, buf_B);                prof_mark("L19 conv3x3 s2 128->128 @S32");
     CONCAT_TENSOR(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
-    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21");
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21"); prof_mark("L21 cat+C2f 384->256 @S32");
 
     t_neck = get_timer_count();
 
@@ -1173,7 +1221,7 @@ void run_yolo_complete() {
     CONV1X1(scratch,  YOLO_S32, YOLO_S32, 80,  wc_p5_2, 80, false,       head_cls);
     LOG_ABSMAX("P5_BOX", head_box, 64 * YOLO_S32 * YOLO_S32, wb_p5_2);
     LOG_ABSMAX("P5_CLS", head_cls, 80 * YOLO_S32 * YOLO_S32, wc_p5_2);
-    DECODE_HEAD(head_box, head_cls, YOLO_S32, YOLO_S32, 32, wb_p5_2, wc_p5_2);
+    DECODE_HEAD(head_box, head_cls, YOLO_S32, YOLO_S32, 32, wb_p5_2, wc_p5_2);            prof_mark("P5 head 6 conv + decode @S32");
 
     /* P4 head — input in save_P4. */
     CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wb_p4_0, 64, 3, 1, 1, true, head_tmp);
@@ -1182,7 +1230,7 @@ void run_yolo_complete() {
     CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wc_p4_0, 80, 3, 1, 1, true, head_tmp);
     CONV2D (head_tmp, YOLO_S16, YOLO_S16, 80,  wc_p4_1, 80, 3, 1, 1, true, scratch);
     CONV1X1(scratch,  YOLO_S16, YOLO_S16, 80,  wc_p4_2, 80, false,       head_cls);
-    DECODE_HEAD(head_box, head_cls, YOLO_S16, YOLO_S16, 16, wb_p4_2, wc_p4_2);
+    DECODE_HEAD(head_box, head_cls, YOLO_S16, YOLO_S16, 16, wb_p4_2, wc_p4_2);            prof_mark("P4 head 6 conv + decode @S16");
 
     /* P3 head — input in save_P3. */
     CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);
@@ -1193,7 +1241,7 @@ void run_yolo_complete() {
     CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);
     LOG_ABSMAX("P3_BOX", head_box, 64 * YOLO_S8 * YOLO_S8, wb_p3_2);
     LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8 * YOLO_S8, wc_p3_2);
-    DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);
+    DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);               prof_mark("P3 head 6 conv + decode @S8");
 
     t_nms = get_timer_count();
 
@@ -1382,4 +1430,8 @@ void run_yolo_complete() {
     video_flush();
 
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
+
+    /* V183: per-layer profile AFTER [P]/[T] so the marks never inflate them.
+     * Only meaningful on real HW; hwbench.py parses the "  name: N us" lines. */
+    if (do_inference) prof_dump();
 }

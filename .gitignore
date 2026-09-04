@@ -9,9 +9,15 @@
 *.txt
 *.ppm
 
-# Python env 
+# Python env
 tools/env/
 __pycache__/
+
+# Serial-boot / hwbench artifacts (V183)
+/d2m_data.bin
+/sdcard/
+/hwbench.log
+ser_*.o
 
 # OS files
 .DS_Store
