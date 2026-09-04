@@ -905,10 +905,15 @@ void c2f_real_inference(act_t* in, act_t* out, act_t* temp,
     int hw_h = hw * c_hidden;
     int c_concat = (2 + n_depth) * c_hidden;
 
-    /* V183: breakdown profiling for a single C2f instance (L6, the heaviest
-     * backbone block). The marks land between the outer "L5" and "L6" marks,
-     * so their sum ≈ the L6 bucket and the outer L6 mark reads ~0. */
-    const bool CP = (prefix[0] == 'L' && prefix[1] == '6' && prefix[2] == 0);
+    /* V183: breakdown profiling for a single C2f instance. `make C2F_PROF=N`
+     * (default 6) picks which one; the marks land between that layer's outer
+     * mark and the previous one, so they sum to its bucket. */
+#ifndef C2F_PROF_LAYER
+#define C2F_PROF_LAYER 6
+#endif
+    int c2f_num = 0;
+    for (const char* pc = prefix + 1; *pc >= '0' && *pc <= '9'; pc++) c2f_num = c2f_num * 10 + (*pc - '0');
+    const bool CP = (prefix[0] == 'L' && c2f_num == (C2F_PROF_LAYER));
     #define C2F_MARK(s) do { if (CP) prof_mark(s); } while (0)
 
     LayerHandle Lcv1 = LAYER_LOAD(ws, c_in * (2 * c_hidden), 2 * c_hidden, "C2f_CV1");

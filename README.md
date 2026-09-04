@@ -3,9 +3,9 @@
 > **This README is a stale YOLOv5n-era snapshot.** The project is now **YOLOv8n 256²**
 > with a working IMX708 camera pipeline (V164+). The maintained engineering logs are
 > **`GOALS.md`** (roadmap + verdicts, incl. why INT8 was closed), **`PLAN.md`** (version
-> log — see the **V183–V189** rows) and `camera_debug.md`. Current real-HW figure (V189,
-> stock 1 GHz clocks, real camera frame as `test_image`, fp32): **799 ms/frame** (1276 ms at
-> the old 600 MHz profile); heads = 33% of that.
+> log — see the **V183–V190** rows) and `camera_debug.md`. Current real-HW figure (V190,
+> stock 1 GHz clocks, real camera frame as `test_image`, fp32): **664 ms/frame** (799 ms
+> before the V190 conv1x1 fix, 1276 ms at the old 600 MHz profile); P3 head = 23% of that.
 > Iterate with the unattended bench: `make bench` (`tools/HWBENCH.md`). Onboarding for
 > Claude Code lives in `CLAUDE.md`.
 

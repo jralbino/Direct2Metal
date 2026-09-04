@@ -116,13 +116,14 @@ ms (−6.1%)** — P3 head 320→260, L4 96→82, L15 119→112, L2 unchanged (i
 16-ch → 4-ch kernel, untouched by P8). Per-layer hot spots: P3 head 260, L2 C2f @S4 154,
 P4 head 121, L15 112, L4 82. Heads = 34% of the frame.
 
-**V189 on HW at stock clocks (2026-09-04):** `config.serial.txt` now runs `arm_freq=1000
-core_freq=400 sdram_freq=450` (V187). Same code, same blob layout, real camera frame as
-`test_image`: **TOTAL 799 ms** (`[P] cap=1 l0=13 bb=316 neck=186 head=262 render=18`),
-`detections: [(74, 83)]`, fingerprint 16/16. That is the 600 MHz figure (1276–1301 ms)
-×1.6 — the graph is compute-bound, clocks scale it linearly. Per-layer at 1 GHz: P3 head
-158, L2 C2f @S4 104, L15 79, P4 head 73, L4 50. Numbers before V187 in this file are at
-600 MHz; don't mix them.
+**V190 on HW (2026-09-04):** conv1x1 input transpose (L1-set-thrash fix). **TOTAL 664 ms**
+(`[P] cap=1 l0=13 bb=244 neck=130 head=256 render=18`), `detections: [(74,83)]`, fingerprint
+16/16 bit-exact. Per-layer at 1 GHz: **P3 head 152**, P4 head 72, L6 C2f 49, L4 42, L12 31,
+L15 31, L18 27, L21 22, L8 21. Sub-breakdown of any C2f with `make C2F_PROF=N`; L2's cv2 1×1
+went 55 → 7.8 ms.
+
+**V189 (previous):** stock clocks (`arm_freq=1000`, V187), TOTAL 799 ms — exactly ×1.6 the
+600 MHz figure. Numbers before V187 in this file are at 600 MHz; don't mix them.
 
 **V184 on HW (2026-09-04):** with the regenerated 256² `test_image` — `detections: PASS
 [(0,71),(0,77),(0,88),(5,85)]`, `fingerprint: PASS (16/16)`, TOTAL 1284 ms (render 29→35 ms

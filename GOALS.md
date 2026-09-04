@@ -249,13 +249,22 @@ projects ~13–15 fps after INT8 + frame-skip.
   tile instead of once per output pixel) measured **1359 → 1276 ms (−6.1%)**
   A/B on HW, all of it in 8-ch K=3/s1 layers (P3 head −60, L4 −14, L15 −7).
   L2 is untouched because its 16-ch bottleneck runs the 4-ch kernel.
-  - [ ] Port P8 to `conv2d_partial` (4-ch) → L2 (154 ms) is the target.
-  - [ ] Heads: 6 convs × 3 levels = 431 ms. Model-level lever (prune P3 or
-        share the cv2/cv3 stems); kernel-level is near the A53 f32 limit
-        (D2M measured: store layout and FMLA scheduling changes = 0 ms).
-  - [ ] Winograd F(2×2,3×3) for the remaining 3×3s (~1.8× on those layers).
+  - [x] **V190 — conv1x1 input transpose.** `ops_neon_conv1x1_kernel` read
+        `in[ci][p]` for consecutive ci, HW·4 B apart; at `HW=S4²=4096` every
+        ci hit the same L1 set → `C_in` conflict misses per output group. L2's
+        cv2 (48→32 @64²) was 55 ms (~18× compute). Fix: transpose each
+        4-position input group to `xt[C_in][4]` once, read it sequentially per
+        output group. **HW 799 → 664 ms (−17 %)** — L2 cv2 55→8, cv1 15→4,
+        L15 79→31. Bit-exact. (This was the real "L2 target", not the 4-ch P8.)
+  - [ ] **P3 head, now 152 ms (23 %)** — the biggest single item. 2 stacked
+        3×3 (P8-8ch already) × box+cls at S8, ~151 M MACs, genuinely at the
+        A53 f32 rate. Levers: Winograd F(2×2,3×3) on those 3×3s (~1.8×), or
+        cut the DFL head to 1 conv per branch (model change).
+  - [ ] Winograd F(2×2,3×3) for the 3×3s (~1.8×) — the remaining algorithmic
+        lever after V190.
   - Not a lever: INT8 (Tier 2 verdict above), FMLA interleave, contiguous
-    output store — all measured 0 ms on this SoC.
+    output store, P8 on the 4-ch kernel (L2's real problem was the conv1x1) —
+    all measured 0 ms / N/A on this SoC.
 - **V184 (2026-09-03) — `test_image.bin` was a 320² fossil.** Since V169
   (`YOLO_IN` 320→256) the tensor stayed 3×320×320; the kernel reads the first
   3·N² floats, so the colour planes were misaligned and the deterministic

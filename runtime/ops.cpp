@@ -50,153 +50,116 @@ static inline float32x4_t neon_silu(float32x4_t x) {
     return vmulq_f32(x, recip);
 }
 
-/* conv1x1 kernel: p_step-outer tiled across HW for L1-cache locality on the
- * input tile (reused across all output channel groups in the tile).
+/* conv1x1 kernel — out[co][p] = b[co] + Σ_ci w[co][ci] · in[ci][p].
  *
- * B2 (2026-05-11): 8-output-channel hot path. With C_out=64/128/256 (typical
- * YOLOv5n head/neck), this halves the C_out loop iteration count and doubles
- * the work-per-input-load. A53 has 32 NEON regs so the 8 accumulators + 1
- * v_in + 8 dup-weights fit easily.
+ * V190 (2026-09-04): the input is [C_in][HW] and the old inner loop did
+ * `vld1q_f32(in + ci*HW + p)` for consecutive ci — HW*4 bytes apart. When HW
+ * is a multiple of 2048 (YOLO_IN=256 → S4²=4096) every ci maps to the SAME
+ * 32 KB / 4-way L1 set, so C_in loads = C_in−4 conflict misses, repeated for
+ * every output-channel group. L2's cv2 (48→32 @64²) was 55 ms this way —
+ * ~18× its compute floor.
  *
- * PRFM (pldl1keep, locality=3) prefetches the next ci's input tile during
- * the current ci iter — at 192² input the smaller layers (L6/L8) fit in L1
- * already, but L2/L4 (C_in × HW × 4 B = ~10-40 KB / channel) benefit.
- *
- * Falls back to 4-ch path for the remainder, then scalar tail. */
+ * Fix: transpose each 4-position group of the input into `xt` ([C_in][4],
+ * contiguous over ci, ~L1-resident) ONCE, then every co-group reads it
+ * sequentially. Strided reads drop from (C_out/4)·C_in to C_in per group.
+ * The 8-output-channel body (B2, 2026-05-11) is kept. C_in > C1X1_MAX_CIN
+ * (never in this model — SPPF cv2 is the max at 512) uses a plain path. */
+#define TILE_P       32
+#define C1X1_MAX_CIN 512
+
+static void conv1x1_slow(const float* in, int HW, int C_in, const float* w, const float* b,
+                         int C_out_start, int C_out_end, bool do_silu, float* out) {
+    for (int co = C_out_start; co < C_out_end; co++) {
+        const float* wr = w + (long)co * C_in;
+        float* och = out + (long)co * HW;
+        for (int p = 0; p < HW; p++) {
+            float acc = b ? b[co] : 0.0f;
+            for (int ci = 0; ci < C_in; ci++) acc += wr[ci] * in[(long)ci * HW + p];
+            if (do_silu) acc *= mini_sigmoidf(acc);
+            och[p] = acc;
+        }
+    }
+}
+
 void ops_neon_conv1x1_kernel(const float* in, int H, int W, int C_in, const float* w, const float* b, int C_out_start, int C_out_end, int C_out_total, bool do_silu, float* out) {
+    (void)C_out_total;
     int HW = H * W;
-    #define TILE_P 32
+
+    if (C_in > C1X1_MAX_CIN) {   /* never in this model (SPPF cv2 = 512 is the max) */
+        conv1x1_slow(in, HW, C_in, w, b, C_out_start, C_out_end, do_silu, out);
+        return;
+    }
 
     for (int p_step = 0; p_step < HW; p_step += TILE_P) {
         int p_max = (p_step + TILE_P < HW) ? p_step + TILE_P : HW;
-        int co = C_out_start;
+        int p_vec = p_step + ((p_max - p_step) & ~3);   /* last 4-aligned p */
 
-        /* ───── 8-channel hot path ───── */
-        for (; co <= C_out_end - 8; co += 8) {
-            float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
-            float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
-            float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
-            float32x4_t bias3 = vdupq_n_f32(b ? b[co+3] : 0.0f);
-            float32x4_t bias4 = vdupq_n_f32(b ? b[co+4] : 0.0f);
-            float32x4_t bias5 = vdupq_n_f32(b ? b[co+5] : 0.0f);
-            float32x4_t bias6 = vdupq_n_f32(b ? b[co+6] : 0.0f);
-            float32x4_t bias7 = vdupq_n_f32(b ? b[co+7] : 0.0f);
-            const float* w0 = w + (co+0) * C_in;
-            const float* w1 = w + (co+1) * C_in;
-            const float* w2 = w + (co+2) * C_in;
-            const float* w3 = w + (co+3) * C_in;
-            const float* w4 = w + (co+4) * C_in;
-            const float* w5 = w + (co+5) * C_in;
-            const float* w6 = w + (co+6) * C_in;
-            const float* w7 = w + (co+7) * C_in;
-            float* out0 = out + (co+0) * HW;
-            float* out1 = out + (co+1) * HW;
-            float* out2 = out + (co+2) * HW;
-            float* out3 = out + (co+3) * HW;
-            float* out4 = out + (co+4) * HW;
-            float* out5 = out + (co+5) * HW;
-            float* out6 = out + (co+6) * HW;
-            float* out7 = out + (co+7) * HW;
-            int p = p_step;
-            for (; p <= p_max - 4; p += 4) {
-                float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
-                float32x4_t acc4 = bias4, acc5 = bias5, acc6 = bias6, acc7 = bias7;
-                for (int ci = 0; ci < C_in; ci++) {
-                    /* PRFM: pull next-ci tile into L1 ahead of the load. */
-                    if (ci + 1 < C_in)
-                        __builtin_prefetch(in + (ci+1) * HW + p, 0, 3);
-                    float32x4_t v_in = vld1q_f32(in + ci * HW + p);
-                    acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci]));
-                    acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));
-                    acc2 = vmlaq_f32(acc2, v_in, vdupq_n_f32(w2[ci]));
-                    acc3 = vmlaq_f32(acc3, v_in, vdupq_n_f32(w3[ci]));
-                    acc4 = vmlaq_f32(acc4, v_in, vdupq_n_f32(w4[ci]));
-                    acc5 = vmlaq_f32(acc5, v_in, vdupq_n_f32(w5[ci]));
-                    acc6 = vmlaq_f32(acc6, v_in, vdupq_n_f32(w6[ci]));
-                    acc7 = vmlaq_f32(acc7, v_in, vdupq_n_f32(w7[ci]));
-                }
-                if (do_silu) {
-                    acc0 = neon_silu(acc0); acc1 = neon_silu(acc1);
-                    acc2 = neon_silu(acc2); acc3 = neon_silu(acc3);
-                    acc4 = neon_silu(acc4); acc5 = neon_silu(acc5);
-                    acc6 = neon_silu(acc6); acc7 = neon_silu(acc7);
-                }
-                vst1q_f32(out0+p, acc0); vst1q_f32(out1+p, acc1);
-                vst1q_f32(out2+p, acc2); vst1q_f32(out3+p, acc3);
-                vst1q_f32(out4+p, acc4); vst1q_f32(out5+p, acc5);
-                vst1q_f32(out6+p, acc6); vst1q_f32(out7+p, acc7);
+        for (int p = p_step; p < p_vec; p += 4) {
+            /* Transpose in[*][p..p+3] → xt[ci*4 .. ci*4+3], contiguous over ci. */
+            float xt[C1X1_MAX_CIN * 4];
+            for (int ci = 0; ci < C_in; ci++) {
+                if (ci + 1 < C_in) __builtin_prefetch(in + (long)(ci + 1) * HW + p, 0, 3);
+                vst1q_f32(xt + ci * 4, vld1q_f32(in + (long)ci * HW + p));
             }
-            for (; p < p_max; p++) {
-                float s0=b?b[co+0]:0.0f, s1=b?b[co+1]:0.0f, s2=b?b[co+2]:0.0f, s3=b?b[co+3]:0.0f;
-                float s4=b?b[co+4]:0.0f, s5=b?b[co+5]:0.0f, s6=b?b[co+6]:0.0f, s7=b?b[co+7]:0.0f;
+
+            int co = C_out_start;
+            for (; co <= C_out_end - 8; co += 8) {
+                const float* w0 = w + (long)(co+0)*C_in; const float* w1 = w + (long)(co+1)*C_in;
+                const float* w2 = w + (long)(co+2)*C_in; const float* w3 = w + (long)(co+3)*C_in;
+                const float* w4 = w + (long)(co+4)*C_in; const float* w5 = w + (long)(co+5)*C_in;
+                const float* w6 = w + (long)(co+6)*C_in; const float* w7 = w + (long)(co+7)*C_in;
+                float32x4_t a0 = vdupq_n_f32(b?b[co+0]:0.0f), a1 = vdupq_n_f32(b?b[co+1]:0.0f);
+                float32x4_t a2 = vdupq_n_f32(b?b[co+2]:0.0f), a3 = vdupq_n_f32(b?b[co+3]:0.0f);
+                float32x4_t a4 = vdupq_n_f32(b?b[co+4]:0.0f), a5 = vdupq_n_f32(b?b[co+5]:0.0f);
+                float32x4_t a6 = vdupq_n_f32(b?b[co+6]:0.0f), a7 = vdupq_n_f32(b?b[co+7]:0.0f);
                 for (int ci = 0; ci < C_in; ci++) {
-                    float v = in[ci*HW+p];
-                    s0+=w0[ci]*v; s1+=w1[ci]*v; s2+=w2[ci]*v; s3+=w3[ci]*v;
-                    s4+=w4[ci]*v; s5+=w5[ci]*v; s6+=w6[ci]*v; s7+=w7[ci]*v;
+                    float32x4_t v = vld1q_f32(xt + ci * 4);
+                    a0 = vmlaq_n_f32(a0, v, w0[ci]); a1 = vmlaq_n_f32(a1, v, w1[ci]);
+                    a2 = vmlaq_n_f32(a2, v, w2[ci]); a3 = vmlaq_n_f32(a3, v, w3[ci]);
+                    a4 = vmlaq_n_f32(a4, v, w4[ci]); a5 = vmlaq_n_f32(a5, v, w5[ci]);
+                    a6 = vmlaq_n_f32(a6, v, w6[ci]); a7 = vmlaq_n_f32(a7, v, w7[ci]);
                 }
                 if (do_silu) {
-                    s0*=mini_sigmoidf(s0); s1*=mini_sigmoidf(s1);
-                    s2*=mini_sigmoidf(s2); s3*=mini_sigmoidf(s3);
-                    s4*=mini_sigmoidf(s4); s5*=mini_sigmoidf(s5);
-                    s6*=mini_sigmoidf(s6); s7*=mini_sigmoidf(s7);
+                    a0 = neon_silu(a0); a1 = neon_silu(a1); a2 = neon_silu(a2); a3 = neon_silu(a3);
+                    a4 = neon_silu(a4); a5 = neon_silu(a5); a6 = neon_silu(a6); a7 = neon_silu(a7);
                 }
-                out0[p]=s0; out1[p]=s1; out2[p]=s2; out3[p]=s3;
-                out4[p]=s4; out5[p]=s5; out6[p]=s6; out7[p]=s7;
+                vst1q_f32(out + (long)(co+0)*HW + p, a0); vst1q_f32(out + (long)(co+1)*HW + p, a1);
+                vst1q_f32(out + (long)(co+2)*HW + p, a2); vst1q_f32(out + (long)(co+3)*HW + p, a3);
+                vst1q_f32(out + (long)(co+4)*HW + p, a4); vst1q_f32(out + (long)(co+5)*HW + p, a5);
+                vst1q_f32(out + (long)(co+6)*HW + p, a6); vst1q_f32(out + (long)(co+7)*HW + p, a7);
+            }
+            for (; co <= C_out_end - 4; co += 4) {
+                const float* w0 = w + (long)(co+0)*C_in; const float* w1 = w + (long)(co+1)*C_in;
+                const float* w2 = w + (long)(co+2)*C_in; const float* w3 = w + (long)(co+3)*C_in;
+                float32x4_t a0 = vdupq_n_f32(b?b[co+0]:0.0f), a1 = vdupq_n_f32(b?b[co+1]:0.0f);
+                float32x4_t a2 = vdupq_n_f32(b?b[co+2]:0.0f), a3 = vdupq_n_f32(b?b[co+3]:0.0f);
+                for (int ci = 0; ci < C_in; ci++) {
+                    float32x4_t v = vld1q_f32(xt + ci * 4);
+                    a0 = vmlaq_n_f32(a0, v, w0[ci]); a1 = vmlaq_n_f32(a1, v, w1[ci]);
+                    a2 = vmlaq_n_f32(a2, v, w2[ci]); a3 = vmlaq_n_f32(a3, v, w3[ci]);
+                }
+                if (do_silu) { a0 = neon_silu(a0); a1 = neon_silu(a1); a2 = neon_silu(a2); a3 = neon_silu(a3); }
+                vst1q_f32(out + (long)(co+0)*HW + p, a0); vst1q_f32(out + (long)(co+1)*HW + p, a1);
+                vst1q_f32(out + (long)(co+2)*HW + p, a2); vst1q_f32(out + (long)(co+3)*HW + p, a3);
+            }
+            for (; co < C_out_end; co++) {
+                const float* wr = w + (long)co * C_in;
+                float32x4_t a = vdupq_n_f32(b ? b[co] : 0.0f);
+                for (int ci = 0; ci < C_in; ci++) a = vmlaq_n_f32(a, vld1q_f32(xt + ci * 4), wr[ci]);
+                if (do_silu) a = neon_silu(a);
+                vst1q_f32(out + (long)co * HW + p, a);
             }
         }
 
-        /* ───── 4-channel path for remainder ───── */
-        for (; co <= C_out_end - 4; co += 4) {
-            float32x4_t bias0 = vdupq_n_f32(b ? b[co+0] : 0.0f);
-            float32x4_t bias1 = vdupq_n_f32(b ? b[co+1] : 0.0f);
-            float32x4_t bias2 = vdupq_n_f32(b ? b[co+2] : 0.0f);
-            float32x4_t bias3 = vdupq_n_f32(b ? b[co+3] : 0.0f);
-            const float* w0 = w + (co+0) * C_in;
-            const float* w1 = w + (co+1) * C_in;
-            const float* w2 = w + (co+2) * C_in;
-            const float* w3 = w + (co+3) * C_in;
-            float* out0 = out + (co+0) * HW;
-            float* out1 = out + (co+1) * HW;
-            float* out2 = out + (co+2) * HW;
-            float* out3 = out + (co+3) * HW;
-            int p = p_step;
-            for (; p <= p_max - 4; p += 4) {
-                float32x4_t acc0 = bias0, acc1 = bias1, acc2 = bias2, acc3 = bias3;
-                for (int ci = 0; ci < C_in; ci++) {
-                    if (ci + 1 < C_in)
-                        __builtin_prefetch(in + (ci+1) * HW + p, 0, 3);
-                    float32x4_t v_in = vld1q_f32(in + ci * HW + p);
-                    acc0 = vmlaq_f32(acc0, v_in, vdupq_n_f32(w0[ci]));
-                    acc1 = vmlaq_f32(acc1, v_in, vdupq_n_f32(w1[ci]));
-                    acc2 = vmlaq_f32(acc2, v_in, vdupq_n_f32(w2[ci]));
-                    acc3 = vmlaq_f32(acc3, v_in, vdupq_n_f32(w3[ci]));
-                }
-                if (do_silu) {
-                    acc0 = neon_silu(acc0); acc1 = neon_silu(acc1);
-                    acc2 = neon_silu(acc2); acc3 = neon_silu(acc3);
-                }
-                vst1q_f32(out0+p, acc0); vst1q_f32(out1+p, acc1);
-                vst1q_f32(out2+p, acc2); vst1q_f32(out3+p, acc3);
-            }
-            for (; p < p_max; p++) {
-                float s0=b?b[co+0]:0.0f, s1=b?b[co+1]:0.0f, s2=b?b[co+2]:0.0f, s3=b?b[co+3]:0.0f;
-                for (int ci = 0; ci < C_in; ci++) {
-                    float v = in[ci*HW+p];
-                    s0+=w0[ci]*v; s1+=w1[ci]*v; s2+=w2[ci]*v; s3+=w3[ci]*v;
-                }
-                if (do_silu) { s0*=mini_sigmoidf(s0); s1*=mini_sigmoidf(s1); s2*=mini_sigmoidf(s2); s3*=mini_sigmoidf(s3); }
-                out0[p]=s0; out1[p]=s1; out2[p]=s2; out3[p]=s3;
-            }
-        }
-        /* Scalar tail: remaining channels not divisible by 4 */
-        for (; co < C_out_end; co++) {
-            const float* wr = w + co * C_in;
-            float* och = out + co * HW;
-            for (int p = p_step; p < p_max; p++) {
+        /* Ragged tail: p_max−p_step not a multiple of 4. Never hit for
+         * YOLO_IN=256 (every HW is a multiple of 32) — kept for safety. */
+        for (int p = p_vec; p < p_max; p++) {
+            for (int co = C_out_start; co < C_out_end; co++) {
+                const float* wr = w + (long)co * C_in;
                 float acc = b ? b[co] : 0.0f;
-                for (int ci = 0; ci < C_in; ci++) acc += wr[ci] * in[ci*HW+p];
+                for (int ci = 0; ci < C_in; ci++) acc += wr[ci] * in[(long)ci * HW + p];
                 if (do_silu) acc *= mini_sigmoidf(acc);
-                och[p] = acc;
+                out[(long)co * HW + p] = acc;
             }
         }
     }

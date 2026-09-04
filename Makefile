@@ -59,8 +59,13 @@ SHOW_DEF = -DSHOW_CAMERA=$(SHOW_CAMERA)
 AWB ?= 1
 AWB_DEF = -DAWB=$(AWB)
 
+# Profiling knob: `make C2F_PROF=N` emits the C2f sub-breakdown (cv1/bot 3x3/cv2)
+# for layer LN in the per-layer profile instead of the default L6.
+C2F_PROF ?= 6
+C2F_DEF = -DC2F_PROF_LAYER=$(C2F_PROF)
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)

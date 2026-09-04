@@ -7,11 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **799 ms/frame** at `YOLO_IN=256`,
-fp32, stock 1 GHz clocks (V189 bench, heads 33 %, L2 C2f @S4 13 %); the same build was
-1276 ms at the old 600 MHz low-power profile (V183); **~518 ms** at `YOLO_IN=192` with live
-camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at the
-capture rate and boxes update every 4th frame.
+the Pi Camera Module 3 (IMX708). Real-hardware results: **664 ms/frame** at `YOLO_IN=256`,
+fp32, stock 1 GHz clocks (V190 bench — conv1x1 L1-thrash fix; V189 799 ms, V183 1276 ms at
+600 MHz). P3 head is the biggest item now, 152 ms (23 %). **~518 ms** at `YOLO_IN=192` with
+live camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
+the capture rate and boxes update every 4th frame.
 This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub repo (V76)
 — do not develop there.
 
