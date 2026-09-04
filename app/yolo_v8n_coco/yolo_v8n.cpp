@@ -1310,26 +1310,30 @@ void run_yolo_complete() {
     update_tracker();
     }  /* end if (do_inference) — render block below reuses preds[]/tracks[] */
 
-    /* V167 layout: dark canvas (no full camera image) + bboxes + class labels.
-     * Camera shown as a 192×108 thumbnail in the top-right of the canvas.
-     *
+    /* Canvas layout:
      *   y=0..59   HUD top bar
-     *   y=60..419 canvas (BLACK) + bboxes in CAM_DISP_* area + thumbnail
-     *             on the right
+     *   y=60..419 canvas + bboxes in the CAM_DISP_* area (+ DEBUG thumbnail)
      *   y=420..479 HUD bottom bar (detection cards)
      *
-     * Skipping the full multi-core debayer saves ~7 ms/frame and lets the
-     * thumbnail single-core (~0.5–1 ms). */
+     * SHOW_CAMERA=1 (V186, default): the canvas IS the live frame —
+     * camera_render_fullres() debayers the 1536×864 RAW10 into 640×360
+     * letterboxed at rows 60..419 (the geometry CAM_DISP_* was derived
+     * from), so the boxes land on the objects. ~20 ms single-core.
+     * SHOW_CAMERA=0: the V167 dark canvas (saves those ms). */
     extern void debayer_raw10_to_thumbnail(const uint8_t* raw, uint8_t* fb,
                                            uint32_t pitch, int x_off, int y_off,
                                            int thumb_w, int thumb_h);
 
     if (g_use_camera) {
+#if SHOW_CAMERA
+        camera_render_fullres((uint8_t*)lfb, pitch);
+#else
         /* Clear the canvas region (rows 60..419) to solid black. */
         for (int y = 60; y < 420; y++) {
             uint32_t* row = (uint32_t*)((uint8_t*)lfb + (uint32_t)y * pitch);
             for (int x = 0; x < 640; x++) row[x] = 0xFF000000u;
         }
+#endif
 #if DEBUG
         /* Camera thumbnail in the top-right corner — debug only. */
         const int THUMB_W = 128, THUMB_H = 72;

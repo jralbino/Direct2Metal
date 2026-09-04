@@ -163,6 +163,9 @@ Point the camera at a scene with a recognisable COCO object first; no SD or extr
 (Unicam's own `[CAP] TIMEOUT` message shares the prefix — the parser keys on `begin`/`end`.)
 
 First run (2026-09-04): 786 432 B, CRC OK, live `[DET] c=0 %=67` on the same scene.
+With `SHOW_CAMERA=1` (default since V186) the HDMI shows the live frame under the boxes
+during a capture run, so you can frame the scene while it records; `render` costs ~22 ms.
+Second run: person 92–96% on 24/29 frames.
 
 ## If `initramfs` doesn't load the blob
 

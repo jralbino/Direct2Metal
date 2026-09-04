@@ -40,6 +40,7 @@ docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app rpi-forge make kernel8.i
 | `make USE_INT8=1` / `USE_INT8_W8A8=1` | Tier 1 / Tier 2 INT8 builds. **Closed** (see below) but kept building. |
 | `make FRAME_SKIP_N=4` | B4 frame-skip: infer 1 in N frames, re-render the rest. |
 | `make DEBUG=1` | Camera thumbnail in the canvas. |
+| `make SHOW_CAMERA=0` | Restore the V167 dark canvas. Default **1** (V186) paints the live 640×360 frame under the bboxes via `camera_render_fullres()` — measured +21 ms/frame in `render` (single-core; the V164 multi-core debayer was removed in V167). |
 | `make clean` | Removes `*.o *.elf *.img` (all gitignored — safe). |
 
 `make` flags → `-D` defines: `USE_INT8_WEIGHTS`, `USE_INT8_W8A8`, `W8A8_DEBUG`,

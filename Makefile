@@ -42,8 +42,15 @@ SKIP_DEF = -DYOLO_INFER_EVERY_N=$(FRAME_SKIP_N)
 DEBUG ?= 0
 DEBUG_DEF = -DDEBUG=$(DEBUG)
 
+# V186: `make SHOW_CAMERA=0` restores the V167 dark canvas. Default 1 paints the
+# live camera frame (640×360, letterboxed at rows 60..419 — the same CAM_DISP_*
+# area the bboxes use) under the boxes via camera_render_fullres(). Costs ~20 ms
+# per frame single-core; the V164 multi-core variant was removed in V167.
+SHOW_CAMERA ?= 1
+SHOW_DEF = -DSHOW_CAMERA=$(SHOW_CAMERA)
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)
@@ -186,9 +193,10 @@ cap_%.o: %.cpp
 kernel8_capture.img: bsp/linker.ld $(CAP_OBJS)
 	$(LD) -T bsp/linker.ld -o kernel8_capture.elf $(CAP_OBJS)
 	$(OBJCOPY) -O binary kernel8_capture.elf $@
+CAPFILE  ?= cam_frame.bin
 capture: kernel8_capture.img
 	python3 tools/hwbench.py --port $(PORT) --kernel kernel8_capture.img --frames $$(( $(CAPTURE) + 2 )) \
-	    --timeout 400 --capture cam_frame.bin --no-golden $(BENCHFLAGS)
+	    --timeout 400 --capture $(CAPFILE) --no-golden $(BENCHFLAGS)
 
 # --- CLEAN ---
 clean:
