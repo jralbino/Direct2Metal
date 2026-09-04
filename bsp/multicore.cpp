@@ -47,8 +47,64 @@ static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const
                 float* o0 = out + (co + 0) * HW_out; float* o1 = out + (co + 1) * HW_out;
                 float* o2 = out + (co + 2) * HW_out; float* o3 = out + (co + 3) * HW_out;
 
+                /* V191: weight-stationary K=3 fast path, clipped to the safe
+                 * (padding-free) sub-rectangle of this tile — same idea as the
+                 * 8-ch kernel. L2's bottleneck 3×3 (16→16) had no P8 at all. */
+#ifdef D2M_NO_P8
+                const bool kP8 = false;
+#else
+                const bool kP8 = true;
+#endif
+                int fy0 = y_tile > 1 ? y_tile : 1;
+                int fy1 = y_end < H_out - 1 ? y_end : H_out - 1;
+                int fx0 = x_tile > 1 ? x_tile : 1;
+                int fx1 = x_end < W_out - 1 ? x_end : W_out - 1;
+                bool ran_fast = false;
+                if (kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                    int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
+                    float acc4[TILE_H * TILE_W][4];
+                    for (int p = 0; p < fnpos; p++) vst1q_f32(acc4[p], vdupq_n_f32(0.0f));
+                    for (int ci = 0; ci < C_in; ci++) {
+                        const float* ipc = in + ci * HW_in;
+                        const float* wci = wg + ci * 36;
+                        if (ci + 1 < C_in) {
+                            __builtin_prefetch(wg + (ci+1) * 36, 0, 3);
+                            __builtin_prefetch(in + (ci+1)*HW_in + (fy0-1)*W_in + (fx0-1), 0, 3);
+                        }
+                        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 4), w2=vld1q_f32(wci+ 8);
+                        float32x4_t w3=vld1q_f32(wci+12), w4=vld1q_f32(wci+16), w5=vld1q_f32(wci+20);
+                        float32x4_t w6=vld1q_f32(wci+24), w7=vld1q_f32(wci+28), w8=vld1q_f32(wci+32);
+                        int p = 0;
+                        for (int oy = fy0; oy < fy1; oy++) {
+                            const float* r0 = ipc + (oy - 1) * W_in;
+                            const float* r1 = r0 + W_in;
+                            const float* r2 = r1 + W_in;
+                            for (int ox = fx0; ox < fx1; ox++, p++) {
+                                int b = ox - 1;
+                                float32x4_t a = vld1q_f32(acc4[p]);
+                                a=vmlaq_n_f32(a,w0,r0[b]);   a=vmlaq_n_f32(a,w1,r0[b+1]); a=vmlaq_n_f32(a,w2,r0[b+2]);
+                                a=vmlaq_n_f32(a,w3,r1[b]);   a=vmlaq_n_f32(a,w4,r1[b+1]); a=vmlaq_n_f32(a,w5,r1[b+2]);
+                                a=vmlaq_n_f32(a,w6,r2[b]);   a=vmlaq_n_f32(a,w7,r2[b+1]); a=vmlaq_n_f32(a,w8,r2[b+2]);
+                                vst1q_f32(acc4[p], a);
+                            }
+                        }
+                    }
+                    int p = 0;
+                    for (int oy = fy0; oy < fy1; oy++) {
+                        for (int ox = fx0; ox < fx1; ox++, p++) {
+                            float32x4_t acc = vaddq_f32(vld1q_f32(acc4[p]), v_bias);
+                            if (do_silu) acc = neon_silu(acc);
+                            int pos = oy * W_out + ox;
+                            o0[pos] = vgetq_lane_f32(acc, 0); o1[pos] = vgetq_lane_f32(acc, 1);
+                            o2[pos] = vgetq_lane_f32(acc, 2); o3[pos] = vgetq_lane_f32(acc, 3);
+                        }
+                    }
+                    ran_fast = true;
+                }
+
                 for (int oy = y_tile; oy < y_end; oy++) {
                     for (int ox = x_tile; ox < x_end; ox++) {
+                        if (ran_fast && oy >= fy0 && oy < fy1 && ox >= fx0 && ox < fx1) continue;
                         float32x4_t acc = v_bias;
 
                         bool safe = (oy * stride - pad >= 0) && (oy * stride + K - pad <= H_in) &&
@@ -155,27 +211,30 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
 #else
                 const bool kP8 = true;
 #endif
-                if (kP8 && K == 3 && pad == 1 && stride == 1 &&
-                    y_tile >= 1 && y_end <= H_out - 1 && x_tile >= 1 && x_end <= W_out - 1) {
-                    /* V183 / P8 — weight-stationary K=3 path (ported from D2M).
-                     * ci is the OUTER loop: each ci's 288 B of weights is read once
-                     * per tile and applied to every position from L1 (the original
-                     * loop re-read the ~18 KB group weights from L2 for all 32
-                     * positions — they spill the 32 KB L1D next to the input tile).
-                     * Accumulators live in a 1 KB tile buffer, hot in L1. Measured on
-                     * D2M HW: bot 3x3 @20 11.8 → 10.5 ms (−11%). Keeps the B2 PRFM
-                     * on next-ci weights + input rows. Interior tiles only; edge
-                     * tiles and strided convs fall through to the original path. */
+                (void)npos;
+                /* V191: weight-stationary K=3 fast path, clipped to the "safe"
+                 * (padding-free) sub-rectangle of this tile — [fy0,fy1)×[fx0,fx1).
+                 * V183 gated it at whole-tile granularity (interior tiles only),
+                 * which at S8=32 / TILE_W=8 left ~60 % of positions on the slow
+                 * per-position path that re-reads the 288 B weight block for
+                 * every pixel. Now only the 1-px padded ring falls through. */
+                int fy0 = y_tile > 1 ? y_tile : 1;
+                int fy1 = y_end < H_out - 1 ? y_end : H_out - 1;
+                int fx0 = x_tile > 1 ? x_tile : 1;
+                int fx1 = x_end < W_out - 1 ? x_end : W_out - 1;
+                bool ran_fast = false;
+                if (kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                    int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float accl[TILE_H * TILE_W][4];
                     float acch[TILE_H * TILE_W][4];
-                    for (int p = 0; p < npos; p++) { vst1q_f32(accl[p], vdupq_n_f32(0.0f)); vst1q_f32(acch[p], vdupq_n_f32(0.0f)); }
+                    for (int p = 0; p < fnpos; p++) { vst1q_f32(accl[p], vdupq_n_f32(0.0f)); vst1q_f32(acch[p], vdupq_n_f32(0.0f)); }
 
                     for (int ci = 0; ci < C_in; ci++) {
                         const float* ipc = in + ci * HW_in;
                         const float* wci = wg + ci * 72;
                         if (ci + 1 < C_in) {
                             __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
-                            __builtin_prefetch(in + (ci+1)*HW_in + (y_tile-1)*W_in + (x_tile-1), 0, 3);
+                            __builtin_prefetch(in + (ci+1)*HW_in + (fy0-1)*W_in + (fx0-1), 0, 3);
                         }
                         float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 8), w2=vld1q_f32(wci+16);
                         float32x4_t w3=vld1q_f32(wci+24), w4=vld1q_f32(wci+32), w5=vld1q_f32(wci+40);
@@ -184,12 +243,12 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                         float32x4_t W3=vld1q_f32(wci+28), W4=vld1q_f32(wci+36), W5=vld1q_f32(wci+44);
                         float32x4_t W6=vld1q_f32(wci+52), W7=vld1q_f32(wci+60), W8=vld1q_f32(wci+68);
                         int p = 0;
-                        for (int oy = y_tile; oy < y_end; oy++) {
-                            const float* r0 = ipc + (oy - 1) * W_in;
+                        for (int oy = fy0; oy < fy1; oy++) {
+                            const float* r0 = ipc + (oy - 1) * W_in;   /* oy≥1 → valid */
                             const float* r1 = r0 + W_in;
-                            const float* r2 = r1 + W_in;
-                            for (int ox = x_tile; ox < x_end; ox++, p++) {
-                                int b = ox - 1;
+                            const float* r2 = r1 + W_in;               /* oy≤H_out-2 → valid */
+                            for (int ox = fx0; ox < fx1; ox++, p++) {
+                                int b = ox - 1;                        /* ox≥1 → valid */
                                 float32x4_t al = vld1q_f32(accl[p]);
                                 float32x4_t ah = vld1q_f32(acch[p]);
                                 al=vmlaq_n_f32(al,w0,r0[b]);   ah=vmlaq_n_f32(ah,W0,r0[b]);
@@ -208,8 +267,8 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                     }
 
                     int p = 0;
-                    for (int oy = y_tile; oy < y_end; oy++) {
-                        for (int ox = x_tile; ox < x_end; ox++, p++) {
+                    for (int oy = fy0; oy < fy1; oy++) {
+                        for (int ox = fx0; ox < fx1; ox++, p++) {
                             float32x4_t al = vaddq_f32(vld1q_f32(accl[p]), v_bl);
                             float32x4_t ah = vaddq_f32(vld1q_f32(acch[p]), v_bh);
                             if (do_silu) { al = neon_silu(al); ah = neon_silu(ah); }
@@ -220,11 +279,12 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                             oc[6][pos]=vgetq_lane_f32(ah,2); oc[7][pos]=vgetq_lane_f32(ah,3);
                         }
                     }
-                    continue;
+                    ran_fast = true;
                 }
 
                 for (int oy = y_tile; oy < y_end; oy++) {
                     for (int ox = x_tile; ox < x_end; ox++) {
+                        if (ran_fast && oy >= fy0 && oy < fy1 && ox >= fx0 && ox < fx1) continue;
                         float32x4_t al = v_bl, ah = v_bh;
                         bool safe = (oy*stride-pad >= 0) && (oy*stride+K-pad <= H_in) &&
                                     (ox*stride-pad >= 0) && (ox*stride+K-pad <= W_in);

@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **664 ms/frame** at `YOLO_IN=256`,
-fp32, stock 1 GHz clocks (V190 bench — conv1x1 L1-thrash fix; V189 799 ms, V183 1276 ms at
-600 MHz). P3 head is the biggest item now, 152 ms (23 %). **~518 ms** at `YOLO_IN=192` with
-live camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
+the Pi Camera Module 3 (IMX708). Real-hardware results: **541 ms/frame** at `YOLO_IN=256`,
+fp32, stock 1 GHz clocks (V191 — conv1x1 L1-thrash fix + per-position P8; V189 was 799 ms,
+V183 1276 ms at 600 MHz). The four P3-head conv3×3 (105 ms) are the biggest item, ~3.5× the
+A53 compute floor. **~518 ms** at `YOLO_IN=192` with live camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
 the capture rate and boxes update every 4th frame.
 This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub repo (V76)
 — do not develop there.
@@ -135,8 +135,13 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   `task_epoch` (RELEASE), `sev`; workers ACQUIRE-poll with exponential backoff, do their
   output-channel slice, RELEASE-add `done_count`; 50M-cycle timeout degrades to single-core.
   Kernels: `conv2d_partial` (4-ch), `conv2d_partial_8ch` (8-ch, C_out≥32) with B2 PRFM and
-  the **V183/P8 weight-stationary K=3/s1/p1 fast path** (ci outer, 1 KB tile accumulators —
-  interior tiles only). QEMU never starts secondaries → single-core fallback.
+  the **P8 weight-stationary K=3/s1/p1 fast path** (ci outer, ci's weights read once per tile,
+  1 KB tile accumulators). V183 gated it at whole-tile-interior; **V191 clips it to each
+  tile's safe sub-rectangle** so only the 1-px padded ring uses the slow per-position path
+  (was ~60 % of positions at S8=32). `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
+  4-position input group** to fix an L1 set-thrash when HW is a multiple of 2048.
+  `-DD2M_NO_P8` disables the conv2d fast path for A/B. QEMU never starts secondaries →
+  single-core fallback.
 - **Camera**: works end-to-end on HW since V164 (`[CAM] frame OK`, live detections).
   `camera_debug.md` + `camera_unicam.cpp` are the record; `hardware_sim.h` is the QEMU
   register oracle. Requires `dtoverlay=imx708` + `start_x=1` in `config.txt`.

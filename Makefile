@@ -64,6 +64,12 @@ AWB_DEF = -DAWB=$(AWB)
 C2F_PROF ?= 6
 C2F_DEF = -DC2F_PROF_LAYER=$(C2F_PROF)
 
+# `make HEAD_PROF=1` adds a per-conv breakdown of the P3 detection head.
+HEAD_PROF ?= 0
+ifeq ($(HEAD_PROF),1)
+C2F_DEF += -DHEAD_PROF
+endif
+
 # --- INCLUDE PATHS ---
 INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF)
 

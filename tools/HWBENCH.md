@@ -116,11 +116,13 @@ ms (−6.1%)** — P3 head 320→260, L4 96→82, L15 119→112, L2 unchanged (i
 16-ch → 4-ch kernel, untouched by P8). Per-layer hot spots: P3 head 260, L2 C2f @S4 154,
 P4 head 121, L15 112, L4 82. Heads = 34% of the frame.
 
-**V190 on HW (2026-09-04):** conv1x1 input transpose (L1-set-thrash fix). **TOTAL 664 ms**
-(`[P] cap=1 l0=13 bb=244 neck=130 head=256 render=18`), `detections: [(74,83)]`, fingerprint
-16/16 bit-exact. Per-layer at 1 GHz: **P3 head 152**, P4 head 72, L6 C2f 49, L4 42, L12 31,
-L15 31, L18 27, L21 22, L8 21. Sub-breakdown of any C2f with `make C2F_PROF=N`; L2's cv2 1×1
-went 55 → 7.8 ms.
+**V191 on HW (2026-09-04):** per-position P8 (8-ch + 4-ch). **TOTAL 541 ms**
+(`[P] cap=1 l0=13 bb=208 neck=109 head=189 render=18`), `detections: [(74,83)]`, fingerprint
+16/16 bit-exact. Per-layer at 1 GHz: **head 3×3 105** (P3 box0/box1/cls0 24.5, cls1 32),
+L4 33, L2 33 (bot 3×3 7.2 each), L12 24, L15 27, L21 19. `make HEAD_PROF=1` breaks down the
+P3 head per conv; `make C2F_PROF=N` any C2f.
+
+**V190:** conv1x1 input transpose (L1-set-thrash fix), TOTAL 664 ms; L2's cv2 1×1 55 → 7.8.
 
 **V189 (previous):** stock clocks (`arm_freq=1000`, V187), TOTAL 799 ms — exactly ×1.6 the
 600 MHz figure. Numbers before V187 in this file are at 600 MHz; don't mix them.

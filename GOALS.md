@@ -240,8 +240,9 @@ projects ~13–15 fps after INT8 + frame-skip.
       refreshed at 16 fps). A53 bare-metal target tops out here.
 - **V183 (2026-09-03) — first real per-layer HW profile + P8.** With the
   new bench (G3) the fp32 graph at `YOLO_IN=256`, 600 MHz, `test_image`:
-  **1276 ms/frame** — `bb=502 neck=289 head=431` (V189 at stock 1 GHz clocks:
-  **799 ms** — `bb=316 neck=186 head=262`, exactly ×1.6; same shape). Where it goes: **P3 head
+  **1276 ms/frame** — `bb=502 neck=289 head=431` (V189 stock 1 GHz: 799 ms;
+  **V191 after two kernel-efficiency fixes: 541 ms** — `bb=208 neck=109 head=189`).
+  Where it originally went: **P3 head
   260 ms, L2 C2f @S4 154, P4 head 121, L15 C2f @S8 112, L4 82** — the three
   DFL heads are **34%** of the frame and the two highest-resolution C2f
   blocks another 21%. **P8 weight-stationary conv3×3** (ported from D2M:
@@ -256,15 +257,21 @@ projects ~13–15 fps after INT8 + frame-skip.
         4-position input group to `xt[C_in][4]` once, read it sequentially per
         output group. **HW 799 → 664 ms (−17 %)** — L2 cv2 55→8, cv1 15→4,
         L15 79→31. Bit-exact. (This was the real "L2 target", not the 4-ch P8.)
-  - [ ] **P3 head, now 152 ms (23 %)** — the biggest single item. 2 stacked
-        3×3 (P8-8ch already) × box+cls at S8, ~151 M MACs, genuinely at the
-        A53 f32 rate. Levers: Winograd F(2×2,3×3) on those 3×3s (~1.8×), or
-        cut the DFL head to 1 conv per branch (model change).
-  - [ ] Winograd F(2×2,3×3) for the 3×3s (~1.8×) — the remaining algorithmic
-        lever after V190.
-  - Not a lever: INT8 (Tier 2 verdict above), FMLA interleave, contiguous
-    output store, P8 on the 4-ch kernel (L2's real problem was the conv1x1) —
-    all measured 0 ms / N/A on this SoC.
+  - [x] **V191 — per-position P8.** V183's P8 activated at whole-tile
+        granularity; at S8=32 / TILE_W=8 that left ~60 % of positions on the
+        slow per-pixel weight-reread path (HEAD_PROF: the four P3-head conv3×3
+        = 141 ms). Clipped the fast path to each tile's safe sub-rectangle
+        (`[max(y_tile,1),min(y_end,H_out-1)) × …`); only the 1-px ring falls
+        through. Added P8 to `conv2d_partial` (4-ch) too — L2's bottleneck 3×3
+        had none. **HW 664 → 541 ms (−18 %)**: P3-head 3×3 141→105, L2 bot 3×3
+        32→14, L4 42→33. Bit-exact. Session V189→V191: **799 → 541 ms (−32 %)**.
+  - [ ] **Head conv3×3 (105 ms), the biggest item** — 4 × (64→64 @S8), ~3.5×
+        the A53 f32 floor after P8 (same "near the instruction-mix limit"
+        verdict as D2M). Winograd F(2×2,3×3) (~1.8×, real precision risk with
+        the 1/2 scalings — verify vs a looser [ABS] tol) or cut the DFL head
+        to 1 conv per branch (model change, re-export).
+  - Not a lever: INT8 (Tier 2 verdict), FMLA interleave, contiguous output
+    store — all measured 0 ms on this SoC.
 - **V184 (2026-09-03) — `test_image.bin` was a 320² fossil.** Since V169
   (`YOLO_IN` 320→256) the tensor stayed 3×320×320; the kernel reads the first
   3·N² floats, so the colour planes were misaligned and the deterministic

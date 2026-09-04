@@ -1284,15 +1284,21 @@ void run_yolo_complete() {
     DECODE_HEAD(head_box, head_cls, YOLO_S16, YOLO_S16, 16, wb_p4_2, wc_p4_2);            prof_mark("P4 head 6 conv + decode @S16");
 
     /* P3 head — input in save_P3. */
-    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  64,  wb_p3_1, 64, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  64,  wb_p3_2, 64, false,       head_box);
-    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);
+#ifdef HEAD_PROF
+    #define HP_MARK(s) prof_mark(s)
+#else
+    #define HP_MARK(s) ((void)0)
+#endif
+    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.box0 3x3 64->64");
+    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  64,  wb_p3_1, 64, 3, 1, 1, true, scratch);      HP_MARK("  P3.box1 3x3 64->64");
+    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  64,  wb_p3_2, 64, false,       head_box);       HP_MARK("  P3.box2 1x1 64->64");
+    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.cls0 3x3 64->80");
+    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);      HP_MARK("  P3.cls1 3x3 80->80");
+    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);       HP_MARK("  P3.cls2 1x1 80->80");
     LOG_ABSMAX("P3_BOX", head_box, 64 * YOLO_S8 * YOLO_S8, wb_p3_2);
     LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8 * YOLO_S8, wc_p3_2);
     DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);               prof_mark("P3 head 6 conv + decode @S8");
+    #undef HP_MARK
 
     t_nms = get_timer_count();
 
