@@ -115,6 +115,12 @@ ms (−6.1%)** — P3 head 320→260, L4 96→82, L15 119→112, L2 unchanged (i
 16-ch → 4-ch kernel, untouched by P8). Per-layer hot spots: P3 head 260, L2 C2f @S4 154,
 P4 head 121, L15 112, L4 82. Heads = 34% of the frame.
 
+**V184 on HW (2026-09-04):** with the regenerated 256² `test_image` — `detections: PASS
+[(0,71),(0,77),(0,88),(5,85)]`, `fingerprint: PASS (16/16)`, TOTAL 1284 ms (render 29→35 ms
+for the four boxes). The stale-SD case was caught first: the run before the recopy
+reproduced the V183 fossil fingerprint byte-for-byte → `FAIL 16/16` — exactly what the
+fingerprint golden is for.
+
 **A/B recipe:** build a second serial image with the kill-switch and bench it —
 ```
 docker run … rpi-forge sh -c 'make ser_multicore.o CXXFLAGS="$(CXXFLAGS) -DD2M_NO_P8" …'
