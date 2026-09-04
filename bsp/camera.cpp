@@ -11,6 +11,7 @@ extern void   imx708_stream_on();
 extern uint8_t imx708_read_frame_count();
 extern void   unicam_init();
 extern bool   unicam_capture_frame();
+extern bool   unicam_try_advance();
 extern void   unicam_print_lane_state(const char* tag);
 extern void   debayer_raw10_to_fb(uint8_t* fb, uint32_t pitch);
 extern void   watchdog_kick();
@@ -125,3 +126,9 @@ bool bsp_frame_acquire() {
 void camera_render_fullres(uint8_t* fb, uint32_t pitch) {
     debayer_raw10_to_fb(fb, pitch);
 }
+
+/* V180 — thin wrapper exposed via bsp.h. The unicam state machine lives
+ * in camera_unicam.cpp; this just forwards. AE is intentionally NOT run
+ * here — the pump path doesn't want a group-hold I2C transaction mid-
+ * inference. The once-per-inference bsp_frame_acquire still drives AE. */
+bool bsp_frame_try_advance() { return unicam_try_advance(); }
