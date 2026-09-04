@@ -78,7 +78,12 @@ extern "C" void kernel_main() {
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
     video_init(); draw_fill(0xFF00FF00); video_flush();
     init_mmu();
-#ifdef SERIAL_BOOT
+#if defined(SERIAL_BOOT) && defined(CAPTURE_FRAME)
+    /* V185 capture build (`make capture`): camera ON; yolo_v8n.cpp dumps the
+     * exact model input of frame CAPTURE_FRAME over UART as base64 so the host
+     * can turn a real sensor frame into test_image.bin. */
+    if (!camera_init()) uart_puts("[CAM] CAPTURE_FRAME: no camera — nothing to capture\n");
+#elif defined(SERIAL_BOOT)
     /* V183 bench build: hwbench.py diffs detections against the golden set
      * for test_image — never the camera. Skip camera_init() so g_use_camera
      * stays false and timing/detections are deterministic. */

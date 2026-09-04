@@ -137,6 +137,33 @@ docker run … rpi-forge sh -c 'make ser_multicore.o CXXFLAGS="$(CXXFLAGS) -DD2M
    inference runs on live frames — non-deterministic, and the golden diff fails
    for no real reason.
 
+## Capturing a real camera frame as the golden input (V185)
+
+`test_image.bin` doesn't have to be a JPEG: `make capture` turns a live sensor frame —
+the exact `cam_frame` tensor the model consumes after debayer + ISP + AE — into one.
+
+```
+make capture                 # camera ON, dumps frame 30 (AE settled) over UART as base64
+                             #  → cam_frame.bin (786 432 B, CRC-checked); ~3 min total
+python3 tools/capture_to_test_image.py cam_frame.bin --preview cam_frame.png --no-install
+                             # look at cam_frame.png; rerun `make capture` if the scene is wrong
+python3 tools/capture_to_test_image.py cam_frame.bin      # installs app/<APP>/test_image.bin
+make d2m_data.bin            # → recopy to SD (rm → cp → sync → umount)
+make bench BENCHFLAGS=--print-golden                       # paste GOLDEN / GOLDEN_ABS
+```
+
+How it works: `kernel8_capture.img` = the serial-boot image built with `-DCAPTURE_FRAME=N`
+(`CAPTURE ?= 30`) into separate `cap_*.o` objects, so the flag never leaks into the bench
+image. `kernel_main` calls `camera_init()` instead of skipping it; on frame N
+`run_yolo_complete` prints `[CAP] begin len= crc= n=` + base64 + `[CAP] end` (watchdog kicked
+every 32 lines — the dump takes ~90 s at 115200) and then keeps running live inference, so
+the `[DET]` lines after the dump tell you what the model sees in that scene right now.
+`hwbench.py --capture PATH` reassembles and CRC32-checks the block and strips it from the log.
+Point the camera at a scene with a recognisable COCO object first; no SD or extra wiring.
+(Unicam's own `[CAP] TIMEOUT` message shares the prefix — the parser keys on `begin`/`end`.)
+
+First run (2026-09-04): 786 432 B, CRC OK, live `[DET] c=0 %=67` on the same scene.
+
 ## If `initramfs` doesn't load the blob
 
 Symptom: `weights CRC mismatch` halt on frame 1. Try another address in both

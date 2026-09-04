@@ -288,6 +288,13 @@ projects ~13–15 fps after INT8 + frame-skip.
       `uart_init()`; reset must be RTS-only (power-cycling re-enumerates the
       CH340); camera skipped in the bench build so `test_image` is
       deterministic. Ported from the retired `~/projects/D2M` clone.
+- [x] **V185 (2026-09-04) — real camera frame as the golden input.**
+      `make capture` streams the exact post-ISP model input of a live frame
+      over UART (base64 + CRC32) → `test_image.bin`. Closes the loop the W8A8
+      post-mortem asked for ("calibration needs HW-frame recapture"): the
+      deterministic bench can now run on a genuine sensor frame, and the same
+      capture is the right input for any future calibration. No SD driver
+      needed. First HW capture verified (CRC OK, live person 67%).
 
 ---
 

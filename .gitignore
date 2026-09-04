@@ -18,6 +18,9 @@ __pycache__/
 /sdcard/
 /hwbench.log
 ser_*.o
+cap_*.o
+/cam_frame.bin
+/cam_frame.png
 
 # OS files
 .DS_Store

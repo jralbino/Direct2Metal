@@ -133,6 +133,42 @@ def capture(ser, frames, timeout, logfile):
     return text
 
 
+CAP_BEGIN_RE = re.compile(r"\[CAP\] begin len=(\d+) crc=([0-9a-fA-F]{8})(?: n=(\d+))?")
+
+
+def extract_capture(text, out_path):
+    """Pull the base64 block between [CAP] begin/end out of the UART text, verify
+    length + CRC32, write the raw tensor to out_path. Returns (ok, text_without_block)."""
+    import base64
+    import zlib
+    m = CAP_BEGIN_RE.search(text)
+    if not m:
+        print("capture: no [CAP] begin marker seen (camera off? CAPTURE_FRAME not reached?)")
+        return False, text
+    start = m.end()
+    end = text.find("[CAP] end", start)
+    if end < 0:
+        print("capture: [CAP] begin seen but no [CAP] end — dump truncated (timeout too short?)")
+        return False, text
+    want_len, want_crc = int(m.group(1)), int(m.group(2), 16)
+    b64 = "".join(text[start:end].split())
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        print(f"capture: base64 decode failed: {e}")
+        return False, text
+    got_crc = zlib.crc32(raw) & 0xFFFFFFFF
+    ok = len(raw) == want_len and got_crc == want_crc
+    with open(out_path, "wb") as f:
+        f.write(raw)
+    n = m.group(3) or "?"
+    print(f"capture: {len(raw)} bytes -> {out_path}  (expected {want_len}, n={n})  "
+          f"crc {'OK' if got_crc == want_crc else f'MISMATCH kernel={want_crc:08x} host={got_crc:08x}'}")
+    # Strip the block so frame parsing / the log stay readable.
+    text = text[:m.start()] + "[CAP] (block extracted)\n" + text[end + len("[CAP] end"):]
+    return ok, text
+
+
 def parse_frame(block):
     dets = [(int(c), int(p)) for c, p in DET_RE.findall(block)]
     absmax = {tag: int(v) for tag, v in ABS_RE.findall(block)}
@@ -183,6 +219,8 @@ def main():
     ap.add_argument("--abs-tol", type=int, default=1, help="tolerance on amax1e3 fingerprints (thousandths)")
     ap.add_argument("--print-golden", action="store_true",
                     help="print the last frame's dets/absmax as python literals (to paste into GOLDEN*)")
+    ap.add_argument("--capture", metavar="PATH",
+                    help="V185: expect a [CAP] base64 tensor dump in the stream and save it to PATH")
     args = ap.parse_args()
 
     with open(args.kernel, "rb") as f:
@@ -213,10 +251,16 @@ def main():
     finally:
         ser.close()
 
+    cap_ok = True
+    if args.capture:
+        cap_ok, text = extract_capture(text, args.capture)
+
     if args.raw:
         print("\n----- raw -----\n" + text + "\n---------------\n")
 
     frames = split_frames(text)
+    if args.capture and not frames:
+        sys.exit(0 if cap_ok else 3)   # capture-only runs may legitimately end before a clean frame
     if not frames:
         sys.exit("FAIL: no complete frame captured — see " + args.log)
 

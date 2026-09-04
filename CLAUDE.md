@@ -71,6 +71,13 @@ HW) after model/exporter/test-image changes. **`test_image.bin` must be 3·YOLO_
 (786 432 B at 256): V169–V183 shipped a 320² fossil that misaligned the colour planes and
 produced `[DET] none` — if detections vanish after a resolution change, check this first.
 
+**Real camera frame → golden** (V185): `make capture` builds `kernel8_capture.img`
+(`-DCAPTURE_FRAME=N`, camera ON, separate `cap_*.o`) and dumps the exact model input of frame
+N over UART as base64 (`[CAP] begin/end`, watchdog kicked during the ~90 s dump);
+`hwbench.py --capture cam_frame.bin` reassembles + CRC-checks it, then
+`tools/capture_to_test_image.py` previews/installs it as `test_image.bin`. Regenerate blob +
+goldens afterwards. No SD driver involved (`bsp/sdcard.cpp` is unlinked V116 code).
+
 **Per-layer profiler** (`bsp/kernel.cpp`, declared in `bsp/bsp.h`): `prof_reset()` /
 `prof_mark("name")` / `prof_dump()`. Marks are placed in `run_yolo_complete` after every
 layer and inside `c2f_real_inference` (gated on prefix `"L6"`, macro `C2F_MARK`);

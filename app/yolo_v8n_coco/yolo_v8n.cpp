@@ -1008,6 +1008,49 @@ static void draw_tensor_image_fullscreen(const float* img) {
     }
 }
 
+#ifdef CAPTURE_FRAME
+/* ── V185: frame capture over UART ─────────────────────────────────────────
+ * `make capture` (SERIAL_BOOT + CAPTURE_FRAME=N, camera ON). On frame N — by
+ * then AE has settled — dump cam_frame, the *exact* [3][YOLO_IN][YOLO_IN] fp32
+ * tensor the model consumes after debayer + ISP, as base64 between
+ *   [CAP] begin len=<bytes> crc=<hex32>   …   [CAP] end
+ * hwbench.py --capture reassembles + CRC-checks it; tools/capture_to_test_image.py
+ * installs it as app/<APP>/test_image.bin. ~1 MB at 115200 ≈ 90 s, so the
+ * watchdog is kicked every few lines. */
+static void uart_hex32(uint32_t v) {
+    static const char H[] = "0123456789abcdef";
+    char s[9]; for (int i = 7; i >= 0; i--) { s[i] = H[v & 15]; v >>= 4; } s[8] = 0;
+    uart_puts(s);
+}
+static void uart_b64(const uint8_t* p, size_t n) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char line[80]; int li = 0, lines = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = ((uint32_t)p[i] << 16) | ((i + 1 < n ? (uint32_t)p[i+1] : 0u) << 8) | (i + 2 < n ? (uint32_t)p[i+2] : 0u);
+        line[li++] = T[(v >> 18) & 63]; line[li++] = T[(v >> 12) & 63];
+        line[li++] = (i + 1 < n) ? T[(v >> 6) & 63] : '=';
+        line[li++] = (i + 2 < n) ? T[v & 63] : '=';
+        if (li >= 76) { line[li] = 0; uart_puts(line); uart_puts("\n"); li = 0;
+                        if ((++lines & 31) == 0) watchdog_kick(); }
+    }
+    if (li) { line[li] = 0; uart_puts(line); uart_puts("\n"); }
+    watchdog_kick();
+}
+static void capture_dump_if_due(const float* img) {
+    static bool done = false;
+    /* global_frame_counter is already post-incremented for this frame. */
+    if (done || global_frame_counter != (CAPTURE_FRAME)) return;
+    done = true;
+    const uint8_t* p = (const uint8_t*)img;
+    const size_t   n = sizeof(float) * 3 * YOLO_IN * YOLO_IN;
+    uint32_t crc = crc32_sw(p, n);
+    uart_puts("[CAP] begin len="); uart_dec((int)n); uart_puts(" crc="); uart_hex32(crc);
+    uart_puts(" n="); uart_dec(YOLO_IN); uart_puts("\n");
+    uart_b64(p, n);
+    uart_puts("[CAP] end\n");
+}
+#endif /* CAPTURE_FRAME */
+
 void run_yolo_complete() {
     watchdog_kick();
     unsigned long f = get_timer_freq(); unsigned long t_start = get_timer_count();
@@ -1088,6 +1131,9 @@ void run_yolo_complete() {
         if (g_use_camera) {
             if (cap_ok) {
                 debayer_raw10_to_chw_yolo(cam_frame);
+#ifdef CAPTURE_FRAME
+                capture_dump_if_due(cam_frame);   /* V185 — once, on frame CAPTURE_FRAME */
+#endif
             } else {
                 const int n = 3 * YOLO_IN * YOLO_IN;
                 for (int i = 0; i < n; i++) cam_frame[i] = 0.0f;

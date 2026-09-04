@@ -170,6 +170,26 @@ BENCHFLAGS ?=
 bench: kernel8_serial.img
 	python3 tools/hwbench.py --port $(PORT) --kernel kernel8_serial.img --frames $(FRAMES) $(BENCHFLAGS)
 
+# V185: `make capture` — same serial-boot flow but with the CAMERA ON. On frame
+# CAPTURE (AE settled) the kernel dumps the exact model input tensor over UART
+# as base64; hwbench.py --capture writes it to cam_frame.bin. Then:
+#   python3 tools/capture_to_test_image.py cam_frame.bin --preview cam_frame.png
+#   make d2m_data.bin   (+ recopy to SD, regenerate GOLDEN/GOLDEN_ABS)
+# Separate cap_ objects so the flag never leaks into the bench image.
+CAPTURE  ?= 30
+CAPFLAGS  = $(SERFLAGS) -DCAPTURE_FRAME=$(CAPTURE)
+CAP_OBJS  = $(addprefix cap_,$(filter-out data.o,$(HW_OBJS)))
+cap_%.o: %.s
+	$(CC) $(CFLAGS) -c $< -o $@
+cap_%.o: %.cpp
+	$(CXX) $(CAPFLAGS) -c $< -o $@
+kernel8_capture.img: bsp/linker.ld $(CAP_OBJS)
+	$(LD) -T bsp/linker.ld -o kernel8_capture.elf $(CAP_OBJS)
+	$(OBJCOPY) -O binary kernel8_capture.elf $@
+capture: kernel8_capture.img
+	python3 tools/hwbench.py --port $(PORT) --kernel kernel8_capture.img --frames $$(( $(CAPTURE) + 2 )) \
+	    --timeout 400 --capture cam_frame.bin --no-golden $(BENCHFLAGS)
+
 # --- CLEAN ---
 clean:
 	rm -f *.o *.elf *.img
