@@ -295,6 +295,13 @@ projects ~13–15 fps after INT8 + frame-skip.
       deterministic bench can now run on a genuine sensor frame, and the same
       capture is the right input for any future calibration. No SD driver
       needed. First HW capture verified (CRC OK, live person 67%).
+      - [x] **V188 — camera exposure fixed via the capture loop.** The
+            "blown whites" were AE overexposure in high-contrast scenes (half
+            the sensor ≥ 250 raw with the mean on target), not white balance;
+            highlight protection in `ae_step()` brought R/B clipping from
+            42/45 % to 4/6 %. Grey-world AWB added (`AWB=0` to freeze).
+            `make capture` + per-channel clip stats was the instrument that
+            made this a 3-iteration fix instead of guesswork.
 
 ---
 

@@ -65,30 +65,42 @@ static void build_gamma_lut() {
     k_gamma_ready = true;
 }
 
+/* ── White balance state (Q8) ──────────────────────────────────────────────
+ * V188: the tuning-file gains (WB_R/WB_B, 4640 K daylight) are only the
+ * starting point. With AWB=1 (default) debayer_awb_update() tracks the scene
+ * once per frame (grey-world), so neutral surfaces stay neutral under indoor
+ * light instead of going magenta and burning R/B at 255 while G is fine —
+ * the V162..V187 symptom (R/B clipped in 5-20 % of pixels, G in <1 %).
+ * `make AWB=0` freezes the tuning gains. */
+#ifndef AWB
+#define AWB 1
+#endif
+static int g_wb_r = (int)WB_R;
+static int g_wb_b = (int)WB_B;
+
 /* Per-channel ISP step: post-pedestal R/G/B (0..255) → gamma-encoded sRGB.
- * Bit-exact equivalent of the per-row NEON inner loop of camara_direct V162. */
+ * WB → clip 255 → CCM → clip 255 → gamma, as V162. The post-WB clip is kept
+ * on purpose: a raw channel at sensor saturation carries no information, and
+ * feeding its ×2 WB value unclipped into the CCM's negative cross-terms
+ * only drives G/B further down (redder burn-out) — measured in V188. */
 static inline void isp_pixel(uint8_t Rin, uint8_t Gin, uint8_t Bin,
                              uint8_t* Rout, uint8_t* Gout, uint8_t* Bout) {
     int R = (int)Rin - (int)BLC_MSB8; if (R < 0) R = 0;
     int G = (int)Gin - (int)BLC_MSB8; if (G < 0) G = 0;
     int B = (int)Bin - (int)BLC_MSB8; if (B < 0) B = 0;
 
-    /* White balance (Q8). Widen to 32-bit before multiply — WB_R=535 over a
-     * value near 255 overflows 16-bit. */
-    int Rwb = (R * (int)WB_R) >> 8; if (Rwb > 255) Rwb = 255;
-    int Gwb = (G * (int)WB_G) >> 8; if (Gwb > 255) Gwb = 255;
-    int Bwb = (B * (int)WB_B) >> 8; if (Bwb > 255) Bwb = 255;
+    /* White balance (Q8, runtime gains), 32-bit, clipped at white. */
+    int Rwb = (R * g_wb_r)     >> 8; if (Rwb > 255) Rwb = 255;
+    int Gwb = (G * (int)WB_G)  >> 8; if (Gwb > 255) Gwb = 255;
+    int Bwb = (B * g_wb_b)     >> 8; if (Bwb > 255) Bwb = 255;
 
-    /* CCM (Q10 signed) with rounding +512. */
+    /* CCM (Q10 signed) with rounding +512, then the single clip. */
     int Rc = (Rwb * CCM_RR + Gwb * CCM_RG + Bwb * CCM_RB + 512) >> 10;
     int Gc = (Rwb * CCM_GR + Gwb * CCM_GG + Bwb * CCM_GB + 512) >> 10;
     int Bc = (Rwb * CCM_BR + Gwb * CCM_BG + Bwb * CCM_BB + 512) >> 10;
-    if (Rc < 0) Rc = 0;
-    if (Rc > 255) Rc = 255;
-    if (Gc < 0) Gc = 0;
-    if (Gc > 255) Gc = 255;
-    if (Bc < 0) Bc = 0;
-    if (Bc > 255) Bc = 255;
+    if (Rc < 0) Rc = 0; else if (Rc > 255) Rc = 255;
+    if (Gc < 0) Gc = 0; else if (Gc > 255) Gc = 255;
+    if (Bc < 0) Bc = 0; else if (Bc > 255) Bc = 255;
 
     *Rout = k_gamma[Rc];
     *Gout = k_gamma[Gc];
@@ -124,6 +136,54 @@ static inline uint8_t raw10_msb8(const uint8_t* row, int col) {
     int group = col >> 2;
     int pos   = col & 3;
     return row[group * 5 + pos];
+}
+
+/* ── V188 grey-world AWB ────────────────────────────────────────────────────
+ * Called once per captured frame (bsp_frame_acquire, after AE). Samples a
+ * 32×32 grid of Bayer blocks over the full sensor, BLC-subtracted MSB8,
+ * skipping blocks with any channel ≥ 250 (clipped — unmeasurable), and moves
+ * the Q8 gains toward 256·Ḡ/R̄ and 256·Ḡ/B̄ with a 1/4 IIR per frame,
+ * clamped to [0.5×, 3×]. Neutral-ish scenes converge in ~8 frames; a scene
+ * dominated by one colour biases it (grey-world's known limit — acceptable
+ * here, and AWB=0 restores the fixed tuning gains). Prints the gains every
+ * 32 frames so convergence is visible on the UART. */
+void debayer_awb_update(const uint8_t* raw) {
+#if AWB
+    if (!raw) return;
+    const int stride = 1920;
+    uint32_t sr = 0, sg = 0, sb = 0, n = 0;
+    for (int by = 0; by < 32; by++) {
+        int src_y = ((by * SENSOR_BLK_H) / 32) * 2;          /* 0..836, +1 < 864 */
+        const uint8_t* row0 = raw + src_y * stride;
+        const uint8_t* row1 = row0 + stride;
+        for (int bx = 0; bx < 32; bx++) {
+            int src_x = ((bx * SENSOR_BLK_W) / 32) * 2;      /* 0..1488, +1 < 1536 */
+            int B  = raw10_msb8(row0, src_x);
+            int Gb = raw10_msb8(row0, src_x + 1);
+            int Gr = raw10_msb8(row1, src_x);
+            int R  = raw10_msb8(row1, src_x + 1);
+            if (R >= 250 || B >= 250 || Gr >= 250 || Gb >= 250) continue;
+            R -= (int)BLC_MSB8; B -= (int)BLC_MSB8; int G = ((Gr + Gb) >> 1) - (int)BLC_MSB8;
+            if (R < 0) R = 0; if (G < 0) G = 0; if (B < 0) B = 0;
+            sr += (uint32_t)R; sg += (uint32_t)G; sb += (uint32_t)B; n++;
+        }
+    }
+    /* Need enough unclipped samples and enough signal to estimate anything. */
+    if (n < 128 || sr < 4 * n || sb < 4 * n || sg < 4 * n) return;
+    int tr = (int)((sg * 256u) / sr);
+    int tb = (int)((sg * 256u) / sb);
+    if (tr < 128) tr = 128; else if (tr > 768) tr = 768;
+    if (tb < 128) tb = 128; else if (tb > 768) tb = 768;
+    g_wb_r += (tr - g_wb_r) >> 2;
+    g_wb_b += (tb - g_wb_b) >> 2;
+    static uint32_t frames = 0;
+    if ((frames++ & 31u) == 0u) {
+        uart_puts("[AWB] r="); uart_dec(g_wb_r); uart_puts(" b="); uart_dec(g_wb_b);
+        uart_puts(" (Q8, tuning 535/455) unclipped="); uart_dec((int)n); uart_puts("/1024\n");
+    }
+#else
+    (void)raw;
+#endif
 }
 
 /* ── YOLO input: debayer 864×864 center crop → YOLO_IN² CHW float32 ──────

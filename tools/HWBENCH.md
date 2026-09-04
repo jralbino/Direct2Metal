@@ -167,6 +167,17 @@ With `SHOW_CAMERA=1` (default since V186) the HDMI shows the live frame under th
 during a capture run, so you can frame the scene while it records; `render` costs ~22 ms.
 Second run: person 92–96% on 24/29 frames.
 
+**Exposure / white balance while capturing (V188).** The capture build prints
+`[AE] cit= mean= sat= d=` on every AE update and `[AWB] r= b= unclipped=` every 32
+frames. `sat` is the number of the 1024 AE grid samples at ≥ 250 raw — the number to
+watch: the AE's highlight protection pushes exposure down until it is under 2 % (~20 of
+1024), which from a cold start in a bright room takes ~20 updates ≈ 90 frames in this
+build (hence `CAPTURE ?= 90`). If `sat` is still high at capture time, raise `CAPTURE=`.
+"Blown whites" were exactly this (half the sensor saturated with the mean on target), not
+white balance — see PLAN.md V188. A capture whose per-channel `>= 0.98` fraction
+(`capture_to_test_image.py`) is under ~5 % for R/B and ~1 % for G is healthy; 40 % means
+the AE hadn't settled.
+
 ## If `initramfs` doesn't load the blob
 
 Symptom: `weights CRC mismatch` halt on frame 1. Try another address in both

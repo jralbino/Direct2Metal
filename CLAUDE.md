@@ -38,7 +38,8 @@ docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app rpi-forge make kernel8.i
 | `make sim` | `-DSIMULATION` build **and** QEMU run. Self-terminates after 3 frames via semihosting (`hlt #0xf000`). Camera is *simulated present* → runs the synthetic-frame path, `[DET] none`. Use it for camera-driver sequencing, not for detection correctness. |
 | `make sim_elf` | Same build, no QEMU. |
 | `make USE_INT8=1` / `USE_INT8_W8A8=1` | Tier 1 / Tier 2 INT8 builds. **Closed** (see below) but kept building. |
-| `make FRAME_SKIP_N=4` | B4 frame-skip: infer 1 in N frames, re-render the rest. |
+| `make FRAME_SKIP_N=1` | B4 frame-skip. Default is **4** since V187 (camera + HUD at capture rate, inference on 1 in 4 frames); N=1 infers every frame. The bench and capture images always force N=1 via `SERFLAGS` (`hwbench.py` needs `[P]`/`[ABS]` on the frame it parses). |
+| `make AWB=0` | Freeze the ISP white balance at the tuning-file daylight gains (WB_R=535, WB_B=455 Q8). Default **1** (V188): grey-world AWB once per frame in `debayer_awb_update()`, prints `[AWB] r= b=` every 32 frames. |
 | `make DEBUG=1` | Camera thumbnail in the canvas. |
 | `make SHOW_CAMERA=0` | Restore the V167 dark canvas. Default **1** (V186) paints the live 640×360 frame under the bboxes via `camera_render_fullres()` — measured +21 ms/frame in `render` (single-core; the V164 multi-core debayer was removed in V167). |
 | `make clean` | Removes `*.o *.elf *.img` (all gitignored — safe). |
@@ -147,6 +148,15 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   **0 ms** on HW: contiguous output store vs `vgetq_lane` scatter; FMLA accumulator interleave
   (the A53 forwards the accumulate operand). Remaining algorithmic lever: Winograd F(2×2,3×3).
 - B4 frame-skip raises throughput, not latency.
+- **"Blown whites" on the camera were exposure, not white balance** (V188). Symptom: R/B at 1.0
+  in 5–45 % of pixels while G looked unclipped. Grey-world AWB moved the gains by <5 % (the
+  tuning WB was right for the room), and the AE grid showed ~half the sensor blocks ≥ 250 raw.
+  G *was* saturated too — raw 255 − BLC 16 = 239 → gamma → ~247/255 = 0.97, just under a naive
+  0.98 clip threshold — so per-channel "clipped" stats mislead here. The mean-only AE
+  (`AE_TARGET=100` on raw MSB8) let high-contrast scenes burn; the fix is highlight protection
+  in `ae_step()` (`AE_SAT_LEVEL`/`AE_SAT_MAX_PCT`), which prints `[AE] cit= mean= sat=`. Do
+  not remove the post-WB clip in `isp_pixel` again: on sensor-saturated pixels it makes the
+  burn redder.
 
 ## Conventions
 

@@ -29,10 +29,13 @@ else
     INT8_DEF =
 endif
 
-# B4: frame-skip detection. `make FRAME_SKIP_N=4` runs YOLO inference
-# every 4 frames; the other 3 reuse the cached preds[] but re-render
-# the camera + HUD at the capture rate. N=1 (default) = no change.
-FRAME_SKIP_N ?= 1
+# B4: frame-skip detection. `make FRAME_SKIP_N=N` runs YOLO inference
+# every N frames; the other N-1 reuse the cached preds[] but re-render
+# the camera + HUD at the capture rate. V187: default 4 (camera+HUD ~16 fps,
+# boxes refresh every 4th frame). `make FRAME_SKIP_N=1` = infer every frame.
+# The bench/capture images force N=1 (see SERFLAGS) — hwbench.py needs a
+# [P]/[ABS] block on every frame it parses.
+FRAME_SKIP_N ?= 4
 SKIP_DEF = -DYOLO_INFER_EVERY_N=$(FRAME_SKIP_N)
 
 # V181: `make DEBUG=1` enables the camera thumbnail in the canvas + the
@@ -49,8 +52,15 @@ DEBUG_DEF = -DDEBUG=$(DEBUG)
 SHOW_CAMERA ?= 1
 SHOW_DEF = -DSHOW_CAMERA=$(SHOW_CAMERA)
 
+# V188: `make AWB=0` freezes the ISP white balance at the tuning-file daylight
+# gains (WB_R=535 WB_B=455 Q8). Default 1 = grey-world AWB once per frame in
+# bsp/camera_debayer.cpp (debayer_awb_update), which fixes the magenta-burnt
+# whites (R/B clipped at 255 while G is fine) under indoor light.
+AWB ?= 1
+AWB_DEF = -DAWB=$(AWB)
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)
@@ -140,7 +150,10 @@ kernel8.img: kernel8.elf
 #  raspbootin64.img   : 936 B serial chain-loader, goes on the SD AS kernel8.img.
 #  bench              : reset (RTS->RUN) + upload + capture + parse + golden diff.
 # =====================================================================
-SERFLAGS  = $(CXXFLAGS) -DSERIAL_BOOT
+# Bench + capture images always infer every frame regardless of FRAME_SKIP_N:
+# hwbench.py takes the last frame and expects its [P] buckets, per-layer profile
+# and [ABS] fingerprint — skip frames print none of those.
+SERFLAGS  = $(CXXFLAGS) -DSERIAL_BOOT -UYOLO_INFER_EVERY_N -DYOLO_INFER_EVERY_N=1
 SER_OBJS  = $(addprefix ser_,$(filter-out data.o,$(HW_OBJS)))
 
 ser_%.o: %.s
@@ -178,12 +191,17 @@ bench: kernel8_serial.img
 	python3 tools/hwbench.py --port $(PORT) --kernel kernel8_serial.img --frames $(FRAMES) $(BENCHFLAGS)
 
 # V185: `make capture` — same serial-boot flow but with the CAMERA ON. On frame
-# CAPTURE (AE settled) the kernel dumps the exact model input tensor over UART
-# as base64; hwbench.py --capture writes it to cam_frame.bin. Then:
+# CAPTURE the kernel dumps the exact model input tensor over UART as base64;
+# hwbench.py --capture writes it to cam_frame.bin. Then:
 #   python3 tools/capture_to_test_image.py cam_frame.bin --preview cam_frame.png
 #   make d2m_data.bin   (+ recopy to SD, regenerate GOLDEN/GOLDEN_ABS)
 # Separate cap_ objects so the flag never leaks into the bench image.
-CAPTURE  ?= 30
+# The capture image infers every frame (~1.3 s), so AE/AWB only update every
+# AE_PERIOD=4 frames ≈ 5 s. From the cold-start CIT (1131) a bright room needs
+# ~20 updates to get highlights under the 2 % saturation threshold (measured
+# V188: 15 updates → 4.6 %), so CAPTURE=90. The per-update
+# `[AE] cit= mean= sat= d=` trace is printed in this build only.
+CAPTURE  ?= 90
 CAPFLAGS  = $(SERFLAGS) -DCAPTURE_FRAME=$(CAPTURE)
 CAP_OBJS  = $(addprefix cap_,$(filter-out data.o,$(HW_OBJS)))
 cap_%.o: %.s
