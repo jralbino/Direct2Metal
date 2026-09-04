@@ -7,18 +7,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **541 ms/frame** at `YOLO_IN=256`,
-fp32, stock 1 GHz clocks (V191 — conv1x1 L1-thrash fix + per-position P8; V189 was 799 ms,
-V183 1276 ms at 600 MHz). The four P3-head conv3×3 (105 ms) are the biggest item, ~3.5× the
-A53 compute floor. **~518 ms** at `YOLO_IN=192` with live camera detections (V164). With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
+the Pi Camera Module 3 (IMX708). Real-hardware results: **491 ms/frame** at `YOLO_W=320,
+YOLO_H=192` (V192 — full sensor FoV, non-square input; V191 was 541 ms at 256², V189 799 ms,
+V183 1276 ms at 600 MHz). The graph is fully convolutional so the same YOLOv8n weights run
+at any input divisible by 32; `bsp.h` holds `YOLO_W`/`YOLO_H`. The four P3-head conv3×3
+(~95 ms) are the biggest item, ~3.5× the A53 compute floor. With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
 the capture rate and boxes update every 4th frame.
 This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub repo (V76)
 — do not develop there.
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
-V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy —
-trust GOALS/PLAN over it. Record new findings in GOALS.md / PLAN.md in the same
-version-stamped style (next version after V181 is V183).
+V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
+GOALS.md / PLAN.md version-stamped; the session reached V192.
 
 **Working tree has ~110 uncommitted files of the user's V180/V181 work.** Never
 `git stash`, `git checkout -- .`, or `make clean`-style sweeps that could touch them. If you
@@ -66,15 +66,16 @@ against `GOLDEN` in `tools/hwbench.py`. FP32 weights + `test_image` live on the 
 RTS-only — never power-cycle (the CH340 re-enumerates). Do not pass `--reset-invert`.
 
 Correctness regression for any kernel/graph change: on the last captured frame the
-`(class, conf%)` set must equal `GOLDEN` — since V189 **a real captured camera frame
-(wall clock) → `[(74, 83)]`**; V184's `bus.jpg` gave `[(0,71),(0,77),(0,88),(5,85)]` — **and**
+`(class, conf%)` set must equal `GOLDEN` — a real captured camera frame; V192 (full-FoV
+320×192) → `[(74, 56)]` (the clock is small in the wide view — the `[ABS]` fingerprint is
+the load-bearing check) — **and**
 the `[ABS] <tag> amax1e3=` fingerprints (the `LOG_ABSMAX`
 checkpoints, printed on the fp32 path only under `SERIAL_BOOT`) must match `GOLDEN_ABS`
 within `--abs-tol`. Regenerate both from the SERIAL_BOOT build in QEMU (`-device
 loader,file=d2m_data.bin,addr=0x08000000`, or `make bench BENCHFLAGS=--print-golden` on
-HW) after model/exporter/test-image changes. **`test_image.bin` must be 3·YOLO_IN² floats**
-(786 432 B at 256): V169–V183 shipped a 320² fossil that misaligned the colour planes and
-produced `[DET] none` — if detections vanish after a resolution change, check this first.
+HW) after model/exporter/test-image changes. **`test_image.bin` must be exactly 3·YOLO_W·YOLO_H floats** (737 280 B at 320×192). A size
+mismatch misaligns the colour planes → garbage / `[DET] none`; check it first after any
+geometry change. (V169–V183 shipped a 320² tensor to a 256² model with exactly this bug.)
 
 **Real camera frame → golden** (V185): `make capture` builds `kernel8_capture.img`
 (`-DCAPTURE_FRAME=N`, camera ON, separate `cap_*.o`) and dumps the exact model input of frame
@@ -94,8 +95,8 @@ Weights + test image are `.incbin`'d via `app/yolo_v8n_coco/data.s` (4 blobs: fp
 w8a8, image). After touching the model or exporters:
 
 ```bash
-python3 tools/convert_image.py                # -> app/<APP>/test_image.bin, [3][YOLO_IN][YOLO_IN]
-                                               #    (Pillow + numpy; reads YOLO_IN from bsp/bsp.h)
+python3 tools/convert_image.py                # -> app/<APP>/test_image.bin, [3][YOLO_H][YOLO_W]
+                                               #    (Pillow + numpy; reads YOLO_W/YOLO_H from bsp/bsp.h)
 tools/env/bin/python tools/export_model.py    # -> weights.bin + weights_crc.h   (needs torch)
 tools/env/bin/python tools/export_int8.py     # -> weights_int8*.bin + *_crc.h   (only if INT8 matters)
 make d2m_data.bin                              # -> d2m_data.bin for the bench (recopy to SD)

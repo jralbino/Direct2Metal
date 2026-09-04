@@ -103,14 +103,22 @@ const uint8_t* unicam_frame_ptr();
 bool bsp_frame_try_advance();
 
 /* ── YOLO input geometry ─────────────────────────────────────────────────
- * Single source of truth for the YOLO input side. The BSP debayer reads
- * this so it can never drift from what the model consumes. App-level
- * today; will migrate to app/yolo_v8n_coco/ in Step 4. */
-#define YOLO_IN 256
+ * V192: non-square input = full sensor field of view instead of the old
+ * 864×864 centre crop (which read only 56 % of the frame width — the "zoom").
+ * Both dims must be multiples of 32 (the max backbone stride). YOLOv8n is
+ * fully convolutional so the same weights run at any such size; the decode
+ * takes grid h/w separately. 320×192 ≈ 256² in cost. The 1536×864 (16:9)
+ * sensor is isotropically resized to 320×180 and letterboxed into the
+ * 320×192 tensor (6 black rows top+bottom).
+ * Single source of truth: the debayer and every tool read these. */
+#define YOLO_W  320
+#define YOLO_H  192
+#define YOLO_LETTERBOX_TOP 6          /* (192 - 180) / 2 */
+#define YOLO_CONTENT_H     180        /* 864 * (320/1536) */
 
 /* Debayer the most recent raw frame into a normalized CHW float32 tensor
- * [3][YOLO_IN][YOLO_IN] (864×864 center crop → YOLO_IN²). dst must point
- * to 3*YOLO_IN*YOLO_IN floats. RGGB → libcamera ISP (BLC/WB/CCM/gamma). */
+ * [3][YOLO_H][YOLO_W], full FoV, letterboxed. dst must point to
+ * 3*YOLO_W*YOLO_H floats. RGGB → libcamera ISP (BLC/WB/CCM/gamma). */
 void debayer_raw10_to_chw_yolo(float* dst);
 
 /* Clear the top + bottom letterbox bands of the framebuffer (rows outside

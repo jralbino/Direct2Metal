@@ -52,11 +52,18 @@ extern "C" const int8_t weights_int8_w8a8_end[];
 extern "C" const float  test_image[];
 #endif
 
-#define YOLO_S2  (YOLO_IN / 2)
-#define YOLO_S4  (YOLO_IN / 4)
-#define YOLO_S8  (YOLO_IN / 8)
-#define YOLO_S16 (YOLO_IN / 16)
-#define YOLO_S32 (YOLO_IN / 32)
+/* V192: non-square input (full sensor FoV). Per-stride grid dims, H and W
+ * separate. YOLO_W/YOLO_H come from bsp.h; both are multiples of 32. */
+#define YOLO_S2H  (YOLO_H / 2)
+#define YOLO_S2W  (YOLO_W / 2)
+#define YOLO_S4H  (YOLO_H / 4)
+#define YOLO_S4W  (YOLO_W / 4)
+#define YOLO_S8H  (YOLO_H / 8)
+#define YOLO_S8W  (YOLO_W / 8)
+#define YOLO_S16H (YOLO_H / 16)
+#define YOLO_S16W (YOLO_W / 16)
+#define YOLO_S32H (YOLO_H / 32)
+#define YOLO_S32W (YOLO_W / 32)
 
 #define DFL_REG_MAX 16   /* v8 default; box ch = 4 * REG_MAX */
 
@@ -69,20 +76,20 @@ typedef float  act_t;
 #endif
 
 static act_t buf_A[2000000]; static act_t buf_B[2000000]; static act_t scratch[2000000];
-static float cam_frame[3 * YOLO_IN * YOLO_IN];   /* fp32 — debayer/preprocess input */
+static float cam_frame[3 * YOLO_W * YOLO_H];   /* fp32 — debayer/preprocess input */
 
 /* Skip connections + per-level head inputs (v8 PAN). */
-static act_t save_L4   [64  * YOLO_S8  * YOLO_S8];    /* L4 (P3 backbone)     */
-static act_t save_L6   [128 * YOLO_S16 * YOLO_S16];   /* L6 (P4 backbone)     */
-static act_t save_SPPF [256 * YOLO_S32 * YOLO_S32];   /* L9 SPPF out          */
-static act_t save_P4mid[128 * YOLO_S16 * YOLO_S16];   /* L12 (mid neck)       */
-static act_t save_P3   [64  * YOLO_S8  * YOLO_S8];    /* L15 → P3 head input  */
-static act_t save_P4   [128 * YOLO_S16 * YOLO_S16];   /* L18 → P4 head input  */
+static act_t save_L4   [64  * YOLO_S8H * YOLO_S8W];    /* L4 (P3 backbone)     */
+static act_t save_L6   [128 * YOLO_S16H * YOLO_S16W];   /* L6 (P4 backbone)     */
+static act_t save_SPPF [256 * YOLO_S32H * YOLO_S32W];   /* L9 SPPF out          */
+static act_t save_P4mid[128 * YOLO_S16H * YOLO_S16W];   /* L12 (mid neck)       */
+static act_t save_P3   [64  * YOLO_S8H * YOLO_S8W];    /* L15 → P3 head input  */
+static act_t save_P4   [128 * YOLO_S16H * YOLO_S16W];   /* L18 → P4 head input  */
 
 /* Head per-level scratch. Sized for P3 (largest spatial grid). */
-static act_t head_box [64 * YOLO_S8 * YOLO_S8];
-static act_t head_cls [80 * YOLO_S8 * YOLO_S8];
-static act_t head_tmp [80 * YOLO_S8 * YOLO_S8];
+static act_t head_box [64 * YOLO_S8H * YOLO_S8W];
+static act_t head_cls [80 * YOLO_S8H * YOLO_S8W];
+static act_t head_tmp [80 * YOLO_S8H * YOLO_S8W];
 
 static float mini_exp(float x) {
     if (x > 88.0f) { return 3.40282347e+38f; }
@@ -483,10 +490,10 @@ static int global_frame_counter = 1;
 #define MAX_TRACKS         16
 #define TRACK_IOU_MATCH    0.30f
 #define TRACK_MAX_MISSED   5
-#define TRACK_V_MAX        64.0f   /* YOLO_IN / 4 */
+#define TRACK_V_MAX        80.0f   /* ~ YOLO_W / 4 */
 struct Track {
     int   id;              /* 0 = free slot */
-    Box   box;             /* cls + conf + x/y/w/h in YOLO_IN² space */
+    Box   box;             /* cls + conf + x/y/w/h in YOLO_W x YOLO_H space */
     float vx, vy;          /* per-inference velocity */
     int   frames_missed;
     bool  has_velocity;    /* false until first successful re-match */
@@ -824,7 +831,7 @@ static void update_tracker() {
  *   1. find argmax over 80 raw cls logits, sigmoid it, prefilter.
  *   2. for each of 4 sides (l, t, r, b), softmax over 16 bins and take
  *      the integral E[k] = Σ k * softmax(box[s*16:(s+1)*16]).
- *   3. recover (x, y, w, h) in YOLO_IN-space using anchor at cell centre.
+ *   3. recover (x, y, w, h) in YOLO_W x YOLO_H space using anchor at cell centre.
  * Pushes preds onto the shared preds[] buffer (consumed by NMS below).
  * ------------------------------------------------------------------ */
 static void decode_v8_dfl(const float* box_chw, const float* cls_chw,
@@ -992,13 +999,13 @@ static int heartbeat_counter = 0;
 
 static void draw_tensor_image_fullscreen(const float* img) {
     const float* dst_r = img;
-    const float* dst_g = img + (YOLO_IN * YOLO_IN);
-    const float* dst_b = img + (2 * YOLO_IN * YOLO_IN);
+    const float* dst_g = img + (YOLO_W * YOLO_H);
+    const float* dst_b = img + (2 * YOLO_W * YOLO_H);
     for (int y = 0; y < 480; y++) {
-        int src_y = (y * YOLO_IN) / 480;
+        int src_y = (y * YOLO_H) / 480;
         for (int x = 0; x < 640; x++) {
-            int src_x = (x * YOLO_IN) / 640;
-            int idx = src_y * YOLO_IN + src_x;
+            int src_x = (x * YOLO_W) / 640;
+            int idx = src_y * YOLO_W + src_x;
             int r = (int)(dst_r[idx] * 255.0f); int g = (int)(dst_g[idx] * 255.0f); int b = (int)(dst_b[idx] * 255.0f);
 
             if (r < 0) { r = 0; }
@@ -1016,7 +1023,7 @@ static void draw_tensor_image_fullscreen(const float* img) {
 #ifdef CAPTURE_FRAME
 /* ── V185: frame capture over UART ─────────────────────────────────────────
  * `make capture` (SERIAL_BOOT + CAPTURE_FRAME=N, camera ON). On frame N — by
- * then AE has settled — dump cam_frame, the *exact* [3][YOLO_IN][YOLO_IN] fp32
+ * then AE has settled — dump cam_frame, the *exact* [3][YOLO_H][YOLO_W] fp32
  * tensor the model consumes after debayer + ISP, as base64 between
  *   [CAP] begin len=<bytes> crc=<hex32>   …   [CAP] end
  * hwbench.py --capture reassembles + CRC-checks it; tools/capture_to_test_image.py
@@ -1047,10 +1054,10 @@ static void capture_dump_if_due(const float* img) {
     if (done || global_frame_counter != (CAPTURE_FRAME)) return;
     done = true;
     const uint8_t* p = (const uint8_t*)img;
-    const size_t   n = sizeof(float) * 3 * YOLO_IN * YOLO_IN;
+    const size_t   n = sizeof(float) * 3 * YOLO_W * YOLO_H;
     uint32_t crc = crc32_sw(p, n);
     uart_puts("[CAP] begin len="); uart_dec((int)n); uart_puts(" crc="); uart_hex32(crc);
-    uart_puts(" n="); uart_dec(YOLO_IN); uart_puts("\n");
+    uart_puts(" w="); uart_dec(YOLO_W); uart_puts(" h="); uart_dec(YOLO_H); uart_puts("\n");
     uart_b64(p, n);
     uart_puts("[CAP] end\n");
 }
@@ -1140,12 +1147,12 @@ void run_yolo_complete() {
                 capture_dump_if_due(cam_frame);   /* V185 — once, on frame CAPTURE_FRAME */
 #endif
             } else {
-                const int n = 3 * YOLO_IN * YOLO_IN;
+                const int n = 3 * YOLO_W * YOLO_H;
                 for (int i = 0; i < n; i++) cam_frame[i] = 0.0f;
             }
         }
 
-    int hw = YOLO_IN * YOLO_IN;
+    int hw = YOLO_W * YOLO_H;
 #ifdef USE_INT8_W8A8
     /* W8A8: quantize fp32 input → int8 buf_B using L0's actual
      * scale_in from the bin (auto-tracks any --scale_safety_margin
@@ -1180,32 +1187,32 @@ void run_yolo_complete() {
 
     /* ── Backbone ─────────────────────────────────────────────────────── */
     LayerHandle L0 = LAYER_LOAD(ws, 16*3*3*3, 16, "L0");
-    CONV2D(buf_B, YOLO_IN, YOLO_IN, 3, L0, 16, 3, 2, 1, true, buf_A);
-    LOG_ABSMAX("L0", buf_A, 16 * YOLO_S2 * YOLO_S2, L0);
+    CONV2D(buf_B, YOLO_H, YOLO_W, 3, L0, 16, 3, 2, 1, true, buf_A);
+    LOG_ABSMAX("L0", buf_A, 16 * YOLO_S2H * YOLO_S2W, L0);
     t_l0 = get_timer_count();
     prof_reset();   /* V183 per-layer profile starts after L0 (it has its own bucket) */
 
     LayerHandle L1 = LAYER_LOAD(ws, 32*16*3*3, 32, "L1");
-    CONV2D(buf_A, YOLO_S2, YOLO_S2, 16, L1, 32, 3, 2, 1, true, buf_B);
-    LOG_ABSMAX("L1", buf_B, 32 * YOLO_S4 * YOLO_S4, L1);                                     prof_mark("L1  conv3x3 s2 16->32 @S4");
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4, YOLO_S4, 32, 32, 1, true, ws, "L2");  prof_mark("L2  C2f n1  32ch @S4");
+    CONV2D(buf_A, YOLO_S2H, YOLO_S2W, 16, L1, 32, 3, 2, 1, true, buf_B);
+    LOG_ABSMAX("L1", buf_B, 32 * YOLO_S4H * YOLO_S4W, L1);                                     prof_mark("L1  conv3x3 s2 16->32 @S4");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S4H, YOLO_S4W, 32, 32, 1, true, ws, "L2");  prof_mark("L2  C2f n1  32ch @S4");
 
     LayerHandle L3 = LAYER_LOAD(ws, 64*32*3*3, 64, "L3");
-    CONV2D(buf_A, YOLO_S4, YOLO_S4, 32, L3, 64, 3, 2, 1, true, buf_B);                     prof_mark("L3  conv3x3 s2 32->64 @S8");
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8, YOLO_S8, 64, 64, 2, true, ws, "L4");
-    COPY_TENSOR(buf_A, save_L4, 64 * YOLO_S8 * YOLO_S8);                                   prof_mark("L4  C2f n2  64ch @S8");
+    CONV2D(buf_A, YOLO_S4H, YOLO_S4W, 32, L3, 64, 3, 2, 1, true, buf_B);                     prof_mark("L3  conv3x3 s2 32->64 @S8");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S8H, YOLO_S8W, 64, 64, 2, true, ws, "L4");
+    COPY_TENSOR(buf_A, save_L4, 64 * YOLO_S8H * YOLO_S8W);                                   prof_mark("L4  C2f n2  64ch @S8");
 
     LayerHandle L5 = LAYER_LOAD(ws, 128*64*3*3, 128, "L5");
-    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L5, 128, 3, 2, 1, true, buf_B);                    prof_mark("L5  conv3x3 s2 64->128 @S16");
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16, YOLO_S16, 128, 128, 2, true, ws, "L6");
-    COPY_TENSOR(buf_A, save_L6, 128 * YOLO_S16 * YOLO_S16);                                prof_mark("L6  C2f n2  128ch @S16");
+    CONV2D(buf_A, YOLO_S8H, YOLO_S8W, 64, L5, 128, 3, 2, 1, true, buf_B);                    prof_mark("L5  conv3x3 s2 64->128 @S16");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S16H, YOLO_S16W, 128, 128, 2, true, ws, "L6");
+    COPY_TENSOR(buf_A, save_L6, 128 * YOLO_S16H * YOLO_S16W);                                prof_mark("L6  C2f n2  128ch @S16");
 
     LayerHandle L7 = LAYER_LOAD(ws, 256*128*3*3, 256, "L7");
-    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L7, 256, 3, 2, 1, true, buf_B);
-    LOG_ABSMAX("L7", buf_B, 256 * YOLO_S32 * YOLO_S32, L7);                                prof_mark("L7  conv3x3 s2 128->256 @S32");
-    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32, YOLO_S32, 256, 256, 1, true, ws, "L8"); prof_mark("L8  C2f n1  256ch @S32");
-    sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32, YOLO_S32, 256, ws);
-    COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32 * YOLO_S32);                              prof_mark("SPPF      256ch @S32");
+    CONV2D(buf_A, YOLO_S16H, YOLO_S16W, 128, L7, 256, 3, 2, 1, true, buf_B);
+    LOG_ABSMAX("L7", buf_B, 256 * YOLO_S32H * YOLO_S32W, L7);                                prof_mark("L7  conv3x3 s2 128->256 @S32");
+    c2f_real_inference(buf_B, buf_A, scratch, YOLO_S32H, YOLO_S32W, 256, 256, 1, true, ws, "L8"); prof_mark("L8  C2f n1  256ch @S32");
+    sppf_real_inference(buf_A, buf_B, scratch, YOLO_S32H, YOLO_S32W, 256, ws);
+    COPY_TENSOR(buf_B, save_SPPF, 256 * YOLO_S32H * YOLO_S32W);                              prof_mark("SPPF      256ch @S32");
 
     t_backbone = get_timer_count();
 
@@ -1213,29 +1220,29 @@ void run_yolo_complete() {
      *    upsamples — the C2f modules handle the channel reduction. ───── */
 
     /* L10 upsample(SPPF) → L11 concat with L6 → L12 C2f → mid-P4 */
-    UPSAMPLE2X(buf_B, buf_A, YOLO_S32, YOLO_S32, 256);
-    CONCAT_TENSOR(buf_A, 256, save_L6, 128, scratch, YOLO_S16 * YOLO_S16);
-    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 384, 128, 1, false, ws, "L12");
-    COPY_TENSOR(buf_A, save_P4mid, 128 * YOLO_S16 * YOLO_S16);                             prof_mark("L12 up+cat+C2f 384->128 @S16");
+    UPSAMPLE2X(buf_B, buf_A, YOLO_S32H, YOLO_S32W, 256);
+    CONCAT_TENSOR(buf_A, 256, save_L6, 128, scratch, YOLO_S16H * YOLO_S16W);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16H, YOLO_S16W, 384, 128, 1, false, ws, "L12");
+    COPY_TENSOR(buf_A, save_P4mid, 128 * YOLO_S16H * YOLO_S16W);                             prof_mark("L12 up+cat+C2f 384->128 @S16");
 
     /* L13 upsample → L14 concat with L4 → L15 C2f → P3 head input */
-    UPSAMPLE2X(buf_A, buf_B, YOLO_S16, YOLO_S16, 128);
-    CONCAT_TENSOR(buf_B, 128, save_L4, 64, scratch, YOLO_S8 * YOLO_S8);
-    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S8, YOLO_S8, 192, 64, 1, false, ws, "L15");
-    COPY_TENSOR(buf_A, save_P3, 64 * YOLO_S8 * YOLO_S8);                                   prof_mark("L15 up+cat+C2f 192->64 @S8");
+    UPSAMPLE2X(buf_A, buf_B, YOLO_S16H, YOLO_S16W, 128);
+    CONCAT_TENSOR(buf_B, 128, save_L4, 64, scratch, YOLO_S8H * YOLO_S8W);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S8H, YOLO_S8W, 192, 64, 1, false, ws, "L15");
+    COPY_TENSOR(buf_A, save_P3, 64 * YOLO_S8H * YOLO_S8W);                                   prof_mark("L15 up+cat+C2f 192->64 @S8");
 
     /* L16 conv 3x3 s=2 → L17 concat with mid-P4 → L18 C2f → P4 head input */
     LayerHandle L16 = LAYER_LOAD(ws, 64*64*3*3, 64, "L16");
-    CONV2D(buf_A, YOLO_S8, YOLO_S8, 64, L16, 64, 3, 2, 1, true, buf_B);                    prof_mark("L16 conv3x3 s2 64->64 @S16");
-    CONCAT_TENSOR(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16 * YOLO_S16);
-    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16, YOLO_S16, 192, 128, 1, false, ws, "L18");
-    COPY_TENSOR(buf_A, save_P4, 128 * YOLO_S16 * YOLO_S16);                                prof_mark("L18 cat+C2f 192->128 @S16");
+    CONV2D(buf_A, YOLO_S8H, YOLO_S8W, 64, L16, 64, 3, 2, 1, true, buf_B);                    prof_mark("L16 conv3x3 s2 64->64 @S16");
+    CONCAT_TENSOR(buf_B, 64, save_P4mid, 128, scratch, YOLO_S16H * YOLO_S16W);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S16H, YOLO_S16W, 192, 128, 1, false, ws, "L18");
+    COPY_TENSOR(buf_A, save_P4, 128 * YOLO_S16H * YOLO_S16W);                                prof_mark("L18 cat+C2f 192->128 @S16");
 
     /* L19 conv 3x3 s=2 → L20 concat with SPPF → L21 C2f → P5 head input */
     LayerHandle L19 = LAYER_LOAD(ws, 128*128*3*3, 128, "L19");
-    CONV2D(buf_A, YOLO_S16, YOLO_S16, 128, L19, 128, 3, 2, 1, true, buf_B);                prof_mark("L19 conv3x3 s2 128->128 @S32");
-    CONCAT_TENSOR(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32 * YOLO_S32);
-    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32, YOLO_S32, 384, 256, 1, false, ws, "L21"); prof_mark("L21 cat+C2f 384->256 @S32");
+    CONV2D(buf_A, YOLO_S16H, YOLO_S16W, 128, L19, 128, 3, 2, 1, true, buf_B);                prof_mark("L19 conv3x3 s2 128->128 @S32");
+    CONCAT_TENSOR(buf_B, 128, save_SPPF, 256, scratch, YOLO_S32H * YOLO_S32W);
+    c2f_real_inference(scratch, buf_A, buf_B, YOLO_S32H, YOLO_S32W, 384, 256, 1, false, ws, "L21"); prof_mark("L21 cat+C2f 384->256 @S32");
 
     t_neck = get_timer_count();
 
@@ -1264,24 +1271,24 @@ void run_yolo_complete() {
     LayerHandle wc_p5_2 = LAYER_LOAD(ws, 80*80,    80, "P5_CLS_2");
 
     /* P5 head — input still in buf_A. scratch is free. */
-    CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wb_p5_0, 64, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S32, YOLO_S32, 64,  wb_p5_1, 64, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S32, YOLO_S32, 64,  wb_p5_2, 64, false,       head_box);
-    CONV2D (buf_A,    YOLO_S32, YOLO_S32, 256, wc_p5_0, 80, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S32, YOLO_S32, 80,  wc_p5_1, 80, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S32, YOLO_S32, 80,  wc_p5_2, 80, false,       head_cls);
-    LOG_ABSMAX("P5_BOX", head_box, 64 * YOLO_S32 * YOLO_S32, wb_p5_2);
-    LOG_ABSMAX("P5_CLS", head_cls, 80 * YOLO_S32 * YOLO_S32, wc_p5_2);
-    DECODE_HEAD(head_box, head_cls, YOLO_S32, YOLO_S32, 32, wb_p5_2, wc_p5_2);            prof_mark("P5 head 6 conv + decode @S32");
+    CONV2D (buf_A,    YOLO_S32H, YOLO_S32W, 256, wb_p5_0, 64, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S32H, YOLO_S32W, 64,  wb_p5_1, 64, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S32H, YOLO_S32W, 64,  wb_p5_2, 64, false,       head_box);
+    CONV2D (buf_A,    YOLO_S32H, YOLO_S32W, 256, wc_p5_0, 80, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S32H, YOLO_S32W, 80,  wc_p5_1, 80, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S32H, YOLO_S32W, 80,  wc_p5_2, 80, false,       head_cls);
+    LOG_ABSMAX("P5_BOX", head_box, 64 * YOLO_S32H * YOLO_S32W, wb_p5_2);
+    LOG_ABSMAX("P5_CLS", head_cls, 80 * YOLO_S32H * YOLO_S32W, wc_p5_2);
+    DECODE_HEAD(head_box, head_cls, YOLO_S32H, YOLO_S32W, 32, wb_p5_2, wc_p5_2);            prof_mark("P5 head 6 conv + decode @S32");
 
     /* P4 head — input in save_P4. */
-    CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wb_p4_0, 64, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S16, YOLO_S16, 64,  wb_p4_1, 64, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S16, YOLO_S16, 64,  wb_p4_2, 64, false,       head_box);
-    CONV2D (save_P4,  YOLO_S16, YOLO_S16, 128, wc_p4_0, 80, 3, 1, 1, true, head_tmp);
-    CONV2D (head_tmp, YOLO_S16, YOLO_S16, 80,  wc_p4_1, 80, 3, 1, 1, true, scratch);
-    CONV1X1(scratch,  YOLO_S16, YOLO_S16, 80,  wc_p4_2, 80, false,       head_cls);
-    DECODE_HEAD(head_box, head_cls, YOLO_S16, YOLO_S16, 16, wb_p4_2, wc_p4_2);            prof_mark("P4 head 6 conv + decode @S16");
+    CONV2D (save_P4,  YOLO_S16H, YOLO_S16W, 128, wb_p4_0, 64, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S16H, YOLO_S16W, 64,  wb_p4_1, 64, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S16H, YOLO_S16W, 64,  wb_p4_2, 64, false,       head_box);
+    CONV2D (save_P4,  YOLO_S16H, YOLO_S16W, 128, wc_p4_0, 80, 3, 1, 1, true, head_tmp);
+    CONV2D (head_tmp, YOLO_S16H, YOLO_S16W, 80,  wc_p4_1, 80, 3, 1, 1, true, scratch);
+    CONV1X1(scratch,  YOLO_S16H, YOLO_S16W, 80,  wc_p4_2, 80, false,       head_cls);
+    DECODE_HEAD(head_box, head_cls, YOLO_S16H, YOLO_S16W, 16, wb_p4_2, wc_p4_2);            prof_mark("P4 head 6 conv + decode @S16");
 
     /* P3 head — input in save_P3. */
 #ifdef HEAD_PROF
@@ -1289,15 +1296,15 @@ void run_yolo_complete() {
 #else
     #define HP_MARK(s) ((void)0)
 #endif
-    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.box0 3x3 64->64");
-    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  64,  wb_p3_1, 64, 3, 1, 1, true, scratch);      HP_MARK("  P3.box1 3x3 64->64");
-    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  64,  wb_p3_2, 64, false,       head_box);       HP_MARK("  P3.box2 1x1 64->64");
-    CONV2D (save_P3,  YOLO_S8,  YOLO_S8,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.cls0 3x3 64->80");
-    CONV2D (head_tmp, YOLO_S8,  YOLO_S8,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);      HP_MARK("  P3.cls1 3x3 80->80");
-    CONV1X1(scratch,  YOLO_S8,  YOLO_S8,  80,  wc_p3_2, 80, false,       head_cls);       HP_MARK("  P3.cls2 1x1 80->80");
-    LOG_ABSMAX("P3_BOX", head_box, 64 * YOLO_S8 * YOLO_S8, wb_p3_2);
-    LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8 * YOLO_S8, wc_p3_2);
-    DECODE_HEAD(head_box, head_cls, YOLO_S8, YOLO_S8, 8, wb_p3_2, wc_p3_2);               prof_mark("P3 head 6 conv + decode @S8");
+    CONV2D (save_P3,  YOLO_S8H, YOLO_S8W,  64,  wb_p3_0, 64, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.box0 3x3 64->64");
+    CONV2D (head_tmp, YOLO_S8H, YOLO_S8W,  64,  wb_p3_1, 64, 3, 1, 1, true, scratch);      HP_MARK("  P3.box1 3x3 64->64");
+    CONV1X1(scratch,  YOLO_S8H, YOLO_S8W,  64,  wb_p3_2, 64, false,       head_box);       HP_MARK("  P3.box2 1x1 64->64");
+    CONV2D (save_P3,  YOLO_S8H, YOLO_S8W,  64,  wc_p3_0, 80, 3, 1, 1, true, head_tmp);     HP_MARK("  P3.cls0 3x3 64->80");
+    CONV2D (head_tmp, YOLO_S8H, YOLO_S8W,  80,  wc_p3_1, 80, 3, 1, 1, true, scratch);      HP_MARK("  P3.cls1 3x3 80->80");
+    CONV1X1(scratch,  YOLO_S8H, YOLO_S8W,  80,  wc_p3_2, 80, false,       head_cls);       HP_MARK("  P3.cls2 1x1 80->80");
+    LOG_ABSMAX("P3_BOX", head_box, 64 * YOLO_S8H * YOLO_S8W, wb_p3_2);
+    LOG_ABSMAX("P3_CLS", head_cls, 80 * YOLO_S8H * YOLO_S8W, wc_p3_2);
+    DECODE_HEAD(head_box, head_cls, YOLO_S8H, YOLO_S8W, 8, wb_p3_2, wc_p3_2);               prof_mark("P3 head 6 conv + decode @S8");
     #undef HP_MARK
 
     t_nms = get_timer_count();
@@ -1360,13 +1367,21 @@ void run_yolo_complete() {
         draw_tensor_image_fullscreen(input_img);
     }
 
-    /* Bbox scale: YOLO_IN²-space → CAM_DISP square at (CAM_DISP_XOFF, CAM_DISP_YOFF). */
-    const float disp_scale  = g_use_camera ? (CAM_DISP_W / (float)YOLO_IN) : (640.0f / (float)YOLO_IN);
-    const float disp_scaleY = g_use_camera ? (CAM_DISP_H / (float)YOLO_IN) : (480.0f / (float)YOLO_IN);
-    const int   disp_xoff   = g_use_camera ? CAM_DISP_XOFF : 0;
-    const int   disp_yoff   = g_use_camera ? CAM_DISP_YOFF : 0;
-    const int   disp_right  = disp_xoff + (g_use_camera ? CAM_DISP_W : 640);
-    const int   disp_bottom = disp_yoff + (g_use_camera ? CAM_DISP_H : 480);
+    /* Bbox scale: box coords are in YOLO_W×YOLO_H space, content letterboxed
+     * to rows [YOLO_LETTERBOX_TOP, +YOLO_CONTENT_H). V192:
+     *  - camera: camera_render_fullres() paints the full sensor to 640×360 at
+     *    FB y-offset 60 (camera_debayer DISP_*). Model 320×180 content ↔ that
+     *    640×360 → ×2 both axes; y-origin 60 − TOP·2.
+     *  - test image: draw_tensor_image_fullscreen stretches the whole tensor
+     *    (incl. the black bars) to 640×480. */
+    const float disp_scale  = g_use_camera ? (640.0f / (float)YOLO_W)
+                                           : (640.0f / (float)YOLO_W);
+    const float disp_scaleY = g_use_camera ? (360.0f / (float)YOLO_CONTENT_H)
+                                           : (480.0f / (float)YOLO_H);
+    const int   disp_xoff   = 0;
+    const int   disp_yoff   = g_use_camera ? (60 - (int)(YOLO_LETTERBOX_TOP * (360.0f / YOLO_CONTENT_H))) : 0;
+    const int   disp_right  = disp_xoff + 640;
+    const int   disp_bottom = disp_yoff + (g_use_camera ? (60 + 360) : 480);
 
     int valid_boxes = 0;
     static const uint32_t bbox_palette[6] = {

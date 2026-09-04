@@ -265,7 +265,17 @@ projects ~13–15 fps after INT8 + frame-skip.
         through. Added P8 to `conv2d_partial` (4-ch) too — L2's bottleneck 3×3
         had none. **HW 664 → 541 ms (−18 %)**: P3-head 3×3 141→105, L2 bot 3×3
         32→14, L4 42→33. Bit-exact. Session V189→V191: **799 → 541 ms (−32 %)**.
-  - [ ] **Head conv3×3 (105 ms), the biggest item** — 4 × (64→64 @S8), ~3.5×
+  - [x] **V192 — full sensor FoV, non-square input.** The debayer cropped the
+        central 864×864 of the 1536×864 sensor (56 % of the width — a "zoom"
+        + lateral blindness). Now the whole sensor → a 320×192 tensor
+        (`YOLO_W`/`YOLO_H` in `bsp.h`, both /32; isotropic resize + 6-px
+        letterbox). YOLOv8n is fully conv → **same weights**; the decode
+        already takes grid h/w apart. 61 440 px < 65 536, so **HW 541 → 491 ms**
+        and the whole scene is visible. Session V189→V192: **799 → 491 ms
+        (−39 %)**. Tradeoff: objects are smaller in-frame → lower conf (the
+        golden clock 83 % → 56 %); mitigated later by a model A/B on the same
+        captured frame (v5n@320, v11n).
+  - [ ] **Head conv3×3 (~95 ms), the biggest item** — 4 × (64→64 @S8), ~3.5×
         the A53 f32 floor after P8 (same "near the instruction-mix limit"
         verdict as D2M). Winograd F(2×2,3×3) (~1.8×, real precision risk with
         the 1/2 scalings — verify vs a looser [ABS] tol) or cut the DFL head

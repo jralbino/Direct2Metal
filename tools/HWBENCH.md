@@ -80,9 +80,8 @@ script. `--no-golden` skips the diff.
 they converge over the first couple of frames on a static image — always compare
 the last frame, never frame 1.
 
-**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`: since
-V189 **a real camera frame** captured with `make capture` — wall clock, **`[(74, 83)]`**;
-V184's `bus.jpg` at 256² gave 3× person + bus `[(0,71),(0,77),(0,88),(5,85)]`) and
+**Golden — two sets in `hwbench.py`:** `GOLDEN` (detections as `(class, conf%)`: a real camera frame captured with `make capture`; V192 (full-FoV 320×192) → **`[(74, 56)]`**
+(clock small in the wide view — the fingerprint is the strong check)) and
 `GOLDEN_ABS` (a per-checkpoint numeric fingerprint): the `SERIAL_BOOT` build re-purposes
 the existing `LOG_ABSMAX` checkpoints (L0, L1, L7, every C2f output, P3/P5 box+cls) to
 print `[ABS] <tag> amax1e3=<max|x|×1000>`; `hwbench.py` diffs them with `--abs-tol`
@@ -93,7 +92,7 @@ BENCHFLAGS=--print-golden` prints paste-ready literals; or from QEMU):
 > **V184 fix:** until V183 `test_image.bin` was a **320² fossil** (3×320×320 floats) fed to
 > the 256² model — the kernel reads the first 3·N² floats, so the colour planes were
 > misaligned and the graph saw striped garbage → `[DET] none` despite huge class logits.
-> `tools/convert_image.py` now reads `YOLO_IN` from `bsp/bsp.h` (needs only Pillow +
+> `tools/convert_image.py` now reads `YOLO_W`/`YOLO_H` from `bsp/bsp.h` (needs only Pillow +
 > numpy; the `tools/env` venv has 0-byte interpreters and is unusable). Regenerating the
 > tensor is what made detections appear — nothing in the graph changed.
 ```
@@ -105,9 +104,8 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8_serial.img \
 `[SIM]` camera oracle is NOT active — `SERIAL_BOOT` is a plain HW build, so this
 is also the cleanest way to run the fp32 graph on `test_image` without the camera.
 
-**Absolute timing note:** `build/config.serial.txt` runs the low-power clock profile
-(`arm_freq=600`, `core_freq=250`, `sdram_freq=400`), same as `build/config.txt`.
-Good for A/B of perf changes; not comparable to numbers taken at other clocks.
+**Absolute timing note:** `build/config.serial.txt` runs stock clocks (`arm_freq=1000`,
+V187), in sync with `build/config.txt`. Numbers in this file before V187 are at 600 MHz.
 
 **First verified run (V183, 2026-09-03):** upload 80 KB in 7 s, 4 frames, `fingerprint:
 PASS (16 checkpoints within ±1)`, **TOTAL 1276 ms** (`[P] cap=1 l0=21 bb=502 neck=289
@@ -116,11 +114,13 @@ ms (−6.1%)** — P3 head 320→260, L4 96→82, L15 119→112, L2 unchanged (i
 16-ch → 4-ch kernel, untouched by P8). Per-layer hot spots: P3 head 260, L2 C2f @S4 154,
 P4 head 121, L15 112, L4 82. Heads = 34% of the frame.
 
-**V191 on HW (2026-09-04):** per-position P8 (8-ch + 4-ch). **TOTAL 541 ms**
-(`[P] cap=1 l0=13 bb=208 neck=109 head=189 render=18`), `detections: [(74,83)]`, fingerprint
-16/16 bit-exact. Per-layer at 1 GHz: **head 3×3 105** (P3 box0/box1/cls0 24.5, cls1 32),
-L4 33, L2 33 (bot 3×3 7.2 each), L12 24, L15 27, L21 19. `make HEAD_PROF=1` breaks down the
-P3 head per conv; `make C2F_PROF=N` any C2f.
+**V192 on HW (2026-09-04):** full sensor FoV, non-square input 320×192 (was 256² central
+crop). **TOTAL 491 ms** — 61 440 px vs 65 536, so slightly *faster* than V191's 541. Same
+YOLOv8n weights (fully conv). `test_image` recaptured from the camera at the new geometry
+(`d2m_data.bin` 13 345 344 B, md5 `01d902a0…` — recopy to SD). `make HEAD_PROF=1` breaks
+down the P3 head per conv; `make C2F_PROF=N` any C2f.
+
+**V191:** per-position P8 (8-ch + 4-ch), TOTAL 541 ms (`bb=208 neck=109 head=189`); bit-exact.
 
 **V190:** conv1x1 input transpose (L1-set-thrash fix), TOTAL 664 ms; L2's cv2 1×1 55 → 7.8.
 

@@ -43,22 +43,20 @@ except ImportError:
 # Regenerate both whenever the model / exporter / test image changes.
 #
 # Detections as (class, conf%) — the [DET] line carries no position.
-# V189 (2026-09-04): test_image.bin is a REAL IMX708 frame captured with
-# `make capture` (frame 90, AE highlight-protected + AWB, scene = wall clock),
-# so this is class 74 "clock". History: V184 used bus.jpg at 256²
-# (3× person + bus = [(0,71),(0,77),(0,88),(5,85)]); V169..V183 shipped a 320²
-# fossil that gave `[DET] none`.
-GOLDEN = [(74, 83)]
+# V192 (2026-09-04): full-FoV non-square input (320×192, isotropic + 6-px
+# letterbox). test_image.bin = a real camera frame recaptured at the new
+# geometry (wall clock, now a small part of the full field of view → conf 56 %,
+# borderline; the [ABS] fingerprint below is the load-bearing check).
+#   V189: same clock at 256² central crop = [(74, 83)].
+GOLDEN = [(74, 56)]
 # Per-checkpoint max|activation| x 1000 (int), from the [ABS] lines. Compared with
 # --abs-tol (default 1 = one thousandth) to absorb the x1000 rounding.
-# V189, real HW (Pi Zero 2 W @ 1 GHz), kernel8_serial.img + d2m_data.bin
-# (weights.bin CRC 0x176A3D5A, WEIGHTS_SIZE 12608056; test_image.bin 786432 B =
-# captured camera frame, blob md5 ca135c74…). Taken with --print-golden on frame 4;
-# fp32 is deterministic so QEMU gives the same values.
+# V192, QEMU raspi3b, kernel8_serial.img + d2m_data.bin (test_image.bin 737280 B
+# = camera frame [3][192][320], blob md5 01d902a0…). fp32 deterministic → HW matches.
 GOLDEN_ABS = {
-    "L0": 36703, "L1": 66787, "L2": 7109, "L4": 5509, "L6": 8372, "L7": 4013,
-    "L8": 4468, "SPPF": 3900, "L12": 3822, "L15": 6076, "L18": 7867, "L21": 6295,
-    "P5_BOX": 11241, "P5_CLS": 18614, "P3_BOX": 20600, "P3_CLS": 25319,
+    "L0": 34956, "L1": 63138, "L2": 8151, "L4": 5437, "L6": 3490, "L7": 3444,
+    "L8": 3519, "SPPF": 3952, "L12": 4681, "L15": 4443, "L18": 5598, "L21": 4834,
+    "P5_BOX": 13173, "P5_CLS": 19307, "P3_BOX": 20041, "P3_CLS": 23863,
 }
 
 # HW line is "[DET] id=<track> c=<cls> %=<conf>[ miss=<n>]" (tracker output);
@@ -136,7 +134,8 @@ def capture(ser, frames, timeout, logfile):
     return text
 
 
-CAP_BEGIN_RE = re.compile(r"\[CAP\] begin len=(\d+) crc=([0-9a-fA-F]{8})(?: n=(\d+))?")
+CAP_BEGIN_RE = re.compile(r"\[CAP\] begin len=(\d+) crc=([0-9a-fA-F]{8})"
+                          r"(?: n=(\d+))?(?: w=(\d+) h=(\d+))?")
 
 
 def extract_capture(text, out_path):
@@ -164,8 +163,8 @@ def extract_capture(text, out_path):
     ok = len(raw) == want_len and got_crc == want_crc
     with open(out_path, "wb") as f:
         f.write(raw)
-    n = m.group(3) or "?"
-    print(f"capture: {len(raw)} bytes -> {out_path}  (expected {want_len}, n={n})  "
+    dims = f"{m.group(4)}x{m.group(5)}" if m.group(4) else (f"{m.group(3)}²" if m.group(3) else "?")
+    print(f"capture: {len(raw)} bytes -> {out_path}  (expected {want_len}, {dims})  "
           f"crc {'OK' if got_crc == want_crc else f'MISMATCH kernel={want_crc:08x} host={got_crc:08x}'}")
     # Strip the block so frame parsing / the log stay readable.
     text = text[:m.start()] + "[CAP] (block extracted)\n" + text[end + len("[CAP] end"):]

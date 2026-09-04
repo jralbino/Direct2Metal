@@ -1,7 +1,7 @@
 /* RAW10 BGGR debayer + libcamera ISP (BLC/WB/CCM/gamma) for IMX708 binned
  * 1536x864 mode. Two consumers:
- *   - debayer_raw10_to_chw_yolo: 864×864 center crop → YOLO_IN² CHW float32
- *     (YOLO input). YOLO_IN comes from bsp.h.
+ *   - debayer_raw10_to_chw_yolo: full 1536×864 FoV → [3][YOLO_H][YOLO_W] CHW f32,
+ *     isotropic resize + letterbox. YOLO_W/H come from bsp.h.
  *   - debayer_raw10_to_fb:       full 1536×864 frame → 640×360 letterboxed
  *     in the 640×480 framebuffer (display).
  * Both use the same per-pixel pipeline so YOLO and the user see identical
@@ -113,14 +113,15 @@ static inline void isp_pixel(uint8_t Rin, uint8_t Gin, uint8_t Bin,
 #define SENSOR_BLK_W  (SENSOR_PX_W / 2)   /* 768 Bayer blocks horizontally   */
 #define SENSOR_BLK_H  (SENSOR_PX_H / 2)   /* 432 Bayer blocks vertically     */
 
-/* ── YOLO path: 864×864 center crop → YOLO_IN² ─────────────────────────── */
-/* YOLO_IN is exported by bsp.h so the model and the debayer share one
- * source of truth. STEP_Q8 = (CROP_SZ << 8) / YOLO_IN. */
-#define OUT_W    YOLO_IN
-#define OUT_H    YOLO_IN
-#define CROP_X   336                      /* (1536 - 864) / 2                */
-#define CROP_SZ  864
-#define STEP_Q8  ((CROP_SZ << 8) / YOLO_IN)
+/* ── YOLO path: V192 full-FoV, isotropic resize + letterbox ────────────────
+ * The whole 1536×864 sensor → YOLO_CONTENT_H rows of the YOLO_H tensor,
+ * centred (YOLO_LETTERBOX_TOP black rows top+bottom). Isotropic:
+ * 1536/YOLO_W == 864/YOLO_CONTENT_H by construction (bsp.h). */
+#define OUT_W       YOLO_W
+#define OUT_H       YOLO_H
+#define LB_TOP      YOLO_LETTERBOX_TOP
+#define CONTENT_H   YOLO_CONTENT_H
+#define STEP_Q8     ((1536 << 8) / YOLO_W)   /* == (864<<8)/CONTENT_H */
 
 /* ── Framebuffer path: full 1536×864 → 640×360 letterboxed on 640×480 ──── */
 /* V135: native aspect 1536:864 = 16:9. At 640 wide: 640 × (864/1536) = 360.
@@ -186,7 +187,7 @@ void debayer_awb_update(const uint8_t* raw) {
 #endif
 }
 
-/* ── YOLO input: debayer 864×864 center crop → YOLO_IN² CHW float32 ──────
+/* ── YOLO input: full-FoV debayer → [3][YOLO_H][YOLO_W] CHW f32, letterboxed
  *
  * V162 port: full libcamera-style ISP applied so the model sees the same
  * R/G/B distribution it was trained on.
@@ -208,10 +209,22 @@ void debayer_raw10_to_chw_yolo(float* dst) {
     float* g_plane = dst + OUT_H * OUT_W;
     float* b_plane = dst + 2 * OUT_H * OUT_W;
 
-    for (int oy = 0; oy < OUT_H; oy++) {
-        int src_y = ((oy * STEP_Q8) >> 8);
+    /* Letterbox bands — clear once (the loop below never touches them). */
+    for (int oy = 0; oy < LB_TOP; oy++)
+        for (int c = 0; c < 3; c++) {
+            float* row = dst + (long)c * OUT_H * OUT_W + (long)oy * OUT_W;
+            for (int ox = 0; ox < OUT_W; ox++) row[ox] = 0.0f;
+        }
+    for (int oy = LB_TOP + CONTENT_H; oy < OUT_H; oy++)
+        for (int c = 0; c < 3; c++) {
+            float* row = dst + (long)c * OUT_H * OUT_W + (long)oy * OUT_W;
+            for (int ox = 0; ox < OUT_W; ox++) row[ox] = 0.0f;
+        }
+
+    for (int oy = LB_TOP; oy < LB_TOP + CONTENT_H; oy++) {
+        int src_y = (((oy - LB_TOP) * STEP_Q8) >> 8);
         src_y &= ~1;
-        if (src_y + 1 >= CROP_SZ) src_y = CROP_SZ - 2;
+        if (src_y + 1 >= 864) src_y = 862;
 
         const uint8_t* row0 = frame + src_y       * byte_stride;
         const uint8_t* row1 = frame + (src_y + 1) * byte_stride;
@@ -221,8 +234,9 @@ void debayer_raw10_to_chw_yolo(float* dst) {
         float* b_row = b_plane + oy * OUT_W;
 
         for (int ox = 0; ox < OUT_W; ox++) {
-            int src_x = ((ox * STEP_Q8) >> 8) + CROP_X;
+            int src_x = ((ox * STEP_Q8) >> 8);
             src_x &= ~1;
+            if (src_x + 1 >= 1536) src_x = 1534;
 
             /* BGGR (post-flip): row0=B/Gb row1=Gr/R. */
             uint8_t B  = raw10_msb8(row0, src_x);

@@ -3,8 +3,9 @@
 capture_to_test_image.py — turn a captured camera tensor into test_image.bin (V185).
 
 Input: the raw file written by `make capture` (tools/hwbench.py --capture), i.e.
-cam_frame exactly as the model consumed it: [3][YOLO_IN][YOLO_IN] float32, RGB
-plane order, values in [0, 1], after debayer + ISP + AE.
+cam_frame exactly as the model consumed it: [3][YOLO_H][YOLO_W] float32, RGB
+plane order, values in [0, 1], after debayer + ISP + AE (V192: non-square, the
+top/bottom YOLO_LETTERBOX_TOP rows are black bars).
 
     python3 tools/capture_to_test_image.py cam_frame.bin --preview cam_frame.png
     python3 tools/capture_to_test_image.py cam_frame.bin --no-install   # just inspect
@@ -25,32 +26,36 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def yolo_in_from_bsp():
-    with open(os.path.join(ROOT, "bsp", "bsp.h")) as f:
-        m = re.search(r"^\s*#define\s+YOLO_IN\s+(\d+)", f.read(), re.M)
-    return int(m.group(1)) if m else None
+def wh_from_bsp():
+    txt = open(os.path.join(ROOT, "bsp", "bsp.h")).read()
+    mw = re.search(r"^\s*#define\s+YOLO_W\s+(\d+)", txt, re.M)
+    mh = re.search(r"^\s*#define\s+YOLO_H\s+(\d+)", txt, re.M)
+    if mw and mh:
+        return int(mw.group(1)), int(mh.group(1))
+    m = re.search(r"^\s*#define\s+YOLO_IN\s+(\d+)", txt, re.M)
+    return (int(m.group(1)), int(m.group(1))) if m else (None, None)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("raw", nargs="?", default="cam_frame.bin", help="captured tensor (default cam_frame.bin)")
     ap.add_argument("--app", default="yolo_v8n_coco")
-    ap.add_argument("--size", type=int, help="N (default: YOLO_IN from bsp/bsp.h)")
+    ap.add_argument("--wh", type=int, nargs=2, metavar=("W", "H"), help="default: from bsp/bsp.h")
     ap.add_argument("--preview", metavar="PNG", help="also write an RGB preview image")
     ap.add_argument("--no-install", action="store_true", help="inspect only; do not overwrite test_image.bin")
     args = ap.parse_args()
 
-    n = args.size or yolo_in_from_bsp()
-    if not n:
-        sys.exit("cannot determine YOLO_IN; pass --size")
-    want = 4 * 3 * n * n
+    w, h = tuple(args.wh) if args.wh else wh_from_bsp()
+    if not w:
+        sys.exit("cannot determine YOLO_W/YOLO_H; pass --wh")
+    want = 4 * 3 * w * h
     data = open(args.raw, "rb").read()
     if len(data) != want:
-        sys.exit(f"{args.raw}: {len(data)} bytes, expected {want} (= 4*3*{n}*{n}); wrong N or truncated dump")
+        sys.exit(f"{args.raw}: {len(data)} bytes, expected {want} (= 4*3*{w}*{h}); wrong size or truncated dump")
 
-    t = np.frombuffer(data, dtype="<f4").reshape(3, n, n)
+    t = np.frombuffer(data, dtype="<f4").reshape(3, h, w)
     lo, hi, mean = float(t.min()), float(t.max()), float(t.mean())
-    print(f"tensor   [3][{n}][{n}] float32, range [{lo:.3f}, {hi:.3f}], mean {mean:.3f}")
+    print(f"tensor   [3][{h}][{w}] float32, range [{lo:.3f}, {hi:.3f}], mean {mean:.3f}")
     for c, name in enumerate("RGB"):
         print(f"  {name}: mean {t[c].mean():.3f}  std {t[c].std():.3f}")
     if not (0.0 <= lo and hi <= 1.0001):
