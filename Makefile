@@ -34,8 +34,15 @@ endif
 FRAME_SKIP_N ?= 1
 SKIP_DEF = -DYOLO_INFER_EVERY_N=$(FRAME_SKIP_N)
 
+# V181: `make DEBUG=1` enables the camera thumbnail in the canvas + the
+# thumbnail repaint inside display_pump. Default 0 hides the thumbnail —
+# the canvas shows only bboxes + IDs over solid black. HUD chrome animates
+# in both modes.
+DEBUG ?= 0
+DEBUG_DEF = -DDEBUG=$(DEBUG)
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)

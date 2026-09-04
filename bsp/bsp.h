@@ -84,8 +84,16 @@ bool bsp_frame_acquire();
 
 /* Pointer to the most recently completed Unicam RAW10 frame
  * (FRAME_W × FRAME_H, packed RAW10, ~1.6 MB). Valid until the next
- * bsp_frame_acquire(). Returns nullptr before the first frame completes. */
+ * bsp_frame_acquire() OR bsp_frame_try_advance() returns true. Returns
+ * nullptr before the first frame completes. */
 const uint8_t* unicam_frame_ptr();
+
+/* V180: non-blocking ping-pong advance. One MMIO read per call when no
+ * FSI is pending. Returns true when a fresh frame has just been latched
+ * into the completed buffer (caller can repaint from unicam_frame_ptr()).
+ * Does NOT run AE — the outer acquire path owns that. Sim build returns
+ * false (sync 4-core path is used in sim). */
+bool bsp_frame_try_advance();
 
 /* ── YOLO input geometry ─────────────────────────────────────────────────
  * Single source of truth for the YOLO input side. The BSP debayer reads

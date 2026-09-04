@@ -266,6 +266,33 @@ extern "C" void secondary_main() {
             ops_neon_conv1x1_kernel((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
                                     (const float*)parallel_task.w1x1, (const float*)parallel_task.bias, start, end,
                                     parallel_task.C_out, parallel_task.do_silu, (float*)parallel_task.out);
+        } else if (type == TASK_CONV2D_ASYNC) {
+            /* Cores 1-3 each take 1/3 of n_grp. Core 0 is busy with the
+             * display loop. slice_idx = core_id - 1 ∈ {0, 1, 2}. */
+            int C_out_w = parallel_task.C_out;
+            int grp_w   = (C_out_w >= 32 && (C_out_w & 7) == 0) ? 8 : 4;
+            int slice   = parallel_task.n_grp / 3;
+            int idx     = core_id - 1;
+            int grp_start = idx * slice;
+            int grp_end   = (idx == 2) ? parallel_task.n_grp : (grp_start + slice);
+            if (grp_w == 8)
+                conv2d_partial_8ch((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
+                                   (const float*)parallel_task.w_rep, (const float*)parallel_task.bias, parallel_task.K,
+                                   parallel_task.stride, parallel_task.pad, parallel_task.do_silu,
+                                   (float*)parallel_task.out, grp_start, grp_end);
+            else
+                conv2d_partial((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
+                               (const float*)parallel_task.w_rep, (const float*)parallel_task.bias, parallel_task.K,
+                               parallel_task.stride, parallel_task.pad, parallel_task.do_silu,
+                               (float*)parallel_task.out, grp_start, grp_end);
+        } else if (type == TASK_CONV1X1_ASYNC) {
+            int chunk = parallel_task.C_out / 3;
+            int idx   = core_id - 1;
+            int start = idx * chunk;
+            int end   = (idx == 2) ? parallel_task.C_out : (start + chunk);
+            ops_neon_conv1x1_kernel((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
+                                    (const float*)parallel_task.w1x1, (const float*)parallel_task.bias, start, end,
+                                    parallel_task.C_out, parallel_task.do_silu, (float*)parallel_task.out);
         }
         __atomic_fetch_add((int*)&done_count, 1, __ATOMIC_RELEASE); asm volatile("sev");
     }
@@ -319,6 +346,69 @@ void parallel_conv2d(const float* in, int H_in, int W_in, int C_in, const float*
     int slice = n_grp / 4;
     if (grp_w == 8) conv2d_partial_8ch(in, H_in, W_in, C_in, w_rep, bias, K, stride, pad, do_silu, out, 0, slice);
     else            conv2d_partial(in, H_in, W_in, C_in, w_rep, bias, K, stride, pad, do_silu, out, 0, slice);
+    wait_for_workers();
+}
+
+/* ── B4 async dispatch ────────────────────────────────────────────────────
+ * Same task fields, different worker code path: cores 1-3 each grab 1/3
+ * of the work, core 0 returns from start() with no slice to do. The
+ * caller polls parallel_async_done() and runs display work in the gap. */
+
+static void dispatch_task_async() {
+    check_stack_canary(0); check_stack_canary(1); check_stack_canary(2); check_stack_canary(3);
+    __atomic_store_n((int*)&done_count, 0, __ATOMIC_RELAXED);
+    asm volatile("dsb ish" : : : "memory");
+    __atomic_fetch_add((int*)&task_epoch, 1, __ATOMIC_RELEASE);
+    asm volatile("sev");
+}
+
+void parallel_conv2d_async_start(const float* in, int H_in, int W_in, int C_in,
+                                 const float* w_rep, const float* bias, int C_out, int K,
+                                 int stride, int pad, bool do_silu, float* out) {
+    int grp_w = (C_out >= 32 && (C_out & 7) == 0) ? 8 : 4;
+    int n_grp = C_out / grp_w;
+    probe_multicore();
+    if (!multicore_available) {
+        if (grp_w == 8) conv2d_partial_8ch(in, H_in, W_in, C_in, w_rep, bias, K, stride, pad, do_silu, out, 0, n_grp);
+        else            conv2d_partial(in, H_in, W_in, C_in, w_rep, bias, K, stride, pad, do_silu, out, 0, n_grp);
+        /* Single-core fallback: result is ready immediately. Mark done so
+         * parallel_async_done() returns true on the first poll. */
+        __atomic_store_n((int*)&done_count, 3, __ATOMIC_RELEASE);
+        return;
+    }
+    parallel_task.type = TASK_CONV2D_ASYNC; parallel_task.in = in;
+    parallel_task.H = H_in; parallel_task.W = W_in;
+    parallel_task.C_in = C_in; parallel_task.C_out = C_out;
+    parallel_task.w_rep = w_rep; parallel_task.bias = bias;
+    parallel_task.K = K; parallel_task.stride = stride; parallel_task.pad = pad;
+    parallel_task.do_silu = do_silu;
+    parallel_task.out = out; parallel_task.n_grp = n_grp;
+    dispatch_task_async();
+}
+
+void parallel_conv1x1_async_start(const float* in, int H, int W, int C_in,
+                                  const float* w, const float* b, int C_out,
+                                  bool do_silu, float* out) {
+    probe_multicore();
+    if (!multicore_available) {
+        ops_neon_conv1x1_kernel(in, H, W, C_in, w, b, 0, C_out, C_out, do_silu, out);
+        __atomic_store_n((int*)&done_count, 3, __ATOMIC_RELEASE);
+        return;
+    }
+    parallel_task.type = TASK_CONV1X1_ASYNC; parallel_task.in = in;
+    parallel_task.H = H; parallel_task.W = W;
+    parallel_task.C_in = C_in; parallel_task.C_out = C_out;
+    parallel_task.w1x1 = w; parallel_task.bias = b;
+    parallel_task.do_silu = do_silu; parallel_task.out = out;
+    dispatch_task_async();
+}
+
+bool parallel_async_done() {
+    return __atomic_load_n((int*)&done_count, __ATOMIC_ACQUIRE) >= 3;
+}
+
+void parallel_async_wait() {
+    if (!multicore_available) return;
     wait_for_workers();
 }
 

@@ -419,6 +419,149 @@ static inline void fp32_residual_add_neon(float* x_out, const float* x_in, int n
     for (; k < n; k++) x_out[k] += x_in[k];
 }
 
+/* Forward decls — predictions + frame counter live further down the file
+ * but display_pump (below) reads them while iterating. Their bodies stay
+ * in their original locations so the model code reads top-to-bottom. */
+struct Box { float x, y, w, h, conf; int cls; };
+static Box preds[MAX_PREDS];
+static int num_preds = 0;
+static int global_frame_counter = 1;
+
+/* V181 tracker storage — Track struct + tracks[] live here so display_pump
+ * (HUD card collection) can see them. update_tracker() body is further down
+ * with the rest of the post-NMS code; it needs calculate_iou which is
+ * declared after this block.
+ *
+ * V182: added linear velocity prediction. Each track remembers its last
+ * inter-inference displacement (vx, vy). On the next round, the predicted
+ * bbox = current + (vx, vy); matching uses IoU against the predicted box
+ * rather than the stale one. Robust to a walking subject at V180's ~1 fps
+ * inference cadence (a person can easily traverse > 30 % bbox width in
+ * one second, defeating a plain IoU tracker). On miss frames the bbox is
+ * advanced by velocity too, so the rendered bbox glides while inference
+ * catches up. Velocity is clamped to TRACK_V_MAX per axis to prevent a
+ * runaway after a bad observation. */
+#define MAX_TRACKS         16
+#define TRACK_IOU_MATCH    0.30f
+#define TRACK_MAX_MISSED   5
+#define TRACK_V_MAX        64.0f   /* YOLO_IN / 4 */
+struct Track {
+    int   id;              /* 0 = free slot */
+    Box   box;             /* cls + conf + x/y/w/h in YOLO_IN² space */
+    float vx, vy;          /* per-inference velocity */
+    int   frames_missed;
+    bool  has_velocity;    /* false until first successful re-match */
+};
+static Track tracks[MAX_TRACKS];
+static int   next_track_id = 1;
+static void  update_tracker();
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * V180 — Async inference + display pump. Default FP32 build only.
+ *
+ * Cores 1-3 run the conv (3-way split, n_grp/3 per worker) while core 0
+ * services the camera + thumbnail + HUD. Each conv dispatch is wrapped
+ * by `parallel_conv2d_with_pump` which kicks the workers and then loops:
+ *   while (!done) display_pump();
+ *
+ * `display_pump` consumes one camera frame (bsp_frame_acquire waits the
+ * next FSI + runs AE), redraws the thumbnail + HUD, flushes the FB.
+ * Cost: ~30-40 ms per pump (FSI wait dominates). Cores 1-3's per-conv
+ * work ranges from <1 ms to ~50 ms; pumps may overshoot the conv's
+ * completion (poll returns ready mid-pump and the next loop iteration
+ * just exits). Inference wall-clock grows ~33 % vs the 4-core sync
+ * path (3 workers instead of 4); in exchange the display refreshes
+ * continuously instead of freezing for ~720 ms per inference.
+ * ────────────────────────────────────────────────────────────────────── */
+
+#if !defined(USE_INT8_W8A8) && !defined(USE_INT8_WEIGHTS)
+extern void debayer_raw10_to_thumbnail(const uint8_t* raw, uint8_t* fb,
+                                       uint32_t pitch, int x_off, int y_off,
+                                       int thumb_w, int thumb_h);
+
+static void display_pump() {
+    /* Drive the Unicam ping-pong state machine non-blockingly. When a
+     * fresh frame just landed, refresh the on-screen chrome; otherwise
+     * we just advanced one state (~one MMIO read) and return so the
+     * conv-done check stays tight. AE is intentionally NOT run here —
+     * the outer bsp_frame_acquire (once per inference) owns AE. */
+    if (!g_use_camera) return;
+    if (!bsp_frame_try_advance()) return;
+
+#if DEBUG
+    /* Debug build only: repaint camera thumbnail with the fresh frame. */
+    const uint8_t* now = unicam_frame_ptr();
+    if (now != NULL) {
+        const int THUMB_W = 128, THUMB_H = 72;
+        const int THUMB_X = 640 - THUMB_W - 8;
+        const int THUMB_Y = 64;
+        debayer_raw10_to_thumbnail(now, (uint8_t*)lfb, pitch,
+                                   THUMB_X, THUMB_Y, THUMB_W, THUMB_H);
+    }
+#endif
+
+    /* Refresh HUD chrome — fps/CIT gauge animates while inference runs.
+     * Cards come from active tracks so they stay consistent with bboxes
+     * even though preds[] gets overwritten between inferences.
+     * duration_ms=0 keeps the gauge bar at zero during pumps; the outer
+     * frame's [T] update at end-of-inference refills it. */
+    HudPred hud_preds[3]; int hud_n = 0;
+    float   hud_conf[3];
+    for (int ti = 0; ti < MAX_TRACKS; ti++) {
+        if (tracks[ti].id == 0) continue;
+        const Box& b = tracks[ti].box;
+        if (b.conf <= CONF_THRESH) continue;
+        int slot = hud_n;
+        if (hud_n < 3) hud_n++;
+        else if (b.conf > hud_conf[2]) slot = 2;
+        else continue;
+        while (slot > 0 && b.conf > hud_conf[slot-1]) {
+            hud_conf[slot]  = hud_conf[slot-1];
+            hud_preds[slot] = hud_preds[slot-1];
+            slot--;
+        }
+        hud_conf[slot]       = b.conf;
+        hud_preds[slot].cls  = b.cls;
+        hud_preds[slot].conf = b.conf;
+    }
+    hud_update_state(hud_preds, hud_n, global_frame_counter,
+                     0, (int)imx708_ae_cit_get());
+    hud_render((uint8_t*)lfb, pitch);
+    video_flush();
+}
+
+/* Async wait body — used by both conv2d and conv1x1 wrappers. Spin pumping
+ * the display while workers run. The wfe between pumps puts core 0 to
+ * sleep until the workers' sev when they increment done_count — under
+ * QEMU this is essential (yield alone doesn't reschedule cores aggressively
+ * enough and core 0 starves the workers). On real HW wfe is also cheaper
+ * than tight spinning. */
+static inline void async_wait_with_pump() {
+    while (!parallel_async_done()) {
+        display_pump();
+        if (parallel_async_done()) break;
+        asm volatile("wfe");
+    }
+    parallel_async_wait();
+}
+
+static inline void parallel_conv2d_with_pump(const float* in, int H, int W, int C_in,
+                                             const float* w_rep, const float* bias,
+                                             int C_out, int K, int stride, int pad,
+                                             bool do_silu, float* out) {
+    parallel_conv2d_async_start(in, H, W, C_in, w_rep, bias, C_out, K, stride, pad, do_silu, out);
+    async_wait_with_pump();
+}
+
+static inline void parallel_conv1x1_with_pump(const float* in, int H, int W, int C_in,
+                                              const float* w, const float* b, int C_out,
+                                              bool do_silu, float* out) {
+    parallel_conv1x1_async_start(in, H, W, C_in, w, b, C_out, do_silu, out);
+    async_wait_with_pump();
+}
+#endif  /* !USE_INT8_W8A8 && !USE_INT8_WEIGHTS */
+
+
 /* ──────────────────────────────────────────────────────────────────────────
  * Unified layer handle + dispatch macros that select the model precision
  * at compile time. Three modes:
@@ -507,10 +650,23 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
 #define WS_TYPE       WeightStream
 #define WS_INIT(name) WeightStream name(weights_start)
 #define LAYER_LOAD(ws, nw, nb, tag) fp32_layer_load((ws), (nw), (nb), (tag))
+/* V180: FP32 path uses async dispatch + display pump on HW so core 0 keeps
+ * the camera + HUD alive while cores 1-3 grind the conv. ~33% more
+ * wall-clock inference vs sync 4-core, but no display freeze. Gated on
+ * !SIMULATION because QEMU time-shares the 4 emulated cores on one host
+ * CPU — core 0 spinning + pumping starves the workers and one frame
+ * stretches to 80 s. Sim builds stay on the sync 4-core path. */
+#ifdef SIMULATION
 #define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
     parallel_conv2d((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
     parallel_conv1x1((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
+#else
+#define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
+    parallel_conv2d_with_pump((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
+#define CONV1X1(in, H, W, ci, L, co, silu, out) \
+    parallel_conv1x1_with_pump((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
+#endif
 #define COPY_TENSOR(src, dst, n)               copy_tensor((src), (dst), (n))
 #define CONCAT_TENSOR(s1, c1, s2, c2, dst, hw) concat_tensor((s1), (c1), (s2), (c2), (dst), (hw))
 #define UPSAMPLE2X(in, out, H, W, C)           upsample2x_nearest((in), (out), (H), (W), (C))
@@ -522,9 +678,6 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
 
 #endif
 
-struct Box { float x, y, w, h, conf; int cls; };
-static Box preds[MAX_PREDS]; static int num_preds = 0;
-
 static float calculate_iou(const Box& a, const Box& b) {
     float x1_int = (a.x - a.w/2) > (b.x - b.w/2) ? (a.x - a.w/2) : (b.x - b.w/2);
     float y1_int = (a.y - a.h/2) > (b.y - b.h/2) ? (a.y - a.h/2) : (b.y - b.h/2);
@@ -533,6 +686,95 @@ static float calculate_iou(const Box& a, const Box& b) {
     float w_int = x2_int - x1_int; float h_int = y2_int - y1_int;
     if (w_int <= 0 || h_int <= 0) return 0.0f;
     float area_int = w_int * h_int; return area_int / (a.w * a.h + b.w * b.h - area_int);
+}
+
+/* ── V181: greedy IoU tracker ────────────────────────────────────────────
+ * Assigns a stable integer ID to each detection across inferences. On every
+ * inference (post-NMS):
+ *   1. Each active track greedily binds to the unused pred of the same
+ *      class with highest IoU above TRACK_IOU_MATCH.
+ *   2. Bound preds are consumed; track bbox + conf are refreshed.
+ *   3. Tracks without a match this round get frames_missed++; expired
+ *      after TRACK_MAX_MISSED rounds (~5 inferences ≈ 5 s @ V180 cadence).
+ *   4. Unmatched preds become brand-new tracks with the next free ID.
+ * No persistence filter — every track renders the same frame it's born
+ * (so first appearance has no extra latency). Storage (Track struct +
+ * tracks[]) is declared near the top of this file so display_pump can
+ * iterate it. */
+static void update_tracker() {
+    bool pred_used[MAX_PREDS];
+    for (int i = 0; i < MAX_PREDS; i++) pred_used[i] = false;
+
+    /* 1) Refresh / age existing tracks, matching against the predicted
+     *    bbox rather than the stale one. */
+    for (int t = 0; t < MAX_TRACKS; t++) {
+        if (tracks[t].id == 0) continue;
+
+        /* Linear extrapolation: predicted box = current + last velocity.
+         * First round after spawn (has_velocity == false) just uses the
+         * current box, identical to V181. */
+        Box pred = tracks[t].box;
+        if (tracks[t].has_velocity) {
+            pred.x += tracks[t].vx;
+            pred.y += tracks[t].vy;
+        }
+
+        float best_iou = TRACK_IOU_MATCH;
+        int   best_p   = -1;
+        for (int p = 0; p < num_preds; p++) {
+            if (pred_used[p]) continue;
+            if (preds[p].conf <= CONF_THRESH) continue;
+            if (preds[p].cls != tracks[t].box.cls) continue;
+            float iou = calculate_iou(pred, preds[p]);
+            if (iou > best_iou) { best_iou = iou; best_p = p; }
+        }
+        if (best_p >= 0) {
+            /* New velocity = actual displacement since last observation,
+             * clamped per axis so a single bad observation doesn't send
+             * the predictor off-screen on subsequent rounds. */
+            float nvx = preds[best_p].x - tracks[t].box.x;
+            float nvy = preds[best_p].y - tracks[t].box.y;
+            if (nvx >  TRACK_V_MAX) nvx =  TRACK_V_MAX;
+            if (nvx < -TRACK_V_MAX) nvx = -TRACK_V_MAX;
+            if (nvy >  TRACK_V_MAX) nvy =  TRACK_V_MAX;
+            if (nvy < -TRACK_V_MAX) nvy = -TRACK_V_MAX;
+            tracks[t].vx           = nvx;
+            tracks[t].vy           = nvy;
+            tracks[t].has_velocity = true;
+            tracks[t].box          = preds[best_p];
+            tracks[t].frames_missed = 0;
+            pred_used[best_p]      = true;
+        } else {
+            /* Coast: glide the bbox forward so the rendered overlay stays
+             * with a moving subject while inference catches up, and so
+             * next round's prediction starts from the extrapolated point
+             * instead of the stale anchor. */
+            if (tracks[t].has_velocity) {
+                tracks[t].box.x += tracks[t].vx;
+                tracks[t].box.y += tracks[t].vy;
+            }
+            tracks[t].frames_missed++;
+            if (tracks[t].frames_missed > TRACK_MAX_MISSED) tracks[t].id = 0;
+        }
+    }
+
+    /* 2) Spawn new tracks for unmatched preds. */
+    for (int p = 0; p < num_preds; p++) {
+        if (pred_used[p]) continue;
+        if (preds[p].conf <= CONF_THRESH) continue;
+        for (int t = 0; t < MAX_TRACKS; t++) {
+            if (tracks[t].id == 0) {
+                tracks[t].id            = next_track_id++;
+                if (next_track_id > 9999) next_track_id = 1;
+                tracks[t].box           = preds[p];
+                tracks[t].vx            = 0.0f;
+                tracks[t].vy            = 0.0f;
+                tracks[t].has_velocity  = false;
+                tracks[t].frames_missed = 0;
+                break;
+            }
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -720,8 +962,6 @@ static void draw_tensor_image_fullscreen(const float* img) {
         }
     }
 }
-
-static int global_frame_counter = 1;
 
 void run_yolo_complete() {
     watchdog_kick();
@@ -973,7 +1213,8 @@ void run_yolo_complete() {
             if (calculate_iou(preds[ii], preds[jj]) > NMS_THRESH) preds[jj].conf = 0.0f;
         }
     }
-    }  /* end if (do_inference) — render block below reuses preds[] */
+    update_tracker();
+    }  /* end if (do_inference) — render block below reuses preds[]/tracks[] */
 
     /* V167 layout: dark canvas (no full camera image) + bboxes + class labels.
      * Camera shown as a 192×108 thumbnail in the top-right of the canvas.
@@ -995,7 +1236,8 @@ void run_yolo_complete() {
             uint32_t* row = (uint32_t*)((uint8_t*)lfb + (uint32_t)y * pitch);
             for (int x = 0; x < 640; x++) row[x] = 0xFF000000u;
         }
-        /* Camera thumbnail in the top-right corner of the canvas (smaller). */
+#if DEBUG
+        /* Camera thumbnail in the top-right corner — debug only. */
         const int THUMB_W = 128, THUMB_H = 72;
         const int THUMB_X = 640 - THUMB_W - 8;   /* 504 */
         const int THUMB_Y = 64;
@@ -1003,6 +1245,7 @@ void run_yolo_complete() {
                                    THUMB_X, THUMB_Y, THUMB_W, THUMB_H);
         draw_rect(THUMB_X - 1, THUMB_Y - 1, THUMB_W + 2, THUMB_H + 2,
                   0xFF00C0FFu, 1);
+#endif
     } else {
         draw_fill(0xFF222222);
         draw_tensor_image_fullscreen(input_img);
@@ -1017,50 +1260,64 @@ void run_yolo_complete() {
     const int   disp_bottom = disp_yoff + (g_use_camera ? CAM_DISP_H : 480);
 
     int valid_boxes = 0;
+    static const uint32_t bbox_palette[6] = {
+        0xFF00C0FFu, 0xFF00FF80u, 0xFFFF00FFu,
+        0xFFFFC000u, 0xFF80FF00u, 0xFFFF4080u
+    };
 
-    for (int ii = 0; ii < num_preds; ii++) {
-        if (preds[ii].conf > CONF_THRESH) {
-            valid_boxes++;
-            uart_puts("[DET] c="); uart_dec(preds[ii].cls);
-            uart_puts(" %="); uart_dec((int)(preds[ii].conf * 100));
-            uart_puts("\n");
+    for (int ti = 0; ti < MAX_TRACKS; ti++) {
+        if (tracks[ti].id == 0) continue;
+        const Box& b = tracks[ti].box;
+        if (b.conf <= CONF_THRESH) continue;
 
-            int box_w = (int)(preds[ii].w * disp_scale);
-            int box_h = (int)(preds[ii].h * disp_scaleY);
-            int cx    = (int)(preds[ii].x * disp_scale)  + disp_xoff;
-            int cy    = (int)(preds[ii].y * disp_scaleY) + disp_yoff;
+        valid_boxes++;
+        uart_puts("[DET] id="); uart_dec(tracks[ti].id);
+        uart_puts(" c=");       uart_dec(b.cls);
+        uart_puts(" %=");       uart_dec((int)(b.conf * 100));
+        if (tracks[ti].frames_missed > 0) {
+            uart_puts(" miss="); uart_dec(tracks[ti].frames_missed);
+        }
+        uart_puts("\n");
 
-            int left = cx - (box_w / 2);
-            int top  = cy - (box_h / 2);
+        int box_w = (int)(b.w * disp_scale);
+        int box_h = (int)(b.h * disp_scaleY);
+        int cx    = (int)(b.x * disp_scale)  + disp_xoff;
+        int cy    = (int)(b.y * disp_scaleY) + disp_yoff;
 
-            if (left < disp_xoff) { left = disp_xoff; }
-            if (top  < disp_yoff) { top  = disp_yoff; }
-            if (left + box_w > disp_right)  { box_w = disp_right  - left; }
-            if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
+        int left = cx - (box_w / 2);
+        int top  = cy - (box_h / 2);
 
-            if (box_w > 2 && box_h > 2) {
-                static const uint32_t bbox_palette[6] = {
-                    0xFF00C0FFu, 0xFF00FF80u, 0xFFFF00FFu,
-                    0xFFFFC000u, 0xFF80FF00u, 0xFFFF4080u
-                };
-                uint32_t color = bbox_palette[((unsigned)preds[ii].cls) % 6];
-                draw_rect(left, top, box_w, box_h, color, 3);
+        if (left < disp_xoff) { left = disp_xoff; }
+        if (top  < disp_yoff) { top  = disp_yoff; }
+        if (left + box_w > disp_right)  { box_w = disp_right  - left; }
+        if (top  + box_h > disp_bottom) { box_h = disp_bottom - top; }
 
-                /* Class label above the bbox: "name 67%" */
-                const char* nm = (preds[ii].cls >= 0 && preds[ii].cls < 80)
-                                 ? coco_names[preds[ii].cls] : "?";
-                int pct = (int)(preds[ii].conf * 100.0f);
-                if (pct > 99) pct = 99;
-                char lbl[40]; int ln = 0;
-                while (*nm && ln < 30) lbl[ln++] = *nm++;
-                lbl[ln++] = ' ';
-                if (pct >= 10) lbl[ln++] = '0' + (pct / 10);
-                lbl[ln++] = '0' + (pct % 10);
-                lbl[ln++] = '%';
-                lbl[ln] = '\0';
-                int label_y = (top - 18 >= disp_yoff) ? top - 18 : top + 4;
-                draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 2);
-            }
+        if (box_w > 2 && box_h > 2) {
+            /* Color by track ID so two same-class detections are visually
+             * distinguishable; cycles every 6 IDs. */
+            uint32_t color = bbox_palette[((unsigned)tracks[ti].id) % 6];
+            draw_rect(left, top, box_w, box_h, color, 3);
+
+            /* Label format: "person #3 67%" */
+            const char* nm = (b.cls >= 0 && b.cls < 80) ? coco_names[b.cls] : "?";
+            int pct = (int)(b.conf * 100.0f);
+            if (pct > 99) pct = 99;
+            int id  = tracks[ti].id;
+            char lbl[48]; int ln = 0;
+            while (*nm && ln < 30) lbl[ln++] = *nm++;
+            lbl[ln++] = ' '; lbl[ln++] = '#';
+            /* Up to 4 digits for the track ID. */
+            if (id >= 1000) { lbl[ln++] = '0' + (id / 1000) % 10; }
+            if (id >= 100)  { lbl[ln++] = '0' + (id / 100)  % 10; }
+            if (id >= 10)   { lbl[ln++] = '0' + (id / 10)   % 10; }
+            lbl[ln++] = '0' + (id % 10);
+            lbl[ln++] = ' ';
+            if (pct >= 10) lbl[ln++] = '0' + (pct / 10);
+            lbl[ln++] = '0' + (pct % 10);
+            lbl[ln++] = '%';
+            lbl[ln] = '\0';
+            int label_y = (top - 18 >= disp_yoff) ? top - 18 : top + 4;
+            draw_text(left + 2, label_y, lbl, color, 0xFF000000u, 2);
         }
     }
     if (valid_boxes == 0) uart_puts("[DET] none\n");
@@ -1093,13 +1350,27 @@ void run_yolo_complete() {
      * untouched. */
     {
         unsigned long duration_ms = (t_end - t_start) * 1000UL / f;
+        /* HUD cards come from the same tracks the bboxes use — pick the top
+         * 3 active tracks by confidence so cards and bboxes always agree. */
         HudPred hud_preds[3]; int hud_n = 0;
-        for (int ii = 0; ii < num_preds && hud_n < 3; ii++) {
-            if (preds[ii].conf > CONF_THRESH) {
-                hud_preds[hud_n].cls  = preds[ii].cls;
-                hud_preds[hud_n].conf = preds[ii].conf;
-                hud_n++;
+        float   hud_conf[3];
+        for (int ti = 0; ti < MAX_TRACKS; ti++) {
+            if (tracks[ti].id == 0) continue;
+            const Box& b = tracks[ti].box;
+            if (b.conf <= CONF_THRESH) continue;
+            int slot = hud_n;
+            if (hud_n < 3) hud_n++;
+            else if (b.conf > hud_conf[2]) slot = 2;
+            else continue;
+            /* Insertion sort by descending conf (3 slots — trivial). */
+            while (slot > 0 && b.conf > hud_conf[slot-1]) {
+                hud_conf[slot]  = hud_conf[slot-1];
+                hud_preds[slot] = hud_preds[slot-1];
+                slot--;
             }
+            hud_conf[slot]       = b.conf;
+            hud_preds[slot].cls  = b.cls;
+            hud_preds[slot].conf = b.conf;
         }
         hud_update_state(hud_preds, hud_n, global_frame_counter,
                          (int)duration_ms, (int)imx708_ae_cit_get());
