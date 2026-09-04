@@ -1,7 +1,8 @@
 # Direct2Metal — Plan de Desarrollo
 
-> Última actualización: 2026-05-11
-> Estado: **V165** — B0 (per-layer profiling UART) + B1 (192×192 inference) + B2 (NEON 8-ch conv1x1 + PRFM). Ganancia esperada ×2.7×1.15 ≈ ×3.1, **fps target ~6**. B3 (INT8) plan en `tools/B3_INT8_PLAN.md`.
+> Última actualización: 2026-09-03
+> Estado: **V183** — banco de pruebas HW desatendido (`make bench`), P8 weight-stationary conv3×3 (−6.1% A/B en HW), profiler por capa + desglose C2f. Primer profile real del v8n @256: **1276 ms @600 MHz**, heads = 34%, L2 C2f @S4 = 12%. Tier 2 INT8 cerrado (ver GOALS.md). Ver también la fila V183 de la tabla.
+> (Estado previo: **V165** — B0 profiling UART + B1 192×192 + B2 NEON 8-ch conv1x1 + PRFM.)
 
 ---
 
@@ -35,6 +36,8 @@ Barras horizontales y shift izquierda-derecha persisten — causa no es captura 
 | V163 | Back-port V162 al padre: BGGR flip 0x0101=0x03, HS clock continuo 0x0310=0x01, LSC LUT, ISP libcamera, lanes runtime-correctos, ping-pong DMA, multi-core debayer async, YOLO desactivado → 52 fps cámara-sólo. |
 | V164 | YOLO re-activado sobre V163. `run_yolo_complete` usa `parallel_debayer_start/wait` para el render FB. Detecciones COCO confirmadas en HW (person 66%, wine glass 65%). ~1.9 fps, inferencia FP32 domina. |
 | **V165** | **B0: per-layer profiling UART `[P] cap= l0= bb= neck= head= render=`. B1: inference 320→192 (parametrizado por `YOLO_IN` macro, todas las dimensiones espaciales derivadas). B2: 8-output-channel hot path en `ops_neon_conv1x1_kernel` + `__builtin_prefetch(pldl1keep)` en conv1x1 y conv2d_partial_8ch. B3 plan documentado en `tools/B3_INT8_PLAN.md`.** |
+| V166–V182 | (Sin fila aquí; ver commits `git log` V175–V179 INT8 Tier 1/2 + B4 frame-skip, y GOALS.md §G2 para el veredicto. V180 ping-pong no bloqueante, V181 `DEBUG=` thumbnail, V182 tracker con predicción de velocidad — en árbol de trabajo.) |
+| **V183** | **Banco HW desatendido** (`make bench`, `tools/HWBENCH.md`): stub `raspbootin64` en la SD + kernel `-DSERIAL_BOOT` de 80 KB por UART + `d2m_data.bin` (fp32 + test_image) cargado por el VPU vía `initramfs` a `0x08000000` + reset por RTS→RUN. Golden = detecciones + huella `[ABS]` de 16 checkpoints (QEMU ≡ HW a la milésima). **P8 weight-stationary** en `conv2d_partial_8ch` (K=3/s1/p1, tiles interiores, ci externo, pesos leídos 1× por tile): **A/B en HW 1359 → 1276 ms (−6.1%)**; P3 head 320→260, L4 96→82, L15 119→112; L2 sin cambio (kernel 4ch). **Profiler por capa** (`prof_*` en bsp, marks en el grafo + `C2F_MARK` en L6): heads 431 ms (34%; P3 260), L2 C2f @S4 154, L15 112, bb 502 / neck 289. Código muerto fuera (`runtime/conv2d.cpp`, `runtime/neon/*.s`, 10 declaraciones fantasma en `ops.h`). `CLAUDE.md` nuevo. Kill-switch `-DD2M_NO_P8` para A/B. Próximos levers: P8 en el kernel 4ch (L2), Winograd F(2×2,3×3); INT8 descartado (Tier 2). |
 
 ---
 

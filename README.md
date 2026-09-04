@@ -1,5 +1,13 @@
 # Direct2Metal — YOLOv5n Bare-Metal on Raspberry Pi Zero 2 W
 
+> **This README is a stale YOLOv5n-era snapshot.** The project is now **YOLOv8n 256²**
+> with a working IMX708 camera pipeline (V164+). The maintained engineering logs are
+> **`GOALS.md`** (roadmap + verdicts, incl. why INT8 was closed), **`PLAN.md`** (version
+> log — see the **V183** row) and `camera_debug.md`. Current real-HW figure (V183, 600 MHz
+> low-power profile, `test_image`, fp32): **1276 ms/frame**; heads = 34% of that.
+> Iterate with the unattended bench: `make bench` (`tools/HWBENCH.md`). Onboarding for
+> Claude Code lives in `CLAUDE.md`.
+
 **Hypothesis:** A real-time object detection model runs significantly faster without an operating system, eliminating scheduler overhead, generic drivers, and high-level abstraction layers.
 
 **Approach:** Port YOLOv5n (320×320 input, 80 COCO classes) to bare-metal AArch64 using ARM NEON SIMD, 4-core parallelism, and a custom MMU with D-cache, running on a Raspberry Pi Zero 2 W with no OS of any kind.

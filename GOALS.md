@@ -238,6 +238,23 @@ projects ~13–15 fps after INT8 + frame-skip.
 - [ ] Stop point: ~16 fps real (camera/HUD) at any N; inference fps
       = 1.4 / N (e.g. N=10 → real inference 0.14 fps but bboxes
       refreshed at 16 fps). A53 bare-metal target tops out here.
+- **V183 (2026-09-03) — first real per-layer HW profile + P8.** With the
+  new bench (G3) the fp32 graph at `YOLO_IN=256`, 600 MHz, `test_image`:
+  **1276 ms/frame** — `bb=502 neck=289 head=431`. Where it goes: **P3 head
+  260 ms, L2 C2f @S4 154, P4 head 121, L15 C2f @S8 112, L4 82** — the three
+  DFL heads are **34%** of the frame and the two highest-resolution C2f
+  blocks another 21%. **P8 weight-stationary conv3×3** (ported from D2M:
+  `ci` outer loop in `conv2d_partial_8ch`, each ci's weights read once per
+  tile instead of once per output pixel) measured **1359 → 1276 ms (−6.1%)**
+  A/B on HW, all of it in 8-ch K=3/s1 layers (P3 head −60, L4 −14, L15 −7).
+  L2 is untouched because its 16-ch bottleneck runs the 4-ch kernel.
+  - [ ] Port P8 to `conv2d_partial` (4-ch) → L2 (154 ms) is the target.
+  - [ ] Heads: 6 convs × 3 levels = 431 ms. Model-level lever (prune P3 or
+        share the cv2/cv3 stems); kernel-level is near the A53 f32 limit
+        (D2M measured: store layout and FMLA scheduling changes = 0 ms).
+  - [ ] Winograd F(2×2,3×3) for the remaining 3×3s (~1.8× on those layers).
+  - Not a lever: INT8 (Tier 2 verdict above), FMLA interleave, contiguous
+    output store — all measured 0 ms on this SoC.
 
 ### G3 — Reproducibility and toolchain stability
 
@@ -247,6 +264,19 @@ projects ~13–15 fps after INT8 + frame-skip.
       seeded — wire the runtime check).
 - [ ] One README-tested cold-start path: `git clone` → `make` →
       QEMU run → `./flash.sh` on an SD card.
+- [x] **V183 (2026-09-03) — unattended hardware bench** (`make bench`,
+      `tools/HWBENCH.md`). No SD swaps: a 936 B `raspbootin64` stub on the SD
+      chain-loads the ~80 KB `-DSERIAL_BOOT` code kernel over UART; FP32
+      weights + `test_image` ride the SD as `d2m_data.bin` loaded by the VPU at
+      `0x08000000` via `initramfs`; reset is the adapter's RTS → RUN pad.
+      `tools/hwbench.py` parses `[T]`/`[P]`/per-layer profile and diffs
+      `[DET]` + a 16-checkpoint `[ABS]` fingerprint (fp32 `LOG_ABSMAX`,
+      SERIAL_BOOT only) against goldens generated in QEMU — QEMU and HW agree
+      to the thousandth. Iteration = edit → `make bench` → ~90 s → PASS/FAIL +
+      profile. Gotchas baked in: stub UART clock pinned to 48 MHz to match
+      `uart_init()`; reset must be RTS-only (power-cycling re-enumerates the
+      CH340); camera skipped in the bench build so `test_image` is
+      deterministic. Ported from the retired `~/projects/D2M` clone.
 
 ---
 
