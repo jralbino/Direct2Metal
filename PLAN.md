@@ -1,7 +1,12 @@
 # Direct2Metal — Plan de Desarrollo
 
-> Última actualización: 2026-09-03
-> Estado: **V192** — **campo de visión completo** (entrada no cuadrada 320×192, todo el sensor 16:9 en vez del recorte central 864²). **491 ms/frame** (menos píxeles que 256²) y sin el "zoom". YOLOv8n es fully-conv → mismos pesos. Golden = frame de cámara recapturado a la nueva geometría.
+> Última actualización: 2026-09-04
+> Estado: **V192** — **campo de visión completo** (entrada no cuadrada 320×192, todo el sensor 16:9 en vez del recorte central 864²). **492 ms/frame HW @1 GHz** y sin el "zoom". YOLOv8n es fully-conv → mismos pesos. Golden = frame de cámara recapturado (`clock` 56 %, huella `[ABS]` PASS 16/16). En GitHub `main` (hasta `3ad18eb`).
+>
+> **SESIÓN 2026-09-04: 799 → 492 ms (−38 %) + FoV completo.** V187 relojes stock 1 GHz + `FRAME_SKIP_N=4`; V188 AE altas-luces + AWB; V189 golden real; V190 conv1x1 transpose (fin del thrash de sets L1, −17 %); V191 P8 por-posición 8ch+4ch (−18 %); V192 FoV completo (−9 %).
+>
+> **CONTINUAR MAÑANA — A/B de modelos.** Portar `app/yolo_v5n_coco/` (existe, layout viejo) al layout `bsp/runtime/app` y correrlo contra v8n sobre el MISMO frame capturado (`test_image.bin`), a 320×192. Hipótesis: v5n (½ FLOPs) detecta el reloj mejor que el 56 % del v8n, o permite subir a 384×224 a igual latencia. Después: Winograd F(2×2,3×3) en los conv3×3 del head (~95 ms, el ítem mayor); o recortar el head DFL a 1 conv/rama. Ver GOALS.md §G2.
+> Levers descartados (medidos): INT8 (sin SDOT), interleave FMLA, store contiguo. `tools/env` roto (venv de 0 bytes — recrear para los exporters torch).
 > V191 — P8 por-posición (541 ms). V190 — conv1x1 transpose (664). V189 — 1 GHz (799).
 > V188 — cámara: AE con protección de altas luces (blancos quemados resueltos: recorte R/B 42/45 % → 4/6 %), AWB grey-world, imagen de cámara en pantalla (`SHOW_CAMERA`), `FRAME_SKIP_N=4` por defecto, relojes stock 1 GHz (V187), captura de frame real por UART (`make capture`, V185). Ver filas V185–V188.
 > Estado previo — **V184**: `test_image.bin` regenerado a 256² (era un fósil de 320² desde V169 → planos de color desalineados → `[DET] none`). Ahora el golden determinista **detecta**: person 88 / bus 85 / person 77 / person 71 sobre `bus.jpg`. V183: banco HW desatendido (`make bench`), P8 (−6.1% A/B), profiler por capa; 1276 ms @600 MHz, heads 34%. Tier 2 INT8 cerrado (GOALS.md). `tools/env` roto (intérpretes de 0 bytes).
