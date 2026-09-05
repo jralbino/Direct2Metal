@@ -878,6 +878,9 @@ void unicam_init() {
     setup_unicam_block(U1);
 }
 
+/* Forward decl — definition immediately below unicam_capture_frame. */
+bool unicam_try_advance();
+
 /* V136 diagnostic: dump raw bytes at key rows to reveal buffer structure. */
 bool unicam_capture_frame() {
     g_sim_state.frame_number++;
@@ -1083,58 +1086,72 @@ bool unicam_capture_frame() {
     return true;
 
 #else
-    /* ── HW capture: continuous-DMA ping-pong (camara_direct V162 pattern) ─
-     * CPE stays on the whole time. Each call:
-     *   1. Stage next_buf in IBSA0 (queued; only takes effect at LIP).
-     *   2. Wait for two FSIs. At FSI 1, strobe LIP → DMA flips to next_buf;
-     *      the buffer that WAS active before LIP is now frozen and holds the
-     *      just-completed frame. At FSI 2, that frame's full sensor period
-     *      has elapsed and the staged buffer is mid-fill of the new frame.
-     *   3. Swap active/completed pointers and invalidate the completed
-     *      buffer's cache lines so the CPU sees DMA writes. */
-    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
-
-    uint8_t* next_buf = (g_active_buf == g_raw_a) ? g_raw_b : g_raw_a;
-    const uint32_t bus_next = 0xC0000000u | (uint32_t)(uintptr_t)next_buf;
-    U1[U_IBSA0/4] = bus_next;
-    U1[U_IBEA0/4] = bus_next + FRAME_SZ;
-
-    U1[U_CTRL/4] |= U_CTRL_CPE;
-    *UNICAM1_CLKGATE = 0x5A000015u;
-    U1[U_MISC/4] |= (1u << 6) | (1u << 9);
-    asm volatile("dsb st" ::: "memory");
-
-    U1[U_ISTA/4] = 0xFFFFFFFFu;
-
-    int fs_count = 0;
+    /* ── HW capture: blocking loop around the non-blocking try_advance ───── */
     for (unsigned long i = 0; i < 45000000UL; i++) {
         if (i % 100000 == 0) watchdog_kick();
-        uint32_t ista = U1[U_ISTA/4];
-
-        if (ista & U_ISTA_FSI) {
-            fs_count++;
-            U1[U_ISTA/4] = 0xFFFFFFFFu;
-
-            if (fs_count == 1) {
-                U1[U_ICTL/4] |= U_ICTL_LIP;
-                asm volatile("dsb sy" ::: "memory");
-            } else {
-                uint8_t* prev_buf = g_active_buf;
-                g_active_buf    = next_buf;
-                g_completed_buf = prev_buf;
-                /* Invalidate prev_buf cache lines so CPU sees DMA's writes. */
-                unsigned long addr = (unsigned long)(void*)prev_buf;
-                unsigned long end  = addr + FRAME_SZ;
-                for (unsigned long a = addr & ~63UL; a < end; a += 64)
-                    asm volatile("dc civac, %0" :: "r"(a) : "memory");
-                asm volatile("dsb sy" ::: "memory");
-                return true;
-            }
-        }
+        if (unicam_try_advance()) return true;
     }
-
     uart_puts("[CAP] TIMEOUT\n");
     return false;
+#endif
+}
+
+/* ── V180: non-blocking ping-pong advance ─────────────────────────────────
+ * State machine, one MMIO read per call when no FSI pending. Sequence:
+ *   state 0 (idle) → stage next_buf, (re-)assert CPE/CLKGATE/MISC, clear
+ *                    stale ISTA bits, → state 1.
+ *   state 1 (wait FSI 1) → poll ISTA. On FSI: clear, strobe LIP → state 2.
+ *   state 2 (wait FSI 2) → poll ISTA. On FSI: clear, swap active/completed,
+ *                    invalidate cache for completed buf, → state 0, return
+ *                    true (caller can now read unicam_frame_ptr()).
+ * Used by both the blocking `unicam_capture_frame` (busy-loops in
+ * acquire) and the display pump on core 0 during async inference. */
+bool unicam_try_advance() {
+#ifdef SIMULATION
+    /* Sim has no MMIO timing model; sim builds use the sync 4-core path
+     * which calls unicam_capture_frame directly. The pump never runs in
+     * sim, so this stub is just for link completeness. */
+    return false;
+#else
+    volatile uint32_t* U1 = (volatile uint32_t*)(uintptr_t)UNICAM1_BASE;
+    static int s_cap_state = 0;
+
+    if (s_cap_state == 0) {
+        uint8_t* next_buf = (g_active_buf == g_raw_a) ? g_raw_b : g_raw_a;
+        const uint32_t bus_next = 0xC0000000u | (uint32_t)(uintptr_t)next_buf;
+        U1[U_IBSA0/4] = bus_next;
+        U1[U_IBEA0/4] = bus_next + FRAME_SZ;
+        U1[U_CTRL/4] |= U_CTRL_CPE;
+        *UNICAM1_CLKGATE = 0x5A000015u;
+        U1[U_MISC/4] |= (1u << 6) | (1u << 9);
+        asm volatile("dsb st" ::: "memory");
+        U1[U_ISTA/4] = 0xFFFFFFFFu;
+        s_cap_state = 1;
+        return false;
+    }
+
+    uint32_t ista = U1[U_ISTA/4];
+    if (!(ista & U_ISTA_FSI)) return false;
+    U1[U_ISTA/4] = 0xFFFFFFFFu;
+
+    if (s_cap_state == 1) {
+        U1[U_ICTL/4] |= U_ICTL_LIP;
+        asm volatile("dsb sy" ::: "memory");
+        s_cap_state = 2;
+        return false;
+    }
+
+    /* state 2: second FSI — swap and invalidate */
+    uint8_t* prev_buf = g_active_buf;
+    g_active_buf    = (g_active_buf == g_raw_a) ? g_raw_b : g_raw_a;
+    g_completed_buf = prev_buf;
+    unsigned long addr = (unsigned long)(void*)prev_buf;
+    unsigned long end  = addr + FRAME_SZ;
+    for (unsigned long a = addr & ~63UL; a < end; a += 64)
+        asm volatile("dc civac, %0" :: "r"(a) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+    s_cap_state = 0;
+    return true;
 #endif
 }
 
