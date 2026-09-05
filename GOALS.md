@@ -277,11 +277,23 @@ projects ~13–15 fps after INT8 + frame-skip.
         captured frame (v5n@320, v11n).
   - [ ] **Head conv3×3 (~95 ms), the biggest item** — 4 × (64→64 @S8), ~3.5×
         the A53 f32 floor after P8 (same "near the instruction-mix limit"
-        verdict as D2M). Winograd F(2×2,3×3) (~1.8×, real precision risk with
-        the 1/2 scalings — verify vs a looser [ABS] tol) or cut the DFL head
-        to 1 conv per branch (model change, re-export).
+        verdict as D2M). Winograd tried (V193, see below) and closed as a
+        regression. Remaining option: cut the DFL head to 1 conv per branch
+        (model change, re-export).
+  - [x] **V193 — Winograd F(2×2,3×3), tried and CLOSED.** Implemented
+        (`bsp/multicore.cpp`, `conv2d_winograd_tile_8ch`), math validated
+        standalone (~2e-6 abs err vs direct conv) and correct on HW
+        (fingerprint 16/16 PASS), but **slower**: 492 → 521-523 ms (+6 %),
+        unchanged after vectorizing the input transform. The 16-tap × up to
+        8-tile accumulator (256 `float32x4_t`) far exceeds the A53's 32 NEON
+        registers, so the 9/4× fewer-FMA win is eaten by a ~9× worse
+        load/store-to-FMA ratio vs the P8 kernel's weight-stationary design.
+        A real win needs a GEMM-style rewrite (tiles in the vector lanes, not
+        the 8 output channels) — not attempted. Kept behind `WINOGRAD=0`
+        (default off) for reference. See PLAN.md V193 for the full writeup.
   - Not a lever: INT8 (Tier 2 verdict), FMLA interleave, contiguous output
-    store — all measured 0 ms on this SoC.
+    store, Winograd F(2×2,3×3) (V193) — all measured 0 ms or a regression on
+    this SoC.
 - **V184 (2026-09-03) — `test_image.bin` was a 320² fossil.** Since V169
   (`YOLO_IN` 320→256) the tensor stayed 3×320×320; the kernel reads the first
   3·N² floats, so the colour planes were misaligned and the deterministic

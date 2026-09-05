@@ -70,8 +70,24 @@ ifeq ($(HEAD_PROF),1)
 C2F_DEF += -DHEAD_PROF
 endif
 
+# V193: Winograd F(2x2,3x3) for the K=3/s1/p1 8-channel fast path (bsp/multicore.cpp).
+# CLOSED / measured regression (PLAN.md V193): +6% total on HW (492->521-523ms),
+# even after vectorizing the input transform — the 16-tap x up to 8-tile
+# accumulator spills far past the A53's 32 NEON registers, so the "2.25x
+# fewer FMA" win is eaten by a ~9x worse load/store-to-FMA ratio vs the P8
+# weight-stationary kernel. Default 0 = off (P8 direct conv). Kept buildable
+# (correctness-verified: HW fingerprint 16/16 PASS both attempts) as a
+# starting point if someone attempts the GEMM-style tile-batched rewrite this
+# would actually need. `make WINOGRAD=1` re-enables it for experimentation.
+WINOGRAD ?= 0
+ifeq ($(WINOGRAD),0)
+WINOGRAD_DEF = -DD2M_NO_WINOGRAD
+else
+WINOGRAD_DEF =
+endif
+
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF)
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF) $(WINOGRAD_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)

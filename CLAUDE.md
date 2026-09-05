@@ -18,7 +18,7 @@ This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub 
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
-GOALS.md / PLAN.md version-stamped; the session reached V192.
+GOALS.md / PLAN.md version-stamped; the session reached V193 (Winograd — closed, no perf change).
 
 **Working tree has ~110 uncommitted files of the user's V180/V181 work.** Never
 `git stash`, `git checkout -- .`, or `make clean`-style sweeps that could touch them. If you
@@ -155,7 +155,19 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   port.
 - **f32 conv3×3 is near the A53 NEON throughput limit** after P8. Micro-opts that measured
   **0 ms** on HW: contiguous output store vs `vgetq_lane` scatter; FMLA accumulator interleave
-  (the A53 forwards the accumulate operand). Remaining algorithmic lever: Winograd F(2×2,3×3).
+  (the A53 forwards the accumulate operand).
+- **Winograd F(2×2,3×3) does not beat the P8 direct-conv kernel on this SoC** (PLAN.md V193):
+  implemented + correctness-verified on HW (fingerprint 16/16 PASS) but measured a net
+  **regression** — 492 → 521-523 ms (+6 %), unchanged after vectorizing the input-transform
+  loads. Root cause: the M accumulator (16 taps × up to 8 tiles × 2 lo/hi = 256 `float32x4_t`)
+  can't come close to living in the A53's 32 NEON registers, so almost every accumulate is a
+  spill load + 1 FMA + spill store, vs the P8 kernel's 9-FMAs-per-register-round-trip
+  weight-stationary design — the 9/4× fewer-FMA win is smaller than the ~9× worse
+  load/store-to-FMA ratio. A real win needs a GEMM-style rewrite (tiles in the vector lanes,
+  not the 8 output channels) — not attempted. Kept buildable behind `WINOGRAD=0` (default) /
+  `make WINOGRAD=1` in `bsp/multicore.cpp` (`conv2d_winograd_tile_8ch` behind
+  `#ifndef D2M_NO_WINOGRAD` — the whole function must not exist in the default build, or its
+  stack frame taxes every `conv2d_partial_8ch` call even on the dead branch, ~12 ms/frame).
 - B4 frame-skip raises throughput, not latency.
 - **"Blown whites" on the camera were exposure, not white balance** (V188). Symptom: R/B at 1.0
   in 5–45 % of pixels while G looked unclipped. Grey-world AWB moved the gains by <5 % (the

@@ -31,6 +31,108 @@ static inline float32x4_t neon_silu(float32x4_t x) {
     recip = vmulq_f32(vrecpsq_f32(denom, recip), recip); return vmulq_f32(x, recip);
 }
 
+#ifndef D2M_NO_WINOGRAD
+/* ── Winograd F(2×2, 3×3) — V193, CLOSED: measured a net regression on HW,
+ * kept only behind `WINOGRAD=0` (default off) as a documented, working
+ * starting point. See PLAN.md V193 for the full writeup; summary:
+ *
+ * Cuts the K=3/s1/p1 inner product from 9 taps to 16 elementwise products
+ * accumulated over C_in (9/4 = 2.25× fewer FMAs per output pixel), at the
+ * cost of a cheap linear transform of the 3×3 filter and 4×4 input tile.
+ * Math validated standalone against a brute-force direct conv (scratchpad
+ * winograd_explicit.cpp, max abs err ~2e-6, float rounding only), and the
+ * NEON port is bit-correct on real HW (fingerprint 16/16 PASS). But it's
+ * **slower**: 492 -> 521-523 ms total (+6%), ~+10-15% on every 3×3-heavy
+ * layer regardless of C_in, in both the first cut and after vectorizing
+ * the input-transform loads (4× vld1q_f32 + in-register lane extracts
+ * instead of 16 independent scalar loads — zero measured difference).
+ * Root cause: the M accumulator (16 taps × up to 8 tiles × 2 lo/hi halves
+ * = 256 float32x4_t) has nowhere near enough of the A53's 32 NEON
+ * registers to live in, so almost every accumulate is a spill load + one
+ * FMA + a spill store. The existing P8 kernel's weight-stationary design
+ * gets **9** FMAs per register round-trip (9 taps into 1 loaded/stored
+ * accumulator); this gets 1. The arithmetic win (9/4 fewer FMAs) is smaller
+ * than the load/store-ratio loss (9× fewer FMAs per touch). A real win
+ * would need a GEMM-style restructure — batch tiles into the vector lanes
+ * (not the 8 output channels) so U can stream from a small per-(g,ci)
+ * cache while M for many tiles stays resident — a bigger rewrite, not
+ * attempted here.
+ *
+ * The three transforms are separable (row pass then column pass) — the
+ * standard F(2,3) B/G/A matrices reduce to pure ±1 combinations for
+ * input/output and ±1 combinations + one 0.5 scale for the filter:
+ *
+ *   input  V = B^T d B      (4×4 -> 4×4, zero multiplies)
+ *   filter U = G g G^T      (3×3 -> 4×4, one ×0.5 per row/col pass)
+ *   output Y = A^T (U⊙V) A  (4×4 -> 2×2, zero multiplies)
+ *
+ * `winograd_weight_transform` runs on 8-wide channel-interleaved filter taps
+ * (the existing `repack_for_neon_8ch` layout: [ci][tap*8+ch]) so one call
+ * transforms all 8 output channels of a group at once. `winograd_input_transform`
+ * loads each input row as one vector (shared by every output-channel group)
+ * and does the column pass 4-wide; the row pass pulls lanes back out to
+ * scalars since it combines *within* a row. `winograd_output_transform` is
+ * 8-wide again, producing the 2×2 output tile's 8 channels. */
+static inline void winograd_weight_transform(
+    float32x4_t g0, float32x4_t g1, float32x4_t g2,
+    float32x4_t g3, float32x4_t g4, float32x4_t g5,
+    float32x4_t g6, float32x4_t g7, float32x4_t g8,
+    float32x4_t U[16]) {
+    float32x4_t half = vdupq_n_f32(0.5f);
+    /* column pass: S[4][3], columns of g are (g0,g3,g6) (g1,g4,g7) (g2,g5,g8) */
+    float32x4_t s00 = g0, s10 = vmulq_f32(vaddq_f32(vaddq_f32(g0, g3), g6), half),
+                s20 = vmulq_f32(vaddq_f32(vsubq_f32(g0, g3), g6), half), s30 = g6;
+    float32x4_t s01 = g1, s11 = vmulq_f32(vaddq_f32(vaddq_f32(g1, g4), g7), half),
+                s21 = vmulq_f32(vaddq_f32(vsubq_f32(g1, g4), g7), half), s31 = g7;
+    float32x4_t s02 = g2, s12 = vmulq_f32(vaddq_f32(vaddq_f32(g2, g5), g8), half),
+                s22 = vmulq_f32(vaddq_f32(vsubq_f32(g2, g5), g8), half), s32 = g8;
+    /* row pass: U[4][4] from S[i][0..2] */
+    U[0]=s00;                                            U[1]=vmulq_f32(vaddq_f32(vaddq_f32(s00,s01),s02),half);
+    U[2]=vmulq_f32(vaddq_f32(vsubq_f32(s00,s01),s02),half); U[3]=s02;
+    U[4]=s10;                                            U[5]=vmulq_f32(vaddq_f32(vaddq_f32(s10,s11),s12),half);
+    U[6]=vmulq_f32(vaddq_f32(vsubq_f32(s10,s11),s12),half); U[7]=s12;
+    U[8]=s20;                                            U[9]=vmulq_f32(vaddq_f32(vaddq_f32(s20,s21),s22),half);
+    U[10]=vmulq_f32(vaddq_f32(vsubq_f32(s20,s21),s22),half); U[11]=s22;
+    U[12]=s30;                                           U[13]=vmulq_f32(vaddq_f32(vaddq_f32(s30,s31),s32),half);
+    U[14]=vmulq_f32(vaddq_f32(vsubq_f32(s30,s31),s32),half); U[15]=s32;
+}
+
+/* V193.1: column pass vectorized across the 4 columns — one vld1q_f32 per
+ * input row (r0[b..b+3] is contiguous) instead of 4 independent scalar
+ * loads, and the column-pass add/sub done 4-wide in one shot instead of
+ * 16 separate scalar ops. The row pass still needs per-row scalars (it
+ * combines lanes *within* a row), pulled out of the vector via
+ * vgetq_lane_f32 (free/near-free lane 0, cheap dup for 1-3) instead of a
+ * second round of memory loads. This was the dominant cost in the first
+ * cut (16 independent scalar loads on an in-order A53 have real load
+ * latency; measured net regression, see PLAN.md V193). */
+static inline void winograd_input_transform(
+    float32x4_t d0, float32x4_t d1, float32x4_t d2, float32x4_t d3,
+    float V[16]) {
+    float32x4_t t0 = vsubq_f32(d0, d2);
+    float32x4_t t1 = vaddq_f32(d1, d2);
+    float32x4_t t2 = vsubq_f32(d2, d1);
+    float32x4_t t3 = vsubq_f32(d1, d3);
+    const float32x4_t T[4] = {t0, t1, t2, t3};
+    for (int i = 0; i < 4; i++) {
+        float t0v = vgetq_lane_f32(T[i], 0), t1v = vgetq_lane_f32(T[i], 1);
+        float t2v = vgetq_lane_f32(T[i], 2), t3v = vgetq_lane_f32(T[i], 3);
+        V[i*4+0] = t0v - t2v; V[i*4+1] = t1v + t2v; V[i*4+2] = t2v - t1v; V[i*4+3] = t1v - t3v;
+    }
+}
+/* Y = A^T M A, M indexed [i*4+j] -> Y[0..3] = (0,0) (0,1) (1,0) (1,1) */
+static inline void winograd_output_transform(const float32x4_t M[16], float32x4_t Y[4]) {
+    float32x4_t P00=vaddq_f32(vaddq_f32(M[0],M[4]),M[8]),   P01=vaddq_f32(vaddq_f32(M[1],M[5]),M[9]);
+    float32x4_t P02=vaddq_f32(vaddq_f32(M[2],M[6]),M[10]),  P03=vaddq_f32(vaddq_f32(M[3],M[7]),M[11]);
+    float32x4_t P10=vsubq_f32(vsubq_f32(M[4],M[8]),M[12]),  P11=vsubq_f32(vsubq_f32(M[5],M[9]),M[13]);
+    float32x4_t P12=vsubq_f32(vsubq_f32(M[6],M[10]),M[14]), P13=vsubq_f32(vsubq_f32(M[7],M[11]),M[15]);
+    Y[0]=vaddq_f32(vaddq_f32(P00,P01),P02);
+    Y[1]=vsubq_f32(vsubq_f32(P01,P02),P03);
+    Y[2]=vaddq_f32(vaddq_f32(P10,P11),P12);
+    Y[3]=vsubq_f32(vsubq_f32(P11,P12),P13);
+}
+#endif /* !D2M_NO_WINOGRAD */
+
 static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const float* w_rep, const float* bias, int K, int stride, int pad, bool do_silu, float* out, int grp_start, int grp_end) {
     int H_out  = (H_in + 2 * pad - K) / stride + 1; int W_out  = (W_in + 2 * pad - K) / stride + 1;
     int HW_out = H_out * W_out; int HW_in  = H_in  * W_in; int CinKK  = C_in  * K * K;
@@ -178,6 +280,100 @@ static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const
     }
 }
 
+#ifndef D2M_NO_WINOGRAD
+/* V193 CLOSED — see the block comment above winograd_weight_transform() for
+ * why this loses on HW. Kept as its own function (not inlined into
+ * conv2d_partial_8ch) so `-DD2M_NO_WINOGRAD` removes it — Mlo/Mhi below are
+ * (TILE_H/2)*(TILE_W/2)*16*2 = 256 float32x4_t; leaving that stack frame
+ * reachable from conv2d_partial_8ch even behind a runtime `if (false)` cost
+ * ~12 ms/frame in the extra prologue on every one of its many calls per
+ * frame (measured; see PLAN.md V193).
+ *
+ * Computes the 2×2-tile-aligned sub-rectangle of [fy0,fy1)×[fx0,fx1) (may
+ * cover one fewer row/col at odd boundaries — *out_ry1 / *out_rx1 report what
+ * was actually covered so the caller's per-position fallback can pick up
+ * the remainder). Returns false (nothing written) if that sub-rectangle is
+ * empty, in which case *out_ry1 / *out_rx1 are left untouched. */
+static bool conv2d_winograd_tile_8ch(const float* in, int W_in, int HW_in,
+                                      const float* wg, int C_in,
+                                      int fy0, int fy1, int fx0, int fx1, int W_out,
+                                      float32x4_t v_bl, float32x4_t v_bh, bool do_silu,
+                                      float* oc[8], int* out_ry1, int* out_rx1) {
+    int wy_end = fy0; for (int oy = fy0; oy + 1 < fy1; oy += 2) wy_end = oy + 2;
+    int wx_end = fx0; for (int ox = fx0; ox + 1 < fx1; ox += 2) wx_end = ox + 2;
+    int nty = (wy_end - fy0) / 2, ntx = (wx_end - fx0) / 2;
+    if (nty <= 0 || ntx <= 0) return false;
+    int ntiles = nty * ntx; /* <= (TILE_H/2)*(TILE_W/2) */
+    float32x4_t Mlo[16][(TILE_H/2)*(TILE_W/2)];
+    float32x4_t Mhi[16][(TILE_H/2)*(TILE_W/2)];
+    for (int t = 0; t < 16; t++)
+        for (int p = 0; p < ntiles; p++) { Mlo[t][p] = vdupq_n_f32(0.0f); Mhi[t][p] = vdupq_n_f32(0.0f); }
+
+    for (int ci = 0; ci < C_in; ci++) {
+        const float* ipc = in + ci * HW_in;
+        const float* wci = wg + ci * 72;
+        if (ci + 1 < C_in) {
+            __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
+            __builtin_prefetch(in + (ci+1)*HW_in + (fy0-1)*W_in + (fx0-1), 0, 3);
+        }
+        float32x4_t g0l=vld1q_f32(wci+ 0), g1l=vld1q_f32(wci+ 8), g2l=vld1q_f32(wci+16);
+        float32x4_t g3l=vld1q_f32(wci+24), g4l=vld1q_f32(wci+32), g5l=vld1q_f32(wci+40);
+        float32x4_t g6l=vld1q_f32(wci+48), g7l=vld1q_f32(wci+56), g8l=vld1q_f32(wci+64);
+        float32x4_t g0h=vld1q_f32(wci+ 4), g1h=vld1q_f32(wci+12), g2h=vld1q_f32(wci+20);
+        float32x4_t g3h=vld1q_f32(wci+28), g4h=vld1q_f32(wci+36), g5h=vld1q_f32(wci+44);
+        float32x4_t g6h=vld1q_f32(wci+52), g7h=vld1q_f32(wci+60), g8h=vld1q_f32(wci+68);
+        float32x4_t Ul[16], Uh[16];
+        winograd_weight_transform(g0l,g1l,g2l,g3l,g4l,g5l,g6l,g7l,g8l, Ul);
+        winograd_weight_transform(g0h,g1h,g2h,g3h,g4h,g5h,g6h,g7h,g8h, Uh);
+
+        int p = 0;
+        for (int ty = 0; ty < nty; ty++) {
+            int oy = fy0 + ty * 2;
+            const float* r0 = ipc + (oy - 1) * W_in;
+            const float* r1 = r0 + W_in;
+            const float* r2 = r1 + W_in;
+            const float* r3 = r2 + W_in;
+            for (int tx = 0; tx < ntx; tx++, p++) {
+                int b = fx0 + tx * 2 - 1;
+                float V[16];
+                winograd_input_transform(vld1q_f32(r0+b), vld1q_f32(r1+b),
+                                          vld1q_f32(r2+b), vld1q_f32(r3+b), V);
+                for (int t = 0; t < 16; t++) {
+                    Mlo[t][p] = vmlaq_n_f32(Mlo[t][p], Ul[t], V[t]);
+                    Mhi[t][p] = vmlaq_n_f32(Mhi[t][p], Uh[t], V[t]);
+                }
+            }
+        }
+    }
+
+    int p = 0;
+    for (int ty = 0; ty < nty; ty++) {
+        int oy = fy0 + ty * 2;
+        for (int tx = 0; tx < ntx; tx++, p++) {
+            int ox = fx0 + tx * 2;
+            float32x4_t Mtl[16], Mth[16];
+            for (int t = 0; t < 16; t++) { Mtl[t] = Mlo[t][p]; Mth[t] = Mhi[t][p]; }
+            float32x4_t Yl[4], Yh[4];
+            winograd_output_transform(Mtl, Yl);
+            winograd_output_transform(Mth, Yh);
+            static const int dy[4] = {0,0,1,1}, dx[4] = {0,1,0,1};
+            for (int q = 0; q < 4; q++) {
+                float32x4_t al = vaddq_f32(Yl[q], v_bl);
+                float32x4_t ah = vaddq_f32(Yh[q], v_bh);
+                if (do_silu) { al = neon_silu(al); ah = neon_silu(ah); }
+                int pos = (oy + dy[q]) * W_out + (ox + dx[q]);
+                oc[0][pos]=vgetq_lane_f32(al,0); oc[1][pos]=vgetq_lane_f32(al,1);
+                oc[2][pos]=vgetq_lane_f32(al,2); oc[3][pos]=vgetq_lane_f32(al,3);
+                oc[4][pos]=vgetq_lane_f32(ah,0); oc[5][pos]=vgetq_lane_f32(ah,1);
+                oc[6][pos]=vgetq_lane_f32(ah,2); oc[7][pos]=vgetq_lane_f32(ah,3);
+            }
+        }
+    }
+    *out_ry1 = wy_end; *out_rx1 = wx_end;
+    return true;
+}
+#endif /* !D2M_NO_WINOGRAD */
+
 /* conv2d_partial_8ch: 8-output-channel NEON kernel.
  * Weight layout: [C_out/8][C_in*K*K][8]  (from repack_for_neon_8ch).
  * K=3 safe path: 6 row accumulators (s0l/s0h, s1l/s1h, s2l/s2h) × 9 positions.
@@ -211,6 +407,8 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
 #else
                 const bool kP8 = true;
 #endif
+                /* -DD2M_NO_WINOGRAD falls back to the plain P8 direct-conv fast
+                 * path below (A/B baseline for the Winograd feature alone). */
                 (void)npos;
                 /* V191: weight-stationary K=3 fast path, clipped to the "safe"
                  * (padding-free) sub-rectangle of this tile — [fy0,fy1)×[fx0,fx1).
@@ -223,7 +421,24 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                 int fx0 = x_tile > 1 ? x_tile : 1;
                 int fx1 = x_end < W_out - 1 ? x_end : W_out - 1;
                 bool ran_fast = false;
-                if (kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                /* Covered sub-rectangle of THIS tile's fast path — [fy0,ry1)×[fx0,rx1).
+                 * Equals [fy0,fy1)×[fx0,fx1) for the P8 path; the Winograd path below
+                 * may cover one fewer row/col at the block's edge (2×2-tile parity),
+                 * in which case the per-position fallback picks up the remainder. */
+                int ry1 = fy1, rx1 = fx1;
+#ifndef D2M_NO_WINOGRAD
+                /* V193 CLOSED (see the block comment above winograd_weight_transform):
+                 * measured slower on HW, kept out of the default build entirely — the
+                 * whole function (including its big Mlo/Mhi arrays) must not exist
+                 * under -DD2M_NO_WINOGRAD, or its stack frame taxes every call to
+                 * conv2d_partial_8ch even when the runtime branch never fires. */
+                if (K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                    ran_fast = conv2d_winograd_tile_8ch(in, W_in, HW_in, wg, C_in,
+                                                         fy0, fy1, fx0, fx1, W_out,
+                                                         v_bl, v_bh, do_silu, oc, &ry1, &rx1);
+                }
+#endif
+                if (!ran_fast && kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
                     int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float accl[TILE_H * TILE_W][4];
                     float acch[TILE_H * TILE_W][4];
@@ -284,7 +499,7 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
 
                 for (int oy = y_tile; oy < y_end; oy++) {
                     for (int ox = x_tile; ox < x_end; ox++) {
-                        if (ran_fast && oy >= fy0 && oy < fy1 && ox >= fx0 && ox < fx1) continue;
+                        if (ran_fast && oy >= fy0 && oy < ry1 && ox >= fx0 && ox < rx1) continue;
                         float32x4_t al = v_bl, ah = v_bh;
                         bool safe = (oy*stride-pad >= 0) && (oy*stride+K-pad <= H_in) &&
                                     (ox*stride-pad >= 0) && (ox*stride+K-pad <= W_in);
