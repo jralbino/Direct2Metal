@@ -503,21 +503,21 @@ static int   next_track_id = 1;
 static void  update_tracker();
 
 /* ──────────────────────────────────────────────────────────────────────────
- * V180 — Async inference + display pump. Default FP32 build only.
+ * Inferencia + bombeo del display. Solo en el build FP32 por defecto.
  *
- * Cores 1-3 run the conv (3-way split, n_grp/3 per worker) while core 0
- * services the camera + thumbnail + HUD. Each conv dispatch is wrapped
- * by `parallel_conv2d_with_pump` which kicks the workers and then loops:
- *   while (!done) display_pump();
+ * Los 4 cores calculan la conv (reparto n_grp/4) y `display_pump()` corre
+ * ENTRE convs, no durante. El pump avanza la máquina de estados ping-pong de
+ * Unicam (una lectura MMIO) y, solo cuando acaba de aterrizar un frame nuevo,
+ * repinta HUD + framebuffer. NO corre el AE: de eso se encarga
+ * `bsp_frame_acquire` una vez por inferencia.
  *
- * `display_pump` consumes one camera frame (bsp_frame_acquire waits the
- * next FSI + runs AE), redraws the thumbnail + HUD, flushes the FB.
- * Cost: ~30-40 ms per pump (FSI wait dominates). Cores 1-3's per-conv
- * work ranges from <1 ms to ~50 ms; pumps may overshoot the conv's
- * completion (poll returns ready mid-pump and the next loop iteration
- * just exits). Inference wall-clock grows ~33 % vs the 4-core sync
- * path (3 workers instead of 4); in exchange the display refreshes
- * continuously instead of freezing for ~720 ms per inference.
+ * V180 hacía lo contrario —cores 1-3 en la conv, core 0 bombeando en un spin
+ * continuo— para que el display no se congelara. Medido en HW con cámara
+ * real (V199), ese trade-off no existía: el repintado lo limita la cámara,
+ * no el core 0. Con 63 convs por frame el híbrido repinta 10 veces por
+ * inferencia (una cada 29 ms) contra las 15 del spin de V180 (una cada
+ * 26 ms), y el frame baja de 383 a 293 ms. El camino async se borró en V200;
+ * su historia está en PLAN.md V180/V198/V199/V200.
  * ────────────────────────────────────────────────────────────────────── */
 
 /* V199: contadores del pump. La pregunta "¿el HUD sigue igual de fluido con
@@ -583,36 +583,6 @@ static void display_pump() {
                      0, (int)imx708_ae_cit_get());
     hud_render((uint8_t*)lfb, pitch);
     video_flush();
-}
-
-/* Async wait body — used by both conv2d and conv1x1 wrappers. Spin pumping
- * the display while workers run. The wfe between pumps puts core 0 to
- * sleep until the workers' sev when they increment done_count — under
- * QEMU this is essential (yield alone doesn't reschedule cores aggressively
- * enough and core 0 starves the workers). On real HW wfe is also cheaper
- * than tight spinning. */
-static inline void async_wait_with_pump() {
-    while (!parallel_async_done()) {
-        display_pump();
-        if (parallel_async_done()) break;
-        asm volatile("wfe");
-    }
-    parallel_async_wait();
-}
-
-static inline void parallel_conv2d_with_pump(const float* in, int H, int W, int C_in,
-                                             const float* w_rep, const float* bias,
-                                             int C_out, int K, int stride, int pad,
-                                             bool do_silu, float* out) {
-    parallel_conv2d_async_start(in, H, W, C_in, w_rep, bias, C_out, K, stride, pad, do_silu, out);
-    async_wait_with_pump();
-}
-
-static inline void parallel_conv1x1_with_pump(const float* in, int H, int W, int C_in,
-                                              const float* w, const float* b, int C_out,
-                                              bool do_silu, float* out) {
-    parallel_conv1x1_async_start(in, H, W, C_in, w, b, C_out, do_silu, out);
-    async_wait_with_pump();
 }
 
 /* V199: bombear una vez y luego la conv bloqueante de 4 cores. En el build de
@@ -723,34 +693,20 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
 #define WS_TYPE       WeightStream
 #define WS_INIT(name) WeightStream name(weights_start)
 #define LAYER_LOAD(ws, nw, nb, tag) fp32_layer_load((ws), (nw), (nb), (tag))
-/* V180: FP32 path uses async dispatch + display pump on HW so core 0 keeps
- * the camera + HUD alive while cores 1-3 grind the conv. ~33% more
- * wall-clock inference vs sync 4-core, but no display freeze. Gated on
- * !SIMULATION because QEMU time-shares the 4 emulated cores on one host
- * CPU — core 0 spinning + pumping starves the workers and one frame
- * stretches to 80 s. Sim builds stay on the sync 4-core path. */
-/* V199 — híbrido: los 4 cores calculan y el display se bombea ENTRE convs.
+/* V199 — los 4 cores calculan y el display se bombea ENTRE convs.
  *
  * V180 dejaba el core 0 fuera del reparto (cores 1-3) para que la cámara y el
- * HUD siguieran vivos durante la inferencia. Medido en V198 eso cuesta
- * 103 ms/frame (367 vs 264) — más que el 4/3 teórico, por el wfe/sev por conv.
- * Pero no hace falta elegir: `display_pump()` solo hace trabajo pesado cuando
- * acaba de aterrizar un frame de la cámara (~cada 19 ms de período FSI); el
- * resto es una lectura MMIO. Bombeando entre convs —el grafo tiene ~60 por
- * frame, una cada ~4 ms de media y ~20 ms en la peor conv— la máquina de
- * estados del ping-pong y el HUD se atienden igual de seguido que antes, y los
- * 4 cores calculan. `-DD2M_ASYNC_CONV` restaura el reparto 1-3 de V180. */
-#if defined(SIMULATION) || !defined(D2M_ASYNC_CONV)
+ * HUD siguieran vivos durante la inferencia. Ese trade-off resultó no existir:
+ * `display_pump()` solo hace trabajo pesado cuando acaba de aterrizar un frame
+ * de la cámara (período FSI ~19 ms); el resto es una lectura MMIO. Con ~60
+ * convs por frame, bombear entre convs da un repintado cada 29 ms contra los
+ * 26 ms del spin continuo de V180 —el repintado lo limita la cámara, no el
+ * core 0— mientras el frame es 90 ms más rápido (293 vs 383 ms, medido en HW
+ * con cámara real). El camino async se eliminó en V200. */
 #define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
     parallel_conv2d_pump_then((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
     parallel_conv1x1_pump_then((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
-#else
-#define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
-    parallel_conv2d_with_pump((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
-#define CONV1X1(in, H, W, ci, L, co, silu, out) \
-    parallel_conv1x1_with_pump((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
-#endif
 #define COPY_TENSOR(src, dst, n)               copy_tensor((src), (dst), (n))
 #define CONCAT_TENSOR(s1, c1, s2, c2, dst, hw) concat_tensor((s1), (c1), (s2), (c2), (dst), (hw))
 #define UPSAMPLE2X(in, out, H, W, C)           upsample2x_nearest((in), (out), (H), (W), (C))

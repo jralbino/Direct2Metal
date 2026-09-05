@@ -24,7 +24,7 @@ This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub 
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
-GOALS.md / PLAN.md version-stamped; the session reached V199 (705 → 264 ms sustained across V195-V199).
+GOALS.md / PLAN.md version-stamped; the session reached V200 (705 → 264 ms sustained across V195-V199; V200 left a single inference path).
 
 **The working tree is clean as of V195.** The ~110 pending files were committed then: 50 were
 a stray `chmod +x` sweep (restored to 100644), 14 were build artifacts tracked *and*
@@ -53,7 +53,7 @@ docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app rpi-forge make kernel8.i
 | `make AWB=0` | Freeze the ISP white balance at the tuning-file daylight gains (WB_R=535, WB_B=455 Q8). Default **1** (V188): grey-world AWB once per frame in `debayer_awb_update()`, prints `[AWB] r= b=` every 32 frames. |
 | `make DEBUG=1` | Camera thumbnail in the canvas. |
 | `make SHOW_CAMERA=0` | Restore the V167 dark canvas. Default **1** (V186) paints the live 640×360 frame under the bboxes via `camera_render_fullres()` — measured +21 ms/frame in `render` (single-core; the V164 multi-core debayer was removed in V167). |
-| `make EXTRA_DEF=-D…` | Ad-hoc A/B defines without editing the Makefile: `-DD2M_ASYNC_CONV` (restore V180's cores-1-3 async split — 367 ms vs 264), `-DD2M_NO_S2P8` (P8 on stride 1 only, V195), `-DD2M_NO_P8` (no fast path). |
+| `make EXTRA_DEF=-D…` | Ad-hoc A/B defines without editing the Makefile: `-DD2M_NO_S2P8` (P8 on stride 1 only, V195), `-DD2M_NO_P8` (no conv2d fast path). |
 | `make clean` | Removes `*.o *.elf *.img` (all gitignored — safe). |
 
 `make` flags → `-D` defines: `USE_INT8_WEIGHTS`, `USE_INT8_W8A8`, `W8A8_DEBUG`,
@@ -173,10 +173,12 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   no position falls outside the fast path at all (the 1-px ring was 47 % of positions at S32,
   25 % at S16) — 435 → 367 ms. On HW the graph reaches these through
   `parallel_conv2d_pump_then` — **all four cores compute** and `display_pump()` runs between
-  convs (V199; V180's cores-1-3 async split is still there behind `-DD2M_ASYNC_CONV` and cost
-  103 ms/frame). The pump only does real work when a camera frame has just landed (~19 ms FSI
-  period), and the graph has ~60 convs/frame, so between-conv pumping is as frequent as the
-  old continuous spin. `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
+  convs. The pump only does real work when a camera frame has just landed (~19 ms FSI period)
+  and the graph runs ~63 convs/frame, so it repaints 10 times per inference (one per 29 ms)
+  against 15 (one per 26 ms) for V180's continuous spin, while the frame is 90 ms faster —
+  measured on HW with a live camera via `[PUMP] calls= paints=`. **V180's cores-1-3 async
+  dispatch was deleted in V200**; there is now exactly one inference path. Its numbers live
+  in PLAN.md V180/V198/V199/V200. `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
   4-position input group** to fix an L1 set-thrash when HW is a multiple of 2048.
   `-DD2M_NO_P8` disables the conv2d fast path for A/B. QEMU never starts secondaries →
   single-core fallback.

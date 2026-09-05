@@ -13,22 +13,31 @@ explícitamente algo de esa época.
 
 ---
 
-## Estado de partida
+## Estado de partida (actualizado 2026-09-04, tras V194-V200)
 
-- **491-492 ms/frame** en HW real @ 1 GHz stock, YOLOv8n 320×192, campo de
-  visión completo (V192). Desglose: `bb=183 neck=99 head=178` (+ cap/l0/render
-  menores).
-- **V193 (Winograd F(2×2,3×3)): implementado, correcto, pero más lento** (+6%).
-  Cerrado y documentado; código vivo detrás de `WINOGRAD=0` (default) por si
-  alguien retoma la reescritura GEMM que sí podría ganar (ver ítem 5).
-- El ítem más caro que queda es el head DFL: **4 conv3×3 (~97 ms)**, ~3.5× el
-  piso de cómputo NEON del A53 — ya cerca del límite para conv directa.
-- `tools/env` está roto (intérpretes de 0 bytes) — **bloquea cualquier cosa
-  que necesite re-exportar pesos** (torch/ultralytics). Esto es un bloqueador
-  transversal para varios ítems de abajo.
-- Hay ~104 archivos sin commitear (V180 ping-pong no bloqueante, V181 thumbnail
-  debug, V182 tracker con predicción de velocidad) — trabajo del usuario en
-  curso, no tocado en esta sesión.
+- **264 ms/frame sostenidos** en HW real @ 1000 MHz, YOLOv8n 320×192, FoV
+  completo. Desglose: `cap=1 l0=7 bb=88 neck=50 head=99 render=16`. Verificado
+  sobre 151-301 frames con `[SOC] arm=1000MHz thr=0x0` hasta 74 °C, y en vivo
+  con cámara (`[T]` mediana 293 ms incluyendo captura y render).
+- **De dónde vienen los 264**: la sesión empezó en **705 ms sostenidos** (los
+  491 que decía este archivo eran los primeros ~95 frames; después el firmware
+  bajaba el reloj a 600 MHz). Cadena: V196 reloj fijado por mailbox
+  (705 → 435), V195 P8 stride-2 + acumuladores `noinline` (504 → 435 dentro de
+  la ventana), V197 padding explícito (435 → 367), V199 los 4 cores calculan
+  (367 → 264). **Sin tocar el modelo, los pesos ni una sola FMA.**
+- **Un único camino de inferencia** desde V200 (borrado el reparto async de
+  V180), para que los A/B entre modelos no arrastren la duda de por cuál se
+  midió.
+- Dos verdades de este archivo se cayeron por el camino: "conv3×3 está cerca
+  del piso del A53" (se le sacó ~40 % al mismo kernel) y "el throttling
+  térmico" (era el governor del firmware, `thr` nunca dejó de ser 0).
+- El ítem más caro que queda sigue siendo el head DFL: **P3 head 65 ms**, con
+  P4 22 y P5 13 — 99 ms de 264, el 37 % del frame.
+- `tools/env` sigue roto (intérpretes de 0 bytes) — **y ahora es el bloqueador
+  principal**, porque lo único que queda por delante necesita re-exportar
+  pesos.
+- Árbol limpio y pusheado a `main`. El WIP de V180-182 quedó commiteado en
+  V200-, y de paso resultó que `HEAD` no compilaba (ver el log de la sesión).
 
 ---
 
@@ -40,31 +49,44 @@ explícitamente algo de esa época.
 python3 -m venv tools/env && tools/env/bin/pip install -r tools/requirements.txt
 ```
 
+**Ahora es el bloqueador único**: todo lo que queda por delante (comparar
+modelos, tocar el head) necesita re-exportar pesos. Todo lo que se podía
+hacer sin torch ya se hizo — el kernel pasó de 705 a 264 ms sostenidos.
+
 Sin esto, los ítems 3, 4 y 6 no se pueden ni empezar (todos necesitan
 `export_model.py`/torch). Verificar primero si este entorno tiene salida a
 internet para el `pip install` (torch + ultralytics son descargas grandes);
 si no la tiene, hay que resolverlo desde una máquina con acceso y traer la
 venv ya armada.
 
-### 2. Barrido de perfil `C2F_PROF` antes de asumir que ya no hay más aire (esfuerzo bajo, impacto incierto pero barato de descartar)
+### 2. ~~Barrido de perfil `C2F_PROF`~~ — **HECHO, y había mucho más aire del previsto**
 
-V190 encontró un bug real de *thrash* de L1 en el `conv1x1` de L2 (55 ms
-sobre un piso de ~3 ms) que nadie había visto hasta perfilar por capa. No hay
-garantía de que sea el único. `make bench C2F_PROF=N` para cada N de C2f
-(2,4,6,8,12,15,18,21) más `make bench HEAD_PROF=1` para P4/P5 (ya lo tenemos
-para P3) da un mapa completo por-conv. Buscar cualquier conv1x1 o conv3×3 que
-esté a >5-6× su piso teórico (proporcional a `C_in·C_out·K²·HW`) — esa es la
-señal que delató a L2. Si no aparece nada, confirma que V191 realmente dejó
-el codebase en el piso y cierra la pregunta con evidencia en vez de
-suposición.
+El perfil por capa ya estaba en `hwbench.log`; no hacía falta el barrido. Lo
+que mostró, comparando ms medidos contra MAC por capa: el `conv1x1` corría a
+2.3-2.5 GMAC/s y el `conv3×3` a 1.3-1.8, con las **stride-2 a 0.86-1.29** —
+mismo MAC, mismo silicio, la mitad del rendimiento. De ahí salieron V195
+(las 6 conv3×3 stride-2 no tenían fast path: 87 → 56 ms) y V197 (el anillo de
+padding era 47 % de las posiciones a S32: 435 → 367 ms). El veredicto "conv3×3
+está cerca del piso del A53" queda retirado: se le sacó ~40 % sin tocar una FMA.
 
-### 3. Head DFL: probar 1 conv por rama en vez de 2 (esfuerzo medio, impacto ~45-50 ms)
+Lo que sigue **sin** medir: no volví a comparar GMAC/s por capa después de
+V197/V199. Si alguien quiere reabrir el kernel, ese es el primer sitio donde
+mirar, y ahora cuesta una corrida de `make bench`.
+
+### 3. Head DFL: probar 1 conv por rama en vez de 2 (esfuerzo **alto**, impacto ~35-40 ms sobre 264)
 
 Cada rama del head (box/cls, en P3/P4/P5) apila 2 conv3×3 antes del conv1x1
-final. Quitar la segunda reduciría el ítem más caro del grafo (~97 ms → ~50 ms)
-sin tocar el kernel NEON. Riesgo: es un cambio de arquitectura, no un
-re-empaquetado de pesos — típicamente pierde exactitud sin reentrenar. Camino
-barato para acotar el riesgo **antes** de comprometerse:
+final. Quitar la segunda recortaría el ítem más caro del grafo: los tres heads
+son 99 ms de los 264 (37 %), y la segunda conv de cada rama es ~35-40 de esos.
+
+**Dos avisos sobre la versión anterior de este ítem.** (a) El esfuerzo no es
+medio: no hay fusión lineal válida porque entre las dos conv3×3 hay un SiLU,
+así que "fusionar sus pesos aproximando con la primera" no funciona — hace
+falta reentrenar o destilar, o sea dataset + GPU, no solo `export_model.py`.
+(b) Antes de eso hace falta **con qué medir la precisión**: hoy el único
+instrumento es "el reloj se detecta al 56 % en un frame". Ver ítem 3b.
+
+Camino barato para acotar el riesgo **antes** de comprometerse:
 
 1. Con `tools/env` arreglado, cargar los pesos YOLOv8n pre-entrenados de
    `ultralytics`, **cortar quirúrgicamente** la segunda conv de cada rama
@@ -75,6 +97,16 @@ barato para acotar el riesgo **antes** de comprometerse:
    recién ahí vale la pena exportar y portar al kernel. Si no, esto se cierra
    rápido y barato — mismo espíritu que el descarte de Winograd: medir antes
    de comprometer una sesión completa.
+
+### 3b. Harness de evaluación de precisión (prerequisito de 3, 4 y 6)
+
+Los ítems 3, 4 y 6 son todos trade-offs de precisión y no hay con qué medirla:
+el bench comprueba la numérica **bit a bit** contra un golden, que es perfecto
+para cambios de kernel (y por eso V195-V199 se pudieron hacer con confianza)
+pero no dice nada de mAP. Hace falta un conjunto de N frames capturados
+(`make capture` ya los produce) con las detecciones esperadas, o referencia
+PyTorch sobre los mismos tensores. Sin esto, cualquier comparación de modelos
+se decide mirando un porcentaje en una escena.
 
 ### 4. A/B de modelos: YOLOv5n vs YOLOv8n sobre el mismo frame capturado (esfuerzo alto, impacto en precisión + posible resolución)
 
@@ -95,6 +127,15 @@ Portarlo es trabajo real:
 Vale la pena solo si el objetivo es precisión/resolución, no velocidad pura
 (v5n no es necesariamente más rápido por parámetro-equivalente en este
 kernel — hay que medirlo, no asumirlo).
+
+**Empezar por YOLOv11n, no por v5n.** v11n usa el mismo head DFL, así que
+reutiliza `decode_v8_dfl` tal cual; v5n es anchor-based y obliga a reescribir
+el decode entero. Si el objetivo es precisión, v11n es a la vez el candidato
+más fuerte y el más barato de portar. Y antes de cualquiera de los dos hay un
+experimento **sin exportador ni venv**: YOLOv8n es fully-conv, así que un
+barrido de `YOLO_W`/`YOLO_H` (384×224, 288×160, …) responde hoy mismo, con los
+pesos actuales y a golpe de flag, cuánta confianza se compra por cuántos ms.
+Con 264 ms de base hay margen para subir resolución que antes no existía.
 
 ### 5. Winograd, segunda vuelta: reescritura estilo GEMM (esfuerzo alto, resultado incierto, impacto potencial grande)
 
@@ -121,10 +162,12 @@ acá para no perderlo.
 
 ## Housekeeping (barato, no bloquea nada, vale la pena en paralelo)
 
-- **Comitear el WIP de V180-182** en incrementos lógicos. 104 archivos sin
-  commitear durante semanas es frágil — un accidente de `git` (como el que
-  yo mismo cometí esta sesión con `git stash`, revertido sin pérdida) podría
-  no tener la misma suerte la próxima vez.
+- ~~**Comitear el WIP de V180-182**~~ — **HECHO.** De los 104 archivos, 50
+  eran un `chmod +x` accidental, 14 artefactos de build trackeados *y*
+  gitignoreados, y solo 2 eran fuente real — que resultaron ser la mitad
+  faltante de código ya commiteado: **`HEAD` no compilaba** (`yolo_v8n.cpp:586:
+  'parallel_async_done' was not declared`), y `main` en GitHub tampoco.
+  Arreglado y verificado con un build desde un worktree limpio.
 - **CI de compilación** (`GOALS.md` §G3, ya anotado, nunca hecho): un
   workflow que corra `docker run rpi-forge make kernel8.img` en cada push
   atraparía roturas de build sin depender de que alguien lo note a mano.
@@ -164,5 +207,13 @@ acá para no perderlo.
 ## Lo que NO vale la pena reintentar (ya medido, ver GOALS.md/CLAUDE.md)
 
 INT8 (Tier 1 y 2, A53 sin SDOT), interleave de FMLA, store contiguo vs
-`vgetq_lane`, y ahora Winograd F(2×2,3×3) en su forma directa (V193). No
-reabrir sin evidencia nueva.
+`vgetq_lane`, Winograd F(2×2,3×3) en su forma directa (V193), y el reparto
+async de V180 (cores 1-3 con el core 0 bombeando — medido en HW con cámara:
+383 vs 293 ms por 3 ms de diferencia en el intervalo de repintado; borrado en
+V200). No reabrir sin evidencia nueva.
+
+**Retirado de esta lista**: "conv3×3 está cerca del piso del A53". Lo estaba
+respecto al kernel de V191, no respecto al A53 — V195/V197/V199 le sacaron
+~40 % al mismo kernel sin tocar una FMA. La evidencia que lo delató estaba a
+la vista: el `conv1x1` de este mismo repo corre a 2.5 GMAC/s y el `conv3×3` a
+1.3-1.8.

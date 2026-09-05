@@ -89,8 +89,12 @@ edit five files in three layers (`kernel.cpp`, `hud.cpp`, `camera.h`,
 ### G2 — Throughput viability
 
 Reach a frame rate where real-world applications are worth pursuing.
-Today: **1.41 fps** at YOLOv8n 256² FP32 (V170). Track B in PLAN.md
-projects ~13–15 fps after INT8 + frame-skip.
+Today: **3.8 fps inference sustained** (264 ms/frame) at YOLOv8n 320×192 FP32,
+full sensor FoV, with the camera + HUD at capture rate (V200). Was 1.41 fps at
+256² when this goal was written (V170), and 1.4 fps *in steady state* as
+recently as V193 — the firmware dropped the ARM clock after ~60 s and nobody
+had an instrument pointed at it (V196). The INT8 projection below never
+materialised; the 2.7x came from the kernel and the clock instead.
 
 - **B3 — INT8 quantization** (`tools/B3_INT8_PLAN.md`). Calibrated
   offline on ~50 real frames, `vmlal_s16` + `vmovl_s8` kernels.
@@ -228,16 +232,16 @@ projects ~13–15 fps after INT8 + frame-skip.
   until refreshed. Trade-off: bbox staleness × N (e.g. at N=10,
   detections lag the scene by ~0.7 s) for an order-of-magnitude
   UX win on perceived smoothness.
-  - [ ] Add `FRAME_SKIP_N ?= 1` Makefile flag → `YOLO_INFER_EVERY_N`.
-        N=1 = no change; N>1 = skip inference on (N-1) of N frames.
-  - [ ] Split `run_yolo_complete` so the capture + render path runs
-        every frame; the heavy graph (preprocess + backbone + neck +
-        head + NMS) runs only on the chosen interval. `preds[]` is
-        the cache between inferences.
-  - [ ] HW measurement of effective frame cadence with N=4 and N=10.
-- [ ] Stop point: ~16 fps real (camera/HUD) at any N; inference fps
-      = 1.4 / N (e.g. N=10 → real inference 0.14 fps but bboxes
-      refreshed at 16 fps). A53 bare-metal target tops out here.
+  - [x] `FRAME_SKIP_N ?= 4` Makefile flag → `YOLO_INFER_EVERY_N` (V187).
+  - [x] `run_yolo_complete` split so capture + render run every frame and
+        the heavy graph only on the interval; `preds[]` is the cache.
+  - [x] HW measurement: camera + HUD at capture rate, inference at
+        264 ms/frame sustained (V200).
+- [x] **Stop point reached and passed.** The A53 bare-metal target was
+      called at "~16 fps display, inference 1.4/N fps". Inference alone is
+      now 3.8 fps sustained, so at N=4 detections refresh ~1 per 1.1 s with
+      the display at capture rate. The remaining 264 ms is 37 % detection
+      heads, 33 % backbone, 19 % neck.
 - **V183 (2026-09-03) — first real per-layer HW profile + P8.** With the
   new bench (G3) the fp32 graph at `YOLO_IN=256`, 600 MHz, `test_image`:
   **1276 ms/frame** — `bb=502 neck=289 head=431` (V189 stock 1 GHz: 799 ms;
@@ -303,7 +307,21 @@ projects ~13–15 fps after INT8 + frame-skip.
         throughput with no change to the graph** — bigger than every kernel
         optimisation of this session combined, and invisible to the 3-frame
         bench that had been the only instrument.
-  - [ ] **Head conv3×3 (~98 ms), still the biggest item** — 4 × (64→64 @S8), ~3.5×
+  - [x] **V197 — explicit padding, V199 — all four cores, V200 — one path.**
+        V197: the P8 fast path only covered positions whose 3×3 window misses
+        the padding, and that ring is 25 % of positions at S16 and 47 % at S32;
+        padding the input into an (H+2)×(W+2) scratch and running with `pad=0`
+        removes the slow path entirely — 435 → 367 ms. V199: V180 kept core 0
+        out of the split so the display would not freeze, but `display_pump()`
+        only does real work when a camera frame lands (~19 ms), so pumping
+        *between* convs gives 10 repaints per inference (one per 29 ms) against
+        15 (one per 26 ms) while the frame drops 383 → 293 ms with a live
+        camera — the trade-off did not exist. V200 deleted the async path so
+        there is exactly one inference path before model comparisons start.
+        Found on the way: TASK_CONV2D's worker slicing dropped the tail groups
+        when n_grp % 4 != 0, leaving channels 64-79 of every cls branch as
+        garbage (V198) — latent since V180 because HW used the async path.
+  - [ ] **Detection heads (99 ms of 264, 37 %), still the biggest item** — 4 × (64→64 @S8), ~3.5×
         the A53 f32 floor after P8 (same "near the instruction-mix limit"
         verdict as D2M). Winograd tried (V193, see below) and closed as a
         regression. Remaining option: cut the DFL head to 1 conv per branch
