@@ -1,0 +1,34 @@
+# Entorno Python para los exportadores del modelo (export_model.py,
+# export_int8.py, calibrate_int8.py, convert_image.py).
+#
+# Por qué una imagen y no un venv: `tools/env` se rompió por debajo (los
+# intérpretes quedaron en 0 bytes cuando desapareció el miniconda que los
+# proveía) y estuvo bloqueando el trabajo de modelo durante meses. Un venv
+# depende de un intérprete del host que puede evaporarse; esto se reconstruye
+# desde el repo. Mismo patrón que `Dockerfile` (rpi-forge) para el toolchain.
+#
+# Versiones pinneadas a las que produjeron los pesos vigentes (leídas del venv
+# viejo antes de jubilarlo). torch va en su build **CPU**: aquí solo se exporta
+# e infiere en el host para generar/validar blobs, no se entrena.
+FROM python:3.13-slim
+
+# libGL/libglib/libxcb: opencv (dependencia de ultralytics) los enlaza aunque
+# nunca abramos una ventana. Sin esto `import ultralytics` falla con
+# "libxcb.so.1: cannot open shared object file".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        torch==2.10.0 torchvision==0.25.0 \
+        numpy==2.4.2 pillow==12.1.1 ultralytics==8.4.14
+
+# Ultralytics escribe settings/caches en $HOME; con --user el HOME del host no
+# es escribible dentro del contenedor. USER hace falta porque corremos con
+# `--user $(id -u)`, ese uid no tiene entrada en /etc/passwd y torch llama a
+# getpass.getuser() al elegir el directorio de caché de inductor
+# ("OSError: No username set in the environment").
+ENV YOLO_CONFIG_DIR=/tmp HOME=/tmp USER=d2m \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor MPLCONFIGDIR=/tmp/mpl
+WORKDIR /app

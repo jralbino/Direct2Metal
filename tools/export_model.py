@@ -163,13 +163,26 @@ def write_weights_crc_header(weights_path, header_path):
 # ---------------------------------------------------------------------------
 def main():
     print("=== Exporting YOLOv8n Weights (FP32 NEON-repacked) ===")
-    yolo = YOLO("yolov8n.pt")
+    # Checkpoint del repo, no relativo al cwd: si ultralytics no lo encuentra
+    # se lo descarga solo y exportaríamos pesos distintos sin enterarnos.
+    ckpt = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "yolov8n.pt")
+    if not os.path.isfile(ckpt):
+        raise SystemExit(f"falta {ckpt}")
+    yolo = YOLO(ckpt)
     model = yolo.model           # DetectionModel
     model.eval()
     model.fuse()                 # fold BN into Conv2d.bias / weight
     seq = model.model            # nn.Sequential of 23 blocks (0..22)
 
-    src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
+    # V201: `src/` se retiró en V171 (GOALS.md G1 paso 5) — los blobs viven en
+    # `app/<APP>/`. Este exportador se quedó apuntando al directorio viejo desde
+    # entonces; `convert_image.py` sí se arregló (V184). Misma convención que
+    # aquél: raíz del repo + app/<APP>, con `--app` para sobreescribir.
+    app_name = os.environ.get("D2M_APP", "yolo_v8n_coco")
+    root     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_dir  = os.path.join(root, "app", app_name)
+    if not os.path.isdir(src_dir):
+        raise SystemExit(f"no existe {src_dir} (¿APP mal puesto? usa D2M_APP=<nombre>)")
     weights_path = os.path.join(src_dir, "weights.bin")
 
     # YOLOv8n graph (width=0.25, depth=0.33). Indices match ultralytics yaml.

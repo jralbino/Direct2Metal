@@ -169,7 +169,15 @@ def main():
     model.fuse()
     seq = model.model
 
-    src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
+    # V201: `src/` se retiró en V171 (GOALS.md G1 paso 5) — los blobs viven en
+    # `app/<APP>/`. Este exportador se quedó apuntando al directorio viejo desde
+    # entonces; `convert_image.py` sí se arregló (V184). Misma convención que
+    # aquél: raíz del repo + app/<APP>, con `--app` para sobreescribir.
+    app_name = os.environ.get("D2M_APP", "yolo_v8n_coco")
+    root     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_dir  = os.path.join(root, "app", app_name)
+    if not os.path.isdir(src_dir):
+        raise SystemExit(f"no existe {src_dir} (¿APP mal puesto? usa D2M_APP=<nombre>)")
     bin_path = os.path.join(src_dir, "weights_int8.bin")
 
     with open(bin_path, "wb") as f:

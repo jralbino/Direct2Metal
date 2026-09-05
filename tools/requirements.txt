@@ -1,2 +1,11 @@
-torch
-numpy
+# Pinneado a lo que produjo los pesos vigentes (weights.bin CRC 0x176A3D5A).
+# La forma soportada de usarlo es la imagen `tools/Dockerfile.torch`:
+#   docker build -f tools/Dockerfile.torch -t d2m-torch .
+#   docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app d2m-torch python tools/export_model.py
+# Un venv del host también sirve, pero es lo que se rompió antes: `tools/env`
+# quedó inservible cuando desapareció el intérprete de miniconda que lo proveía.
+torch==2.10.0
+torchvision==0.25.0
+numpy==2.4.2
+pillow==12.1.1
+ultralytics==8.4.14

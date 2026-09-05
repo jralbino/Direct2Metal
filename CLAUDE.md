@@ -102,6 +102,21 @@ camera build, AE/AWB convergence, live `[DET]`, and `[PUMP] calls= paints=` (pum
 actual HUD repaints per inference frame — the objective form of "does the HUD still feel
 smooth"). Detections will not match `GOLDEN`, hence `--no-golden`.
 
+**Accuracy, as opposed to bit-exactness** (V201, `tools/eval_reference.py`): the bench's
+`[ABS]` fingerprint is the right instrument for kernel changes and says nothing about
+detection quality. `eval_reference.py` runs YOLOv8n in PyTorch on **the kernel's own input
+tensor** and prints detections in `GOLDEN` format, reading CONF/NMS thresholds from
+`bsp/safety_config.h`. On the current golden frame reference and kernel agree exactly
+(`[(74, 56)]`), so a disagreement means the port, and a change in the reference alone means
+the model. Use it before/after anything that touches the graph or the input geometry.
+
+**Input geometry is a `bsp.h` edit** — `YOLO_W`, `YOLO_H`, `YOLO_LETTERBOX_TOP`,
+`YOLO_CONTENT_H` (isotropic: `1536/YOLO_W == 864/YOLO_CONTENT_H`), same weights. Measured on
+HW (V201): 256×160 207 ms, 320×192 275, 384×224 383, 448×256 507 — linear in pixels — while
+detection quality saturates at 384×224 (clock 50/65/70/70 % on one fixed captured frame).
+**`make clean` between geometry changes**: the Makefile does not track header dependencies,
+so editing `bsp.h` alone rebuilds nothing.
+
 **Real camera frame → golden** (V185): `make capture` builds `kernel8_capture.img`
 (`-DCAPTURE_FRAME=N`, camera ON, separate `cap_*.o`) and dumps the exact model input of frame
 N over UART as base64 (`[CAP] begin/end`, watchdog kicked during the ~90 s dump);
@@ -120,17 +135,28 @@ Weights + test image are `.incbin`'d via `app/yolo_v8n_coco/data.s` (4 blobs: fp
 w8a8, image). After touching the model or exporters:
 
 ```bash
+D2M="docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app d2m-torch python"
 python3 tools/convert_image.py                # -> app/<APP>/test_image.bin, [3][YOLO_H][YOLO_W]
                                                #    (Pillow + numpy; reads YOLO_W/YOLO_H from bsp/bsp.h)
-tools/env/bin/python tools/export_model.py    # -> weights.bin + weights_crc.h   (needs torch)
-tools/env/bin/python tools/export_int8.py     # -> weights_int8*.bin + *_crc.h   (only if INT8 matters)
+$D2M tools/export_model.py                    # -> weights.bin + weights_crc.h   (needs torch)
+$D2M tools/export_int8.py                     # -> weights_int8*.bin + *_crc.h   (only if INT8 matters)
+$D2M tools/eval_reference.py                  # -> PyTorch detections on the kernel's own tensor
 make d2m_data.bin                              # -> d2m_data.bin for the bench (recopy to SD)
 ```
 
-**`tools/env` is broken** (2026-09-03): `tools/env/bin/python{,3,3.13}` are 0-byte files
-(dated 2026-07-08), so the torch-based exporters cannot run until the venv is recreated
-(`python3 -m venv tools/env && tools/env/bin/pip install -r tools/requirements.txt`).
-`convert_image.py` deliberately needs only system `python3`.
+**The torch tooling runs in Docker, not in a venv** (V201). `tools/env` was dead for months
+(0-byte interpreters — the miniconda that provided them had been removed, and its 7.7 GB
+`cp313` site-packages will not load under the host's Python 3.14). Build the image once and
+run the exporters through it:
+
+```bash
+docker build -f tools/Dockerfile.torch -t d2m-torch .
+docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app d2m-torch python tools/export_model.py
+```
+
+Versions are pinned to the ones that produced the shipped weights, and that is verified:
+`export_model.py` reproduces `weights.bin` byte-for-byte (CRC 0x176A3D5A). `tools/env` is now
+dead weight on disk — safe to delete. `convert_image.py` still needs only system `python3`.
 
 The kernel CRC-checks each blob at boot and halts on mismatch. Weight layout selection
 (exporter ↔ `bsp/multicore.cpp` unpack) must stay in sync:

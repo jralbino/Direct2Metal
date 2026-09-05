@@ -43,21 +43,24 @@ explícitamente algo de esa época.
 
 ## Ítems, en orden recomendado
 
-### 1. Arreglar `tools/env` (bloqueador, esfuerzo bajo)
+### 1. ~~Arreglar `tools/env`~~ — **HECHO (V201), y no recreándolo**
 
-```
-python3 -m venv tools/env && tools/env/bin/pip install -r tools/requirements.txt
-```
+La causa era que el miniconda que proveía el intérprete había desaparecido del
+host. El `site-packages` de 7.7 GB seguía ahí, intacto, pero es `cp313` y en el
+host solo queda Python 3.14: los `.so` de torch/numpy no cargan. Recrear el venv
+habría dejado el mismo problema esperando a la próxima limpieza del host.
 
-**Ahora es el bloqueador único**: todo lo que queda por delante (comparar
-modelos, tocar el head) necesita re-exportar pesos. Todo lo que se podía
-hacer sin torch ya se hizo — el kernel pasó de 705 a 264 ms sostenidos.
+Sustituido por **`tools/Dockerfile.torch`** (imagen `d2m-torch`), mismo patrón
+que `rpi-forge` para el toolchain, con torch CPU y versiones pinneadas a las que
+produjeron los pesos vigentes. Validado de la forma fuerte: `export_model.py`
+**reproduce `weights.bin` byte a byte** (CRC 0x176A3D5A, `git status` limpio).
 
-Sin esto, los ítems 3, 4 y 6 no se pueden ni empezar (todos necesitan
-`export_model.py`/torch). Verificar primero si este entorno tiene salida a
-internet para el `pip install` (torch + ultralytics son descargas grandes);
-si no la tiene, hay que resolverlo desde una máquina con acceso y traer la
-venv ya armada.
+De paso salieron dos bugs latentes que habrían quemado la siguiente sesión: los
+exportadores escribían en `../src/` (directorio retirado en V171) y cargaban
+`yolov8n.pt` relativo al cwd — si ultralytics no lo encuentra **se lo descarga
+solo**, y habríamos exportado pesos distintos sin enterarnos.
+
+`tools/env` (7.7 GB) queda como peso muerto en disco; se puede borrar.
 
 ### 2. ~~Barrido de perfil `C2F_PROF`~~ — **HECHO, y había mucho más aire del previsto**
 
@@ -98,15 +101,19 @@ Camino barato para acotar el riesgo **antes** de comprometerse:
    rápido y barato — mismo espíritu que el descarte de Winograd: medir antes
    de comprometer una sesión completa.
 
-### 3b. Harness de evaluación de precisión (prerequisito de 3, 4 y 6)
+### 3b. ~~Harness de evaluación de precisión~~ — **HECHO (V201)**
 
-Los ítems 3, 4 y 6 son todos trade-offs de precisión y no hay con qué medirla:
-el bench comprueba la numérica **bit a bit** contra un golden, que es perfecto
-para cambios de kernel (y por eso V195-V199 se pudieron hacer con confianza)
-pero no dice nada de mAP. Hace falta un conjunto de N frames capturados
-(`make capture` ya los produce) con las detecciones esperadas, o referencia
-PyTorch sobre los mismos tensores. Sin esto, cualquier comparación de modelos
-se decide mirando un porcentaje en una escena.
+`tools/eval_reference.py` corre YOLOv8n en PyTorch sobre **el mismo tensor que
+ve el kernel** y saca las detecciones en formato `GOLDEN`; los umbrales los lee
+de `bsp/safety_config.h` para que no puedan derivar. Con esto el banco pasa a
+tener dos instrumentos complementarios: `[ABS]` para la numérica bit a bit y
+éste para la calidad.
+
+**Primer resultado, y vale la pena tenerlo escrito**: sobre el golden actual,
+referencia `[(74, 56)]` y kernel `[(74, 56)]` — **idénticos al punto
+porcentual**. O sea el port bare-metal coincide con PyTorch sobre el mismo
+tensor. A partir de ahora, si los dos discrepan es el port; si cambia solo la
+referencia, es el modelo.
 
 ### 4. A/B de modelos: YOLOv5n vs YOLOv8n sobre el mismo frame capturado (esfuerzo alto, impacto en precisión + posible resolución)
 
@@ -133,9 +140,22 @@ reutiliza `decode_v8_dfl` tal cual; v5n es anchor-based y obliga a reescribir
 el decode entero. Si el objetivo es precisión, v11n es a la vez el candidato
 más fuerte y el más barato de portar. Y antes de cualquiera de los dos hay un
 experimento **sin exportador ni venv**: YOLOv8n es fully-conv, así que un
-barrido de `YOLO_W`/`YOLO_H` (384×224, 288×160, …) responde hoy mismo, con los
-pesos actuales y a golpe de flag, cuánta confianza se compra por cuántos ms.
-Con 264 ms de base hay margen para subir resolución que antes no existía.
+barrido de `YOLO_W`/`YOLO_H` responde sin exportador cuánta confianza se compra
+por cuántos ms. **Ya medido (V201)** — tiempos en HW y calidad sobre un frame
+real capturado a 448×256 y submuestreado a las demás geometrías (escena
+idéntica por construcción):
+
+| geometría | T en HW | clock (referencia) |
+|---|---|---|
+| 256×160 | 207 ms | 50 % |
+| 320×192 | **275 ms** | **65 %** |
+| 384×224 | 383 ms | 70 % |
+| 448×256 | 507 ms | 70 % |
+
+El tiempo es lineal en píxeles (4.4-5.0 ms por cada 1000 px) y **la calidad
+satura en 384×224**: de 320 a 384 son +108 ms (+39 %) por +5 pp, y de 384 a 448
++124 ms por **nada**. Así que subir resolución no es el camino barato que
+parecía: si hace falta más precisión, tiene que venir del modelo.
 
 ### 5. Winograd, segunda vuelta: reescritura estilo GEMM (esfuerzo alto, resultado incierto, impacto potencial grande)
 
