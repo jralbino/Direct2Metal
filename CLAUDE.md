@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (320×192, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **435 ms/frame sustained** at `YOLO_W=320,
-YOLO_H=192` (V195 — P8 for stride 2 + noinline accumulator leaves; V192 504 ms at full sensor
+the Pi Camera Module 3 (IMX708). Real-hardware results: **367 ms/frame sustained** at `YOLO_W=320,
+YOLO_H=192` (V197 — explicit input padding so the P8 fast path covers 100 % of positions; V195 435 ms
+with P8 for stride 2 + noinline accumulator leaves; V192 504 ms at full sensor
 FoV, V191 541 ms at 256², V189 799 ms, V183 1276 ms at 600 MHz). Every timing claim comes with
 its `[SOC] arm= temp= thr=` line (V194). **Validate perf with a long run, never the 3-frame
 bench**: until V196 the firmware dropped the ARM clock 1000 → 600 MHz ~60 s after boot
@@ -22,7 +23,7 @@ This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub 
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
-GOALS.md / PLAN.md version-stamped; the session reached V196 (ARM clock pinned — 705 → 435 ms sustained).
+GOALS.md / PLAN.md version-stamped; the session reached V197 (padding → 367 ms sustained; V196 pinned the ARM clock, 705 → 435).
 
 **The working tree is clean as of V195.** The ~110 pending files were committed then: 50 were
 a stray `chmod +x` sweep (restored to 100644), 14 were build artifacts tracked *and*
@@ -151,7 +152,12 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   `(stride, pad)`** — the six stride-2 conv3×3 (L1/L3/L5/L7/L16/L19, 87 ms) had no fast
   path at all — and moves the accumulator body into `p8_accum_{4,8}ch<S>`, `noinline`
   templates specialised on the stride. Both halves are bit-exact and worth ~35 ms each;
-  the accumulator must stay a leaf — letting it inline costs 37 ms/frame. `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
+  the accumulator must stay a leaf — letting it inline costs 37 ms/frame. **V197 pads the
+  input into a `(H+2)×(W+2)` scratch once per K=3/s1/p1 conv and runs it with `pad=0`**, so
+  no position falls outside the fast path at all (the 1-px ring was 47 % of positions at S32,
+  25 % at S16) — 435 → 367 ms. On HW the graph reaches these through
+  `parallel_conv2d_async_start`, which uses **cores 1-3 only** (core 0 pumps the display,
+  V180), so every timing here is a 3-core number. `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
   4-position input group** to fix an L1 set-thrash when HW is a multiple of 2048.
   `-DD2M_NO_P8` disables the conv2d fast path for A/B. QEMU never starts secondaries →
   single-core fallback.

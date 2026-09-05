@@ -140,28 +140,29 @@ static inline void winograd_output_transform(const float32x4_t M[16], float32x4_
  * offsets constantes `oy-1` / `ox-1` ni reducir la inducción): medido en HW,
  * 504 → 492 ms con la versión runtime vs 504 → 482 con ésta. Con S constante
  * la instancia S=1 genera exactamente el código de V191 y la S=2 es la que
- * hasta ahora no existía. `pad` es siempre 1 aquí (el call site lo exige). */
+ * hasta ahora no existía. `pad` es 0 o 1 y solo entra en dos
+ * inicializadores invariantes del lazo, así que pasarlo en runtime no cuesta. */
 template<int S>
 __attribute__((noinline)) static void p8_accum_4ch(const float* in, int W_in, int HW_in, int C_in,
                                 const float* wg, int fy0, int fy1, int fx0, int fx1,
-                                float acc4[][4]) {
+                                int pad, float acc4[][4]) {
     for (int ci = 0; ci < C_in; ci++) {
         const float* ipc = in + ci * HW_in;
         const float* wci = wg + ci * 36;
         if (ci + 1 < C_in) {
             __builtin_prefetch(wg + (ci+1) * 36, 0, 3);
-            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-1)*W_in + (fx0*S-1), 0, 3);
+            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-pad)*W_in + (fx0*S-pad), 0, 3);
         }
         float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 4), w2=vld1q_f32(wci+ 8);
         float32x4_t w3=vld1q_f32(wci+12), w4=vld1q_f32(wci+16), w5=vld1q_f32(wci+20);
         float32x4_t w6=vld1q_f32(wci+24), w7=vld1q_f32(wci+28), w8=vld1q_f32(wci+32);
         int p = 0;
-        int iy = fy0 * S - 1;
+        int iy = fy0 * S - pad;
         for (int oy = fy0; oy < fy1; oy++, iy += S) {
             const float* r0 = ipc + iy * W_in;
             const float* r1 = r0 + W_in;
             const float* r2 = r1 + W_in;
-            int b = fx0 * S - 1;
+            int b = fx0 * S - pad;
             for (int ox = fx0; ox < fx1; ox++, p++, b += S) {
                 float32x4_t a = vld1q_f32(acc4[p]);
                 a=vmlaq_n_f32(a,w0,r0[b]);   a=vmlaq_n_f32(a,w1,r0[b+1]); a=vmlaq_n_f32(a,w2,r0[b+2]);
@@ -176,13 +177,13 @@ __attribute__((noinline)) static void p8_accum_4ch(const float* in, int W_in, in
 template<int S>
 __attribute__((noinline)) static void p8_accum_8ch(const float* in, int W_in, int HW_in, int C_in,
                                 const float* wg, int fy0, int fy1, int fx0, int fx1,
-                                float accl[][4], float acch[][4]) {
+                                int pad, float accl[][4], float acch[][4]) {
     for (int ci = 0; ci < C_in; ci++) {
         const float* ipc = in + ci * HW_in;
         const float* wci = wg + ci * 72;
         if (ci + 1 < C_in) {
             __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
-            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-1)*W_in + (fx0*S-1), 0, 3);
+            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-pad)*W_in + (fx0*S-pad), 0, 3);
         }
         float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 8), w2=vld1q_f32(wci+16);
         float32x4_t w3=vld1q_f32(wci+24), w4=vld1q_f32(wci+32), w5=vld1q_f32(wci+40);
@@ -191,12 +192,12 @@ __attribute__((noinline)) static void p8_accum_8ch(const float* in, int W_in, in
         float32x4_t W3=vld1q_f32(wci+28), W4=vld1q_f32(wci+36), W5=vld1q_f32(wci+44);
         float32x4_t W6=vld1q_f32(wci+52), W7=vld1q_f32(wci+60), W8=vld1q_f32(wci+68);
         int p = 0;
-        int iy = fy0 * S - 1;
+        int iy = fy0 * S - pad;
         for (int oy = fy0; oy < fy1; oy++, iy += S) {
             const float* r0 = ipc + iy * W_in;
             const float* r1 = r0 + W_in;
             const float* r2 = r1 + W_in;
-            int b = fx0 * S - 1;
+            int b = fx0 * S - pad;
             for (int ox = fx0; ox < fx1; ox++, p++, b += S) {
                 float32x4_t al = vld1q_f32(accl[p]);
                 float32x4_t ah = vld1q_f32(acch[p]);
@@ -265,12 +266,12 @@ static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const
                 int fx0 = x_tile > lo_lim ? x_tile : lo_lim;
                 int fx1 = x_end  < hx_lim ? x_end  : hx_lim;
                 bool ran_fast = false;
-                if (kP8 && K == 3 && pad == 1 && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
+                if (kP8 && K == 3 && (pad == 0 || pad == 1) && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
                     int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float acc4[TILE_H * TILE_W][4];
                     for (int p = 0; p < fnpos; p++) vst1q_f32(acc4[p], vdupq_n_f32(0.0f));
-                    if (stride == 1) p8_accum_4ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, acc4);
-                    else             p8_accum_4ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, acc4);
+                    if (stride == 1) p8_accum_4ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, pad, acc4);
+                    else             p8_accum_4ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, pad, acc4);
                     int p = 0;
                     for (int oy = fy0; oy < fy1; oy++) {
                         for (int ox = fx0; ox < fx1; ox++, p++) {
@@ -538,14 +539,14 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                                                          v_bl, v_bh, do_silu, oc, &ry1, &rx1);
                 }
 #endif
-                if (!ran_fast && kP8 && K == 3 && pad == 1 && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
+                if (!ran_fast && kP8 && K == 3 && (pad == 0 || pad == 1) && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
                     int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float accl[TILE_H * TILE_W][4];
                     float acch[TILE_H * TILE_W][4];
                     for (int p = 0; p < fnpos; p++) { vst1q_f32(accl[p], vdupq_n_f32(0.0f)); vst1q_f32(acch[p], vdupq_n_f32(0.0f)); }
 
-                    if (stride == 1) p8_accum_8ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, accl, acch);
-                    else             p8_accum_8ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, accl, acch);
+                    if (stride == 1) p8_accum_8ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, pad, accl, acch);
+                    else             p8_accum_8ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, pad, accl, acch);
 
                     int p = 0;
                     for (int oy = fy0; oy < fy1; oy++) {
@@ -744,7 +745,54 @@ static void wait_for_workers() {
     asm volatile("dsb ish" : : : "memory");
 }
 
+/* ── V197: padding explícito — que el fast path cubra el 100 % ─────────────
+ * El fast path P8 solo corre donde la ventana 3×3 no toca padding; el anillo
+ * de 1 px cae al camino genérico que re-lee los pesos por posición (~2× más
+ * lento, medido en el A/B de V191). Ese anillo no es despreciable en las
+ * rejillas chicas de este grafo: 6.6 % de las posiciones a S4, 12.9 % a S8,
+ * 25 % a S16 y **46.7 % a S32**.
+ *
+ * En vez de acelerar el borde, se elimina: se copia la entrada una vez a un
+ * buffer (H+2)×(W+2) con el borde a cero y se convoluciona con `pad=0`. Ahí
+ * `lo_lim` = 0 y `hy_lim` = H_out, así que *no queda ninguna* posición fuera
+ * del fast path y el camino por-posición deja de ejecutarse. El coste es una
+ * pasada de memoria por conv contra una ganancia proporcional al anillo.
+ *
+ * Solo para K=3/s1/p1: en stride 2 el anillo ya es marginal (V195 lo dejó en
+ * la fila y columna 0), no compensa la copia. */
+#define PAD_BUF_FLOATS (128 * 1024)   /* 512 KB. Mayor caso del grafo a 320×192:
+                                       * P3.cls1, 80 ch a S8 → 80·26·42 = 87 360.
+                                       * Si algún día no entra, el guard de abajo
+                                       * simplemente no padea (más lento, correcto). */
+static float g_pad_buf[PAD_BUF_FLOATS];
+
+static void pad3x3_chw(const float* in, int C, int H, int W, float* out) {
+    const int Wp = W + 2, Hp = H + 2;
+    for (int c = 0; c < C; c++) {
+        const float* src = in  + (long)c * H  * W;
+        float*       dst = out + (long)c * Hp * Wp;
+        for (int x = 0; x < Wp; x++) { dst[x] = 0.0f; dst[(long)(Hp - 1) * Wp + x] = 0.0f; }
+        for (int y = 0; y < H; y++) {
+            float* d = dst + (long)(y + 1) * Wp;
+            const float* srow = src + (long)y * W;
+            d[0] = 0.0f; d[Wp - 1] = 0.0f;
+            for (int x = 0; x < W; x++) d[x + 1] = srow[x];
+        }
+    }
+}
+
+/* nullptr = no aplica (o no entra en el buffer) → el llamador sigue con pad=1. */
+static const float* try_pad3x3(const float* in, int C_in, int H_in, int W_in,
+                               int K, int stride, int pad) {
+    if (K != 3 || pad != 1 || stride != 1) return nullptr;
+    if ((long)C_in * (H_in + 2) * (W_in + 2) > (long)PAD_BUF_FLOATS) return nullptr;
+    pad3x3_chw(in, C_in, H_in, W_in, g_pad_buf);
+    return g_pad_buf;
+}
+
 void parallel_conv2d(const float* in, int H_in, int W_in, int C_in, const float* w_rep, const float* bias, int C_out, int K, int stride, int pad, bool do_silu, float* out) {
+    { const float* pin = try_pad3x3(in, C_in, H_in, W_in, K, stride, pad);
+      if (pin) { in = pin; H_in += 2; W_in += 2; pad = 0; } }
     int grp_w = (C_out >= 32 && (C_out & 7) == 0) ? 8 : 4;
     int n_grp = C_out / grp_w; probe_multicore();
     if (!multicore_available) {
@@ -779,6 +827,8 @@ static void dispatch_task_async() {
 void parallel_conv2d_async_start(const float* in, int H_in, int W_in, int C_in,
                                  const float* w_rep, const float* bias, int C_out, int K,
                                  int stride, int pad, bool do_silu, float* out) {
+    { const float* pin = try_pad3x3(in, C_in, H_in, W_in, K, stride, pad);
+      if (pin) { in = pin; H_in += 2; W_in += 2; pad = 0; } }
     int grp_w = (C_out >= 32 && (C_out & 7) == 0) ? 8 : 4;
     int n_grp = C_out / grp_w;
     probe_multicore();
