@@ -7,18 +7,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **491 ms/frame** at `YOLO_W=320,
-YOLO_H=192` (V192 — full sensor FoV, non-square input; V191 was 541 ms at 256², V189 799 ms,
-V183 1276 ms at 600 MHz). The graph is fully convolutional so the same YOLOv8n weights run
+the Pi Camera Module 3 (IMX708). Real-hardware results: **435 ms/frame** at `YOLO_W=320,
+YOLO_H=192` (V195 — P8 for stride 2 + noinline accumulator leaves; V192 504 ms at full sensor
+FoV, V191 541 ms at 256², V189 799 ms, V183 1276 ms at 600 MHz). Every timing claim now comes
+with its `[SOC] arm= temp= thr=` line (V194) — the bench repeats to ±0 ms at a fixed clock. The graph is fully convolutional so the same YOLOv8n weights run
 at any input divisible by 32; `bsp.h` holds `YOLO_W`/`YOLO_H`. The four P3-head conv3×3
-(~95 ms) are the biggest item, ~3.5× the A53 compute floor. With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
+(~90 ms of the 98 ms P3 head) are still the biggest item. With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
 the capture rate and boxes update every 4th frame.
 This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub repo (V76)
 — do not develop there.
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
-GOALS.md / PLAN.md version-stamped; the session reached V193 (Winograd — closed, no perf change).
+GOALS.md / PLAN.md version-stamped; the session reached V195 (P8 stride-2, 504 → 435 ms).
 
 **Working tree has ~110 uncommitted files of the user's V180/V181 work.** Never
 `git stash`, `git checkout -- .`, or `make clean`-style sweeps that could touch them. If you
@@ -44,6 +45,7 @@ docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app rpi-forge make kernel8.i
 | `make AWB=0` | Freeze the ISP white balance at the tuning-file daylight gains (WB_R=535, WB_B=455 Q8). Default **1** (V188): grey-world AWB once per frame in `debayer_awb_update()`, prints `[AWB] r= b=` every 32 frames. |
 | `make DEBUG=1` | Camera thumbnail in the canvas. |
 | `make SHOW_CAMERA=0` | Restore the V167 dark canvas. Default **1** (V186) paints the live 640×360 frame under the bboxes via `camera_render_fullres()` — measured +21 ms/frame in `render` (single-core; the V164 multi-core debayer was removed in V167). |
+| `make EXTRA_DEF=-D…` | Ad-hoc A/B defines without editing the Makefile: `-DD2M_NO_S2P8` (P8 on stride 1 only, V195), `-DD2M_NO_P8` (no fast path). |
 | `make clean` | Removes `*.o *.elf *.img` (all gitignored — safe). |
 
 `make` flags → `-D` defines: `USE_INT8_WEIGHTS`, `USE_INT8_W8A8`, `W8A8_DEBUG`,
@@ -136,10 +138,14 @@ app/yolo_v8n_coco/  yolo_v8n.cpp (graph, C2f/SPPF, DFL decode, NMS, tracker, ren
   `task_epoch` (RELEASE), `sev`; workers ACQUIRE-poll with exponential backoff, do their
   output-channel slice, RELEASE-add `done_count`; 50M-cycle timeout degrades to single-core.
   Kernels: `conv2d_partial` (4-ch), `conv2d_partial_8ch` (8-ch, C_out≥32) with B2 PRFM and
-  the **P8 weight-stationary K=3/s1/p1 fast path** (ci outer, ci's weights read once per tile,
+  the **P8 weight-stationary K=3 fast path** (ci outer, ci's weights read once per tile,
   1 KB tile accumulators). V183 gated it at whole-tile-interior; **V191 clips it to each
   tile's safe sub-rectangle** so only the 1-px padded ring uses the slow per-position path
-  (was ~60 % of positions at S8=32). `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
+  (was ~60 % of positions at S8=32); **V195 generalises that sub-rectangle to any
+  `(stride, pad)`** — the six stride-2 conv3×3 (L1/L3/L5/L7/L16/L19, 87 ms) had no fast
+  path at all — and moves the accumulator body into `p8_accum_{4,8}ch<S>`, `noinline`
+  templates specialised on the stride. Both halves are bit-exact and worth ~35 ms each;
+  the accumulator must stay a leaf — letting it inline costs 37 ms/frame. `conv1x1` (`runtime/ops.cpp`): **V190 transposes each
   4-position input group** to fix an L1 set-thrash when HW is a multiple of 2048.
   `-DD2M_NO_P8` disables the conv2d fast path for A/B. QEMU never starts secondaries →
   single-core fallback.

@@ -275,7 +275,22 @@ projects ~13–15 fps after INT8 + frame-skip.
         (−39 %)**. Tradeoff: objects are smaller in-frame → lower conf (the
         golden clock 83 % → 56 %); mitigated later by a model A/B on the same
         captured frame (v5n@320, v11n).
-  - [ ] **Head conv3×3 (~95 ms), the biggest item** — 4 × (64→64 @S8), ~3.5×
+  - [x] **V195 — P8 for stride 2 + noinline accumulator leaves: 504 → 435 ms
+        (−13.7 %), bit-exact.** Two independent wins, measured apart with
+        `EXTRA_DEF=-DD2M_NO_S2P8`: (1) the P8 fast path was gated on
+        `stride == 1`, so the six stride-2 conv3×3 (L1/L3/L5/L7/L16/L19,
+        87 ms = 17 % of the frame) had no weight-stationary path at all —
+        generalizing the safe sub-rectangle to any `(stride, pad)` took them
+        to 55.7 ms (−31.4); (2) extracting the accumulator body into
+        `p8_accum_{4,8}ch<S>` **noinline** templates took another −37 ms,
+        all of it in *stride-1* layers (P3 head 112.0 → 97.7). The mechanism
+        of (2) is not established — it is **not** the V193 stack-frame effect
+        (the frame only shrinks 1760 → 1680 B). Consequence for this goal:
+        the "conv3×3 is near the A53 instruction-mix limit" verdict below was
+        premature twice over. Both the earlier `conv1x1` at 2.5 GMAC/s vs the
+        3×3 at 1.3-1.8, and now a 14 % win with no FMA touched, say the 3×3
+        path still has room.
+  - [ ] **Head conv3×3 (~98 ms), still the biggest item** — 4 × (64→64 @S8), ~3.5×
         the A53 f32 floor after P8 (same "near the instruction-mix limit"
         verdict as D2M). Winograd tried (V193, see below) and closed as a
         regression. Remaining option: cut the DFL head to 1 conv per branch

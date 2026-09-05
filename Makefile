@@ -87,7 +87,12 @@ WINOGRAD_DEF =
 endif
 
 # --- INCLUDE PATHS ---
-INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF) $(WINOGRAD_DEF)
+# V195: escotilla para A/B puntuales sin editar el Makefile, p.ej.
+#   make EXTRA_DEF=-DD2M_NO_S2P8 bench   (P8 solo en stride 1)
+#   make EXTRA_DEF=-DD2M_NO_P8   bench   (sin fast path)
+EXTRA_DEF ?=
+
+INC = -Ibsp -Iruntime -Iapp/$(APP) $(INT8_DEF) $(SKIP_DEF) $(DEBUG_DEF) $(SHOW_DEF) $(AWB_DEF) $(C2F_DEF) $(WINOGRAD_DEF) $(EXTRA_DEF)
 
 # --- FLAGS ---
 CFLAGS = -O3 -g -Wall -nostdlib -nostartfiles -ffreestanding $(INC)

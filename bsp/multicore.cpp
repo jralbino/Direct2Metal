@@ -133,6 +133,89 @@ static inline void winograd_output_transform(const float32x4_t M[16], float32x4_
 }
 #endif /* !D2M_NO_WINOGRAD */
 
+/* ── V195: acumulador weight-stationary P8, especializado en el stride ──────
+ * El cuerpo es el de V191; lo único que cambia con el stride es cómo avanzan
+ * los índices de entrada. Hacerlo con la variable `stride` en runtime costó
+ * +10 ms/frame en las capas stride-1 (el compilador ya no puede plegar los
+ * offsets constantes `oy-1` / `ox-1` ni reducir la inducción): medido en HW,
+ * 504 → 492 ms con la versión runtime vs 504 → 482 con ésta. Con S constante
+ * la instancia S=1 genera exactamente el código de V191 y la S=2 es la que
+ * hasta ahora no existía. `pad` es siempre 1 aquí (el call site lo exige). */
+template<int S>
+__attribute__((noinline)) static void p8_accum_4ch(const float* in, int W_in, int HW_in, int C_in,
+                                const float* wg, int fy0, int fy1, int fx0, int fx1,
+                                float acc4[][4]) {
+    for (int ci = 0; ci < C_in; ci++) {
+        const float* ipc = in + ci * HW_in;
+        const float* wci = wg + ci * 36;
+        if (ci + 1 < C_in) {
+            __builtin_prefetch(wg + (ci+1) * 36, 0, 3);
+            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-1)*W_in + (fx0*S-1), 0, 3);
+        }
+        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 4), w2=vld1q_f32(wci+ 8);
+        float32x4_t w3=vld1q_f32(wci+12), w4=vld1q_f32(wci+16), w5=vld1q_f32(wci+20);
+        float32x4_t w6=vld1q_f32(wci+24), w7=vld1q_f32(wci+28), w8=vld1q_f32(wci+32);
+        int p = 0;
+        int iy = fy0 * S - 1;
+        for (int oy = fy0; oy < fy1; oy++, iy += S) {
+            const float* r0 = ipc + iy * W_in;
+            const float* r1 = r0 + W_in;
+            const float* r2 = r1 + W_in;
+            int b = fx0 * S - 1;
+            for (int ox = fx0; ox < fx1; ox++, p++, b += S) {
+                float32x4_t a = vld1q_f32(acc4[p]);
+                a=vmlaq_n_f32(a,w0,r0[b]);   a=vmlaq_n_f32(a,w1,r0[b+1]); a=vmlaq_n_f32(a,w2,r0[b+2]);
+                a=vmlaq_n_f32(a,w3,r1[b]);   a=vmlaq_n_f32(a,w4,r1[b+1]); a=vmlaq_n_f32(a,w5,r1[b+2]);
+                a=vmlaq_n_f32(a,w6,r2[b]);   a=vmlaq_n_f32(a,w7,r2[b+1]); a=vmlaq_n_f32(a,w8,r2[b+2]);
+                vst1q_f32(acc4[p], a);
+            }
+        }
+    }
+}
+
+template<int S>
+__attribute__((noinline)) static void p8_accum_8ch(const float* in, int W_in, int HW_in, int C_in,
+                                const float* wg, int fy0, int fy1, int fx0, int fx1,
+                                float accl[][4], float acch[][4]) {
+    for (int ci = 0; ci < C_in; ci++) {
+        const float* ipc = in + ci * HW_in;
+        const float* wci = wg + ci * 72;
+        if (ci + 1 < C_in) {
+            __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
+            __builtin_prefetch(in + (ci+1)*HW_in + (fy0*S-1)*W_in + (fx0*S-1), 0, 3);
+        }
+        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 8), w2=vld1q_f32(wci+16);
+        float32x4_t w3=vld1q_f32(wci+24), w4=vld1q_f32(wci+32), w5=vld1q_f32(wci+40);
+        float32x4_t w6=vld1q_f32(wci+48), w7=vld1q_f32(wci+56), w8=vld1q_f32(wci+64);
+        float32x4_t W0=vld1q_f32(wci+ 4), W1=vld1q_f32(wci+12), W2=vld1q_f32(wci+20);
+        float32x4_t W3=vld1q_f32(wci+28), W4=vld1q_f32(wci+36), W5=vld1q_f32(wci+44);
+        float32x4_t W6=vld1q_f32(wci+52), W7=vld1q_f32(wci+60), W8=vld1q_f32(wci+68);
+        int p = 0;
+        int iy = fy0 * S - 1;
+        for (int oy = fy0; oy < fy1; oy++, iy += S) {
+            const float* r0 = ipc + iy * W_in;
+            const float* r1 = r0 + W_in;
+            const float* r2 = r1 + W_in;
+            int b = fx0 * S - 1;
+            for (int ox = fx0; ox < fx1; ox++, p++, b += S) {
+                float32x4_t al = vld1q_f32(accl[p]);
+                float32x4_t ah = vld1q_f32(acch[p]);
+                al=vmlaq_n_f32(al,w0,r0[b]);   ah=vmlaq_n_f32(ah,W0,r0[b]);
+                al=vmlaq_n_f32(al,w1,r0[b+1]); ah=vmlaq_n_f32(ah,W1,r0[b+1]);
+                al=vmlaq_n_f32(al,w2,r0[b+2]); ah=vmlaq_n_f32(ah,W2,r0[b+2]);
+                al=vmlaq_n_f32(al,w3,r1[b]);   ah=vmlaq_n_f32(ah,W3,r1[b]);
+                al=vmlaq_n_f32(al,w4,r1[b+1]); ah=vmlaq_n_f32(ah,W4,r1[b+1]);
+                al=vmlaq_n_f32(al,w5,r1[b+2]); ah=vmlaq_n_f32(ah,W5,r1[b+2]);
+                al=vmlaq_n_f32(al,w6,r2[b]);   ah=vmlaq_n_f32(ah,W6,r2[b]);
+                al=vmlaq_n_f32(al,w7,r2[b+1]); ah=vmlaq_n_f32(ah,W7,r2[b+1]);
+                al=vmlaq_n_f32(al,w8,r2[b+2]); ah=vmlaq_n_f32(ah,W8,r2[b+2]);
+                vst1q_f32(accl[p], al);
+                vst1q_f32(acch[p], ah);
+            }
+        }
+    }
+}
+
 static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const float* w_rep, const float* bias, int K, int stride, int pad, bool do_silu, float* out, int grp_start, int grp_end) {
     int H_out  = (H_in + 2 * pad - K) / stride + 1; int W_out  = (W_in + 2 * pad - K) / stride + 1;
     int HW_out = H_out * W_out; int HW_in  = H_in  * W_in; int CinKK  = C_in  * K * K;
@@ -157,40 +240,37 @@ static void conv2d_partial(const float* in,  int H_in, int W_in, int C_in, const
 #else
                 const bool kP8 = true;
 #endif
-                int fy0 = y_tile > 1 ? y_tile : 1;
-                int fy1 = y_end < H_out - 1 ? y_end : H_out - 1;
-                int fx0 = x_tile > 1 ? x_tile : 1;
-                int fx1 = x_end < W_out - 1 ? x_end : W_out - 1;
+                /* V195: `-DD2M_NO_S2P8` deja el fast path solo en stride 1, para
+                 * poder atribuir por separado el efecto del P8 stride-2 y el del
+                 * stack frame (los templates noinline) sin volver a V194. */
+#ifdef D2M_NO_S2P8
+                const bool kS2P8 = false;
+#else
+                const bool kS2P8 = true;
+#endif
+                /* V195: sub-rectangulo seguro para (stride, pad) cualquiera.
+                 * La ventana K*K de la salida (oy,ox) arranca en el input en
+                 * (oy*s - p, ox*s - p), asi que "no toca padding" es
+                 *   oy*s - p >= 0              -> oy >= ceil(p/s)
+                 *   oy*s - p + K - 1 <= H_in-1 -> oy <= (H_in - K + p)/s
+                 * Con s=1,p=1,K=3 da [1, H_out-1) — identico a V191. Con s=2,p=1
+                 * el anillo inferior/derecho desaparece (L1: H_in=96 -> limite
+                 * 48 = H_out), que es el caso de las 6 conv3x3 stride-2 que
+                 * hasta V194 no tenian fast path alguno. */
+                int lo_lim = (pad + stride - 1) / stride;
+                int hy_lim = (H_in - K + pad) / stride + 1;
+                int hx_lim = (W_in - K + pad) / stride + 1;
+                int fy0 = y_tile > lo_lim ? y_tile : lo_lim;
+                int fy1 = y_end  < hy_lim ? y_end  : hy_lim;
+                int fx0 = x_tile > lo_lim ? x_tile : lo_lim;
+                int fx1 = x_end  < hx_lim ? x_end  : hx_lim;
                 bool ran_fast = false;
-                if (kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                if (kP8 && K == 3 && pad == 1 && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
                     int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float acc4[TILE_H * TILE_W][4];
                     for (int p = 0; p < fnpos; p++) vst1q_f32(acc4[p], vdupq_n_f32(0.0f));
-                    for (int ci = 0; ci < C_in; ci++) {
-                        const float* ipc = in + ci * HW_in;
-                        const float* wci = wg + ci * 36;
-                        if (ci + 1 < C_in) {
-                            __builtin_prefetch(wg + (ci+1) * 36, 0, 3);
-                            __builtin_prefetch(in + (ci+1)*HW_in + (fy0-1)*W_in + (fx0-1), 0, 3);
-                        }
-                        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 4), w2=vld1q_f32(wci+ 8);
-                        float32x4_t w3=vld1q_f32(wci+12), w4=vld1q_f32(wci+16), w5=vld1q_f32(wci+20);
-                        float32x4_t w6=vld1q_f32(wci+24), w7=vld1q_f32(wci+28), w8=vld1q_f32(wci+32);
-                        int p = 0;
-                        for (int oy = fy0; oy < fy1; oy++) {
-                            const float* r0 = ipc + (oy - 1) * W_in;
-                            const float* r1 = r0 + W_in;
-                            const float* r2 = r1 + W_in;
-                            for (int ox = fx0; ox < fx1; ox++, p++) {
-                                int b = ox - 1;
-                                float32x4_t a = vld1q_f32(acc4[p]);
-                                a=vmlaq_n_f32(a,w0,r0[b]);   a=vmlaq_n_f32(a,w1,r0[b+1]); a=vmlaq_n_f32(a,w2,r0[b+2]);
-                                a=vmlaq_n_f32(a,w3,r1[b]);   a=vmlaq_n_f32(a,w4,r1[b+1]); a=vmlaq_n_f32(a,w5,r1[b+2]);
-                                a=vmlaq_n_f32(a,w6,r2[b]);   a=vmlaq_n_f32(a,w7,r2[b+1]); a=vmlaq_n_f32(a,w8,r2[b+2]);
-                                vst1q_f32(acc4[p], a);
-                            }
-                        }
-                    }
+                    if (stride == 1) p8_accum_4ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, acc4);
+                    else             p8_accum_4ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, acc4);
                     int p = 0;
                     for (int oy = fy0; oy < fy1; oy++) {
                         for (int ox = fx0; ox < fx1; ox++, p++) {
@@ -407,6 +487,14 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
 #else
                 const bool kP8 = true;
 #endif
+                /* V195: `-DD2M_NO_S2P8` deja el fast path solo en stride 1, para
+                 * poder atribuir por separado el efecto del P8 stride-2 y el del
+                 * stack frame (los templates noinline) sin volver a V194. */
+#ifdef D2M_NO_S2P8
+                const bool kS2P8 = false;
+#else
+                const bool kS2P8 = true;
+#endif
                 /* -DD2M_NO_WINOGRAD falls back to the plain P8 direct-conv fast
                  * path below (A/B baseline for the Winograd feature alone). */
                 (void)npos;
@@ -416,10 +504,22 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                  * which at S8=32 / TILE_W=8 left ~60 % of positions on the slow
                  * per-position path that re-reads the 288 B weight block for
                  * every pixel. Now only the 1-px padded ring falls through. */
-                int fy0 = y_tile > 1 ? y_tile : 1;
-                int fy1 = y_end < H_out - 1 ? y_end : H_out - 1;
-                int fx0 = x_tile > 1 ? x_tile : 1;
-                int fx1 = x_end < W_out - 1 ? x_end : W_out - 1;
+                /* V195: sub-rectangulo seguro para (stride, pad) cualquiera.
+                 * La ventana K*K de la salida (oy,ox) arranca en el input en
+                 * (oy*s - p, ox*s - p), asi que "no toca padding" es
+                 *   oy*s - p >= 0              -> oy >= ceil(p/s)
+                 *   oy*s - p + K - 1 <= H_in-1 -> oy <= (H_in - K + p)/s
+                 * Con s=1,p=1,K=3 da [1, H_out-1) — identico a V191. Con s=2,p=1
+                 * el anillo inferior/derecho desaparece (L1: H_in=96 -> limite
+                 * 48 = H_out), que es el caso de las 6 conv3x3 stride-2 que
+                 * hasta V194 no tenian fast path alguno. */
+                int lo_lim = (pad + stride - 1) / stride;
+                int hy_lim = (H_in - K + pad) / stride + 1;
+                int hx_lim = (W_in - K + pad) / stride + 1;
+                int fy0 = y_tile > lo_lim ? y_tile : lo_lim;
+                int fy1 = y_end  < hy_lim ? y_end  : hy_lim;
+                int fx0 = x_tile > lo_lim ? x_tile : lo_lim;
+                int fx1 = x_end  < hx_lim ? x_end  : hx_lim;
                 bool ran_fast = false;
                 /* Covered sub-rectangle of THIS tile's fast path — [fy0,ry1)×[fx0,rx1).
                  * Equals [fy0,fy1)×[fx0,fx1) for the P8 path; the Winograd path below
@@ -438,48 +538,14 @@ static void conv2d_partial_8ch(const float* in, int H_in, int W_in, int C_in,
                                                          v_bl, v_bh, do_silu, oc, &ry1, &rx1);
                 }
 #endif
-                if (!ran_fast && kP8 && K == 3 && pad == 1 && stride == 1 && fy0 < fy1 && fx0 < fx1) {
+                if (!ran_fast && kP8 && K == 3 && pad == 1 && (stride == 1 || (kS2P8 && stride == 2)) && fy0 < fy1 && fx0 < fx1) {
                     int fw = fx1 - fx0, fnpos = fw * (fy1 - fy0);
                     float accl[TILE_H * TILE_W][4];
                     float acch[TILE_H * TILE_W][4];
                     for (int p = 0; p < fnpos; p++) { vst1q_f32(accl[p], vdupq_n_f32(0.0f)); vst1q_f32(acch[p], vdupq_n_f32(0.0f)); }
 
-                    for (int ci = 0; ci < C_in; ci++) {
-                        const float* ipc = in + ci * HW_in;
-                        const float* wci = wg + ci * 72;
-                        if (ci + 1 < C_in) {
-                            __builtin_prefetch(wg + (ci+1) * 72, 0, 3);
-                            __builtin_prefetch(in + (ci+1)*HW_in + (fy0-1)*W_in + (fx0-1), 0, 3);
-                        }
-                        float32x4_t w0=vld1q_f32(wci+ 0), w1=vld1q_f32(wci+ 8), w2=vld1q_f32(wci+16);
-                        float32x4_t w3=vld1q_f32(wci+24), w4=vld1q_f32(wci+32), w5=vld1q_f32(wci+40);
-                        float32x4_t w6=vld1q_f32(wci+48), w7=vld1q_f32(wci+56), w8=vld1q_f32(wci+64);
-                        float32x4_t W0=vld1q_f32(wci+ 4), W1=vld1q_f32(wci+12), W2=vld1q_f32(wci+20);
-                        float32x4_t W3=vld1q_f32(wci+28), W4=vld1q_f32(wci+36), W5=vld1q_f32(wci+44);
-                        float32x4_t W6=vld1q_f32(wci+52), W7=vld1q_f32(wci+60), W8=vld1q_f32(wci+68);
-                        int p = 0;
-                        for (int oy = fy0; oy < fy1; oy++) {
-                            const float* r0 = ipc + (oy - 1) * W_in;   /* oy≥1 → valid */
-                            const float* r1 = r0 + W_in;
-                            const float* r2 = r1 + W_in;               /* oy≤H_out-2 → valid */
-                            for (int ox = fx0; ox < fx1; ox++, p++) {
-                                int b = ox - 1;                        /* ox≥1 → valid */
-                                float32x4_t al = vld1q_f32(accl[p]);
-                                float32x4_t ah = vld1q_f32(acch[p]);
-                                al=vmlaq_n_f32(al,w0,r0[b]);   ah=vmlaq_n_f32(ah,W0,r0[b]);
-                                al=vmlaq_n_f32(al,w1,r0[b+1]); ah=vmlaq_n_f32(ah,W1,r0[b+1]);
-                                al=vmlaq_n_f32(al,w2,r0[b+2]); ah=vmlaq_n_f32(ah,W2,r0[b+2]);
-                                al=vmlaq_n_f32(al,w3,r1[b]);   ah=vmlaq_n_f32(ah,W3,r1[b]);
-                                al=vmlaq_n_f32(al,w4,r1[b+1]); ah=vmlaq_n_f32(ah,W4,r1[b+1]);
-                                al=vmlaq_n_f32(al,w5,r1[b+2]); ah=vmlaq_n_f32(ah,W5,r1[b+2]);
-                                al=vmlaq_n_f32(al,w6,r2[b]);   ah=vmlaq_n_f32(ah,W6,r2[b]);
-                                al=vmlaq_n_f32(al,w7,r2[b+1]); ah=vmlaq_n_f32(ah,W7,r2[b+1]);
-                                al=vmlaq_n_f32(al,w8,r2[b+2]); ah=vmlaq_n_f32(ah,W8,r2[b+2]);
-                                vst1q_f32(accl[p], al);
-                                vst1q_f32(acch[p], ah);
-                            }
-                        }
-                    }
+                    if (stride == 1) p8_accum_8ch<1>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, accl, acch);
+                    else             p8_accum_8ch<2>(in, W_in, HW_in, C_in, wg, fy0, fy1, fx0, fx1, accl, acch);
 
                     int p = 0;
                     for (int oy = fy0; oy < fy1; oy++) {
