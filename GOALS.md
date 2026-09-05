@@ -290,6 +290,19 @@ projects ~13–15 fps after INT8 + frame-skip.
         premature twice over. Both the earlier `conv1x1` at 2.5 GMAC/s vs the
         3×3 at 1.3-1.8, and now a 14 % win with no FMA touched, say the 3×3
         path still has room.
+  - [x] **V196 — the ARM clock was dropping to 600 MHz after ~60 s.** User
+        report ("first 100 frames at 2 FPS, then 1.2-1.4") reproduced with a
+        150-frame bench: 435 ms up to frame 95, 705 ms from frame 100 on.
+        `[SOC]` named it in one run — `arm` 1000 → 600 MHz with `thr=0x0` and
+        the temperature *falling*. Not throttling: the firmware's initial-turbo
+        window, which bare-metal never renews because there is no cpufreq
+        driver asking for the clock. `soc_clock_boost()` (GET_MAX_CLOCK_RATE +
+        SET_CLOCK_RATE over the mailbox, one tag per call — SET_TURBO in the
+        same buffer makes this firmware reject it) pins it at boot and the
+        request persists: 301 frames flat at 435 ms, 66 °C. **+38 % sustained
+        throughput with no change to the graph** — bigger than every kernel
+        optimisation of this session combined, and invisible to the 3-frame
+        bench that had been the only instrument.
   - [ ] **Head conv3×3 (~98 ms), still the biggest item** — 4 × (64→64 @S8), ~3.5×
         the A53 f32 floor after P8 (same "near the instruction-mix limit"
         verdict as D2M). Winograd tried (V193, see below) and closed as a

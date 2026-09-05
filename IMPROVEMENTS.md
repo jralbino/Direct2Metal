@@ -143,6 +143,17 @@ acá para no perderlo.
   492 ms de V192 se midió sin registrar reloj ni throttle; a partir de ahora toda
   cifra va acompañada de su línea `[SOC]`.
 
+  **Corrección (V196): la conclusión anterior estaba medida sobre una ventana
+  demasiado corta.** El usuario reportó que en HW los primeros ~100 frames van a
+  2 FPS y después baja a 1.2-1.4. Reproducido con `FRAMES=150`: 435 → 705 ms en
+  el frame 100. `thr` sigue en 0 (así que "no es throttling" era literalmente
+  cierto), pero **el reloj ARM cae de 1000 a 600 MHz** — la ventana de turbo
+  inicial del firmware, que bare-metal nunca renueva porque no existe un cpufreq
+  que pida el reloj. Un bench de 3 frames mide 2 s después del reset y es ciego a
+  esto. Arreglado en V196 (`soc_clock_boost()`, SET_CLOCK_RATE por mailbox):
+  435 ms sostenidos en 301 frames. **Regla nueva: toda cifra de rendimiento se
+  valida con una corrida larga, no con los 3 frames del bench.**
+
 - **Limpieza de docs menor**: `GOALS.md` §"Known issues" tiene una entrada
   sobre `test_image.bin` a 320² vs 256² que ya no aplica (V184 la resolvió
   con un fix distinto al que describe la entrada) — marcarla resuelta o

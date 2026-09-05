@@ -74,6 +74,13 @@ bool soc_status_read(soc_status_t* st);
  * prefijo (p.ej. "[SOC]"); nullptr usa "[SOC]". */
 void soc_status_report(const char* tag);
 
+/* V196: pide al firmware el reloj ARM máximo y engancha turbo. Sin esto el
+ * VideoCore devuelve el ARM a `arm_freq_min` (600 MHz) al expirar la ventana
+ * de turbo inicial —a los ~60 s del boot— porque bare-metal nunca le pide el
+ * reloj alto como sí hace el cpufreq de Linux: el frame pasa de 435 a 705 ms
+ * con `thr=0x0`. Devuelve los Hz concedidos, o 0 si el firmware no atendió. */
+uint32_t soc_clock_boost();
+
 /* ── Cache (multicore.cpp) ───────────────────────────────────────────────── */
 
 /* Clean D-cache to PoC over [addr, addr+size). NULL/zero-size safe.

@@ -54,6 +54,10 @@ extern void uart_puts(const char* s);
 extern void uart_dec(int n);
 extern void uart_hex(uint32_t d);
 
+/* Máximo del clock ARM, cacheado por soc_clock_boost() (V196) para que el
+ * reporter pueda notar una caída y volver a pedirlo. 0 = aún no consultado. */
+static uint32_t g_soc_max_hz = 0;
+
 #define MBOX_TAG_GET_THROTTLED     0x00030046u
 #define MBOX_TAG_GET_CLOCK_MEASURED 0x00030047u
 #define MBOX_TAG_GET_TEMPERATURE   0x00030006u
@@ -101,6 +105,14 @@ void soc_status_report(const char* tag) {
     if (st.have_temp)  { uart_puts(" temp="); uart_dec(st.temp_mc / 1000);
                          uart_puts("."); uart_dec((st.temp_mc / 100) % 10); uart_puts("C"); }
     else                 uart_puts(" temp=?");
+    /* V196: si el reloj se cayó del máximo, volver a pedirlo. Medido: la
+     * petición del boot aguanta 301 frames / 66 °C sin recaer, así que esto
+     * no debería dispararse nunca — es la red por si el firmware cambia de
+     * criterio en un despliegue largo, y deja rastro en el log si pasa. */
+    if (st.have_clock && g_soc_max_hz && st.arm_hz + 1000000u < g_soc_max_hz) {
+        uint32_t got = soc_clock_boost();
+        uart_puts(" REBOOST->"); uart_dec((int)(got / 1000000u)); uart_puts("MHz");
+    }
     if (st.have_throttled) {
         uart_puts(" thr="); uart_hex(st.throttled);
         /* Bits bajos = ahora mismo; bits 16-19 = "ocurrió alguna vez". */
@@ -111,4 +123,51 @@ void soc_status_report(const char* tag) {
         if (st.throttled & SOC_THR_EVER_MASK)     uart_puts(" (ever)");
     } else uart_puts(" thr=unsupported");
     uart_puts("\n");
+}
+
+/* ── V196: mantener el reloj ARM arriba ────────────────────────────────────
+ * Síntoma (reportado por el usuario, reproducido con `--frames 150`): los
+ * primeros ~95 frames corren a 435 ms y a partir de ahí a 705 ms, estable.
+ * El `[SOC]` de V194 lo explica sin ambigüedad: `arm` pasa de 1000 a 600 MHz
+ * con `thr=0x00000000` y la temperatura **bajando** (60.1 → 57.9 °C). No es
+ * throttle ni calor: es la ventana de turbo inicial del firmware. En Linux el
+ * driver cpufreq pide el reloj por este mismo canal; bare-metal no lo pide
+ * nunca, así que al expirar la ventana el VideoCore vuelve a `arm_freq_min`
+ * (600 MHz en el BCM2837). 435 × 1000/600 = 725 ≈ 705: el grafo es
+ * compute-bound y escala lineal con el reloj (V189).
+ *
+ * Arreglo: pedirlo explícitamente. GET_MAX_CLOCK_RATE del clock ARM y luego
+ * SET_TURBO(1) + SET_CLOCK_RATE a ese máximo, así no hay que hardcodear
+ * 1000 MHz ni mantenerlo en sync con `arm_freq` de config.txt. */
+
+#define MBOX_TAG_GET_MAX_CLOCK   0x00030004u
+#define MBOX_TAG_SET_TURBO       0x00038005u
+#define MBOX_TAG_SET_CLOCK_RATE  0x00038002u
+
+uint32_t soc_clock_boost() {
+    /* 1) ¿cuál es el máximo que admite el clock ARM? Preguntarlo evita
+     *    hardcodear 1000 MHz y mantenerlo en sync con `arm_freq`. */
+    mbox[0] = 8 * 4; mbox[1] = 0;
+    mbox[2] = MBOX_TAG_GET_MAX_CLOCK; mbox[3] = 8; mbox[4] = 0;
+    mbox[5] = MBOX_CLOCK_ID_ARM;      mbox[6] = 0;
+    mbox[7] = 0;
+    flush_to_ram((volatile void*)mbox, sizeof(mbox));
+    int ok = mbox_call(MBOX_CH_PROP);
+    flush_to_ram((volatile void*)mbox, sizeof(mbox));
+    if (!ok || !(mbox[4] & 0x80000000u) || mbox[6] == 0) return 0;
+    uint32_t max_hz = mbox[6];
+    g_soc_max_hz = max_hz;
+
+    /* 2) pedirlo. Un tag por llamada: SET_TURBO (0x00038005) hace que este
+     *    firmware rechace el buffer entero con st=0x80000001, así que va
+     *    solo SET_CLOCK_RATE — que es el que concede el reloj de todas
+     *    formas (rc=0x80000008, hz=0x3B9ACA00). */
+    mbox[0] = 9 * 4; mbox[1] = 0;
+    mbox[2] = MBOX_TAG_SET_CLOCK_RATE; mbox[3] = 12; mbox[4] = 12;
+    mbox[5] = MBOX_CLOCK_ID_ARM; mbox[6] = max_hz; mbox[7] = 0;
+    mbox[8] = 0;
+    flush_to_ram((volatile void*)mbox, sizeof(mbox));
+    ok = mbox_call(MBOX_CH_PROP);
+    flush_to_ram((volatile void*)mbox, sizeof(mbox));
+    return (ok && (mbox[4] & 0x80000000u)) ? mbox[6] : 0;
 }

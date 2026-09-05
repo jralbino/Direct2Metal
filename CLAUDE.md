@@ -7,10 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Direct2Metal** — YOLOv8n object detection (320×192, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
-the Pi Camera Module 3 (IMX708). Real-hardware results: **435 ms/frame** at `YOLO_W=320,
+the Pi Camera Module 3 (IMX708). Real-hardware results: **435 ms/frame sustained** at `YOLO_W=320,
 YOLO_H=192` (V195 — P8 for stride 2 + noinline accumulator leaves; V192 504 ms at full sensor
-FoV, V191 541 ms at 256², V189 799 ms, V183 1276 ms at 600 MHz). Every timing claim now comes
-with its `[SOC] arm= temp= thr=` line (V194) — the bench repeats to ±0 ms at a fixed clock. The graph is fully convolutional so the same YOLOv8n weights run
+FoV, V191 541 ms at 256², V189 799 ms, V183 1276 ms at 600 MHz). Every timing claim comes with
+its `[SOC] arm= temp= thr=` line (V194). **Validate perf with a long run, never the 3-frame
+bench**: until V196 the firmware dropped the ARM clock 1000 → 600 MHz ~60 s after boot
+(435 → 705 ms) and a 3-frame bench could not see it; `soc_clock_boost()` now asks for the
+clock over the mailbox at boot (301 frames flat at 435 ms, 66 °C). The graph is fully convolutional so the same YOLOv8n weights run
 at any input divisible by 32; `bsp.h` holds `YOLO_W`/`YOLO_H`. The four P3-head conv3×3
 (~90 ms of the 98 ms P3 head) are still the biggest item. With `FRAME_SKIP_N=4` (default) the camera + HUD refresh at
 the capture rate and boxes update every 4th frame.
@@ -19,7 +22,7 @@ This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub 
 
 **The engineering logs are `GOALS.md` (roadmap + verdicts), `PLAN.md` (version log,
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
-GOALS.md / PLAN.md version-stamped; the session reached V195 (P8 stride-2, 504 → 435 ms).
+GOALS.md / PLAN.md version-stamped; the session reached V196 (ARM clock pinned — 705 → 435 ms sustained).
 
 **The working tree is clean as of V195.** The ~110 pending files were committed then: 50 were
 a stray `chmod +x` sweep (restored to 100644), 14 were build artifacts tracked *and*

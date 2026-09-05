@@ -78,6 +78,10 @@ extern "C" void kernel_main() {
     asm volatile("dsb sy" : : : "memory"); asm volatile("sev");
     video_init(); draw_fill(0xFF00FF00); video_flush();
     init_mmu();
+    /* V196: enganchar el reloj ARM al máximo ANTES de medir nada. Sin esto el
+     * firmware lo devuelve a 600 MHz a los ~60 s (ver soc_clock_boost). */
+    { uint32_t hz = soc_clock_boost();
+      uart_puts("[SOC] boost: arm="); uart_dec((int)(hz / 1000000u)); uart_puts("MHz\n"); }
     /* V194: línea de referencia del SoC antes del primer frame — reloj real
      * (no el pedido en config.txt) y throttle heredado del arranque. */
     soc_status_report("[SOC] boot:");
