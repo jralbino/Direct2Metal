@@ -45,3 +45,6 @@ camara_direct/imx708_extract_*.tar.gz
 camara_direct/lib_*.bin
 camara_direct/linux_capture_linux/
 camara_direct/linux_extract
+
+# Imágenes listas para copiar a la SD (build artifacts)
+/dist/
