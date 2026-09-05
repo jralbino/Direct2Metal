@@ -665,7 +665,14 @@ extern "C" void secondary_main() {
         if (type == TASK_CONV2D) {
             int C_out_w = parallel_task.C_out;
             int grp_w = (C_out_w >= 32 && (C_out_w & 7) == 0) ? 8 : 4;
-            int slice = parallel_task.n_grp / 4; int grp_start = core_id * slice; int grp_end = grp_start + slice;
+            /* V198: el último core toma el resto. Sin esto, con n_grp no
+             * múltiplo de 4 los grupos de cola no los calcula NADIE y esos
+             * canales de salida quedan con basura: C_out=80 → n_grp=10,
+             * 10/4=2, se cubren 8 grupos y los canales 64-79 de cada rama
+             * `cls` (P3/P4/P5) nunca se escriben. TASK_CONV1X1 y
+             * TASK_CONV2D_ASYNC sí lo hacían bien; solo faltaba aquí. */
+            int slice = parallel_task.n_grp / 4; int grp_start = core_id * slice;
+            int grp_end = (core_id == 3) ? parallel_task.n_grp : (grp_start + slice);
             if (grp_w == 8)
                 conv2d_partial_8ch((const float*)parallel_task.in, parallel_task.H, parallel_task.W, parallel_task.C_in,
                                    (const float*)parallel_task.w_rep, (const float*)parallel_task.bias, parallel_task.K,

@@ -52,7 +52,7 @@ docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app rpi-forge make kernel8.i
 | `make AWB=0` | Freeze the ISP white balance at the tuning-file daylight gains (WB_R=535, WB_B=455 Q8). Default **1** (V188): grey-world AWB once per frame in `debayer_awb_update()`, prints `[AWB] r= b=` every 32 frames. |
 | `make DEBUG=1` | Camera thumbnail in the canvas. |
 | `make SHOW_CAMERA=0` | Restore the V167 dark canvas. Default **1** (V186) paints the live 640×360 frame under the bboxes via `camera_render_fullres()` — measured +21 ms/frame in `render` (single-core; the V164 multi-core debayer was removed in V167). |
-| `make EXTRA_DEF=-D…` | Ad-hoc A/B defines without editing the Makefile: `-DD2M_NO_S2P8` (P8 on stride 1 only, V195), `-DD2M_NO_P8` (no fast path). |
+| `make EXTRA_DEF=-D…` | Ad-hoc A/B defines without editing the Makefile: `-DD2M_SYNC_CONV` (sync 4-core convs instead of the V180 async 1-3 split — **264 ms vs 367**, but the display freezes during inference), `-DD2M_NO_S2P8` (P8 on stride 1 only, V195), `-DD2M_NO_P8` (no fast path). |
 | `make clean` | Removes `*.o *.elf *.img` (all gitignored — safe). |
 
 `make` flags → `-D` defines: `USE_INT8_WEIGHTS`, `USE_INT8_W8A8`, `W8A8_DEBUG`,

@@ -702,7 +702,9 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
  * !SIMULATION because QEMU time-shares the 4 emulated cores on one host
  * CPU — core 0 spinning + pumping starves the workers and one frame
  * stretches to 80 s. Sim builds stay on the sync 4-core path. */
-#ifdef SIMULATION
+/* `-DD2M_SYNC_CONV` fuerza el camino síncrono de 4 cores también fuera del sim,
+ * para medir cuánto cuesta el reparto async 1-3 (V180). */
+#if defined(SIMULATION) || defined(D2M_SYNC_CONV)
 #define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
     parallel_conv2d((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
