@@ -1510,4 +1510,17 @@ void run_yolo_complete() {
     /* V183: per-layer profile AFTER [P]/[T] so the marks never inflate them.
      * Only meaningful on real HW; hwbench.py parses the "  name: N us" lines. */
     if (do_inference) prof_dump();
+
+    /* V194: reloj real + throttle del SoC, DESPUÉS de [T] para no inflarlo.
+     * En el bench va en cada frame de inferencia (hwbench.py lo parsea y
+     * marca la corrida como no comparable si hay throttle); en el build
+     * normal cada 32 para no gastar UART en el loop en vivo. */
+    if (do_inference) {
+#ifdef SERIAL_BOOT
+        soc_status_report("[SOC]");
+#else
+        static int soc_tick = 0;
+        if ((soc_tick++ % 32) == 0) soc_status_report("[SOC]");
+#endif
+    }
 }

@@ -129,16 +129,20 @@ acá para no perderlo.
   workflow que corra `docker run rpi-forge make kernel8.img` en cada push
   atraparía roturas de build sin depender de que alguien lo note a mano.
   Esfuerzo bajo, la imagen Docker ya existe.
-- **Confirmar si el throttling térmico observado esta sesión es real**: tras
-  ~10 corridas de `make bench` seguidas a 1 GHz sin disipador, el frame time
-  subió de 492→503-504 ms de forma estable (no ruido — se repitió idéntico en
-  2 corridas). No se investigó a fondo por no bloquear el trabajo de
-  Winograd. El BCM2837 expone `get_throttled` por el mismo mailbox de
-  propiedades que ya usa el kernel para el framebuffer (tag `0x00030006`) —
-  agregar una lectura de ese tag a `kernel_main`/`prof_dump` daría una señal
-  directa (bits de throttle-actual/ever) en vez de inferirlo por timing.
-  Importa para cualquier claim de "X ms/frame" en un despliegue real
-  (duty cycle, caja cerrada, etc.).
+- ~~**Confirmar si el throttling térmico observado esta sesión es real**~~ —
+  **HECHO (V194): no era throttling.** `soc_status_report()` lee el canal de
+  propiedades (get_throttled `0x00030046`, get_clock_rate_measured `0x00030047`,
+  get_temperature `0x00030006` — ojo, `0x00030006` es *temperature*, no
+  *throttled* como decía la versión anterior de este archivo) e imprime
+  `[SOC] arm= temp= thr=` en el boot y por frame en el bench. Medido: `arm=1000MHz`
+  y `thr=0x00000000` (ni los bits 16-19 de "ocurrió alguna vez") en corridas a 43,
+  46, 50 y 51.5 °C, todas a **504 ms exactos**. Segunda hipótesis, la
+  instrumentación `C2F_PROF` por defecto, también falsada: `C2F_PROF=0` da 504 ms.
+  Lo que queda establecido es mejor de lo esperado: **el banco repite a ±0 ms**, así
+  que un A/B de 2-3 ms es señal, no ruido — no hace falta promediar corridas. El
+  492 ms de V192 se midió sin registrar reloj ni throttle; a partir de ahora toda
+  cifra va acompañada de su línea `[SOC]`.
+
 - **Limpieza de docs menor**: `GOALS.md` §"Known issues" tiene una entrada
   sobre `test_image.bin` a 320² vs 256² que ya no aplica (V184 la resolvió
   con un fix distinto al que describe la entrada) — marcarla resuelta o

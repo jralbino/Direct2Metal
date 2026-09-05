@@ -37,6 +37,43 @@ void prof_reset();
 void prof_mark(const char* name);
 void prof_dump();
 
+/* ── SoC health / measurement validity (mailbox.cpp, V194) ────────────────
+ * El grafo es compute-bound y escala lineal con el reloj (V189 lo midió:
+ * ×1.6 exacto de 600 MHz a 1 GHz), así que un frame time solo es comparable
+ * contra otro medido al mismo reloj y sin throttle. Leer esto es la
+ * diferencia entre "el kernel mejoró 2 %" y "el SoC estaba 2 % más frío". */
+
+/* Bits de get_throttled (tag 0x00030046). Los bajos son el estado actual;
+ * los 16-19 son "ocurrió desde el boot" y son los que delatan una corrida
+ * de bench que empezó limpia y se degradó a la mitad. */
+#define SOC_THR_UNDERVOLT_NOW  (1u << 0)
+#define SOC_THR_CAPPED_NOW     (1u << 1)
+#define SOC_THR_THROTTLED_NOW  (1u << 2)
+#define SOC_THR_SOFTTEMP_NOW   (1u << 3)
+#define SOC_THR_UNDERVOLT_EVER (1u << 16)
+#define SOC_THR_CAPPED_EVER    (1u << 17)
+#define SOC_THR_THROTTLED_EVER (1u << 18)
+#define SOC_THR_SOFTTEMP_EVER  (1u << 19)
+#define SOC_THR_EVER_MASK      (0xFu << 16)
+
+typedef struct {
+    uint32_t throttled;      /* bitmask SOC_THR_*                          */
+    uint32_t arm_hz;         /* reloj ARM medido (no el pedido en config)  */
+    int      temp_mc;        /* temperatura del SoC en milésimas de °C     */
+    bool     have_throttled; /* false = el firmware no soporta ese tag     */
+    bool     have_clock;
+    bool     have_temp;
+} soc_status_t;
+
+/* Un round-trip de mailbox con los tres tags. Devuelve false solo si la
+ * GPU no respondió; los have_* dicen qué tags atendió. Requiere que la MMU
+ * ya esté configurada (hace el mantenimiento de caché del buffer). */
+bool soc_status_read(soc_status_t* st);
+
+/* Imprime una línea `<tag> arm=1000MHz temp=51.3C thr=0x0`. `tag` es el
+ * prefijo (p.ej. "[SOC]"); nullptr usa "[SOC]". */
+void soc_status_report(const char* tag);
+
 /* ── Cache (multicore.cpp) ───────────────────────────────────────────────── */
 
 /* Clean D-cache to PoC over [addr, addr+size). NULL/zero-size safe.
