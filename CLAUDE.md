@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**Direct2Metal** — YOLOv8n object detection (256×256, 80 COCO classes, anchor-free DFL)
+**Direct2Metal** — YOLOv8n object detection (320×192, 80 COCO classes, anchor-free DFL)
 running bare-metal on a Raspberry Pi Zero 2 W (BCM2837, 4× Cortex-A53). No OS: custom boot,
 MMU, D-cache, 4-core dispatch, NEON kernels, and a working bare-metal MIPI CSI-2 driver for
 the Pi Camera Module 3 (IMX708). Real-hardware results: **435 ms/frame** at `YOLO_W=320,
@@ -21,9 +21,12 @@ This tree is the live one; `~/projects/D2M` is a stale clone of the same GitHub 
 V1→V165) and `camera_debug.md` (Unicam bring-up).** `README.md` is a stale YOLOv5n copy — trust GOALS/PLAN over it. Record new findings in
 GOALS.md / PLAN.md version-stamped; the session reached V195 (P8 stride-2, 504 → 435 ms).
 
-**Working tree has ~110 uncommitted files of the user's V180/V181 work.** Never
-`git stash`, `git checkout -- .`, or `make clean`-style sweeps that could touch them. If you
-must edit a dirty file, snapshot it first and keep your commit's hunks separate.
+**The working tree is clean as of V195.** The ~110 pending files were committed then: 50 were
+a stray `chmod +x` sweep (restored to 100644), 14 were build artifacts tracked *and*
+gitignored (`git rm --cached`), and the only real sources — `bsp/multicore.h` +
+`bsp/camera_unicam.cpp` — turned out to be the missing half of already-committed code, so
+`HEAD` did not compile (`yolo_v8n.cpp:586: 'parallel_async_done' was not declared`). Still
+never `git stash` / `git checkout -- .` on a dirty tree without looking at it first.
 
 ## Build & run
 
