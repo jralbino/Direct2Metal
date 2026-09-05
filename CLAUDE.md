@@ -87,6 +87,21 @@ HW) after model/exporter/test-image changes. **`test_image.bin` must be exactly 
 mismatch misaligns the colour planes → garbage / `[DET] none`; check it first after any
 geometry change. (V169–V183 shipped a 320² tensor to a 256² model with exactly this bug.)
 
+**Live camera over the serial bench, no SD swap** (V199): the capture image is already
+`SERIAL_BOOT` **with the camera on**, so setting `CAPTURE` out of reach turns it into a live
+camera run streamed over UART — the frame dump never fires and it keeps inferring forever:
+
+```bash
+make CAPTURE=1000000 kernel8_capture.img
+python3 tools/hwbench.py --port /dev/ttyUSB0 --kernel kernel8_capture.img \
+        --frames 200 --timeout 700 --no-golden --log hwbench_cam.log
+```
+
+Use it for anything the deterministic bench cannot see: sustained clock behaviour on the
+camera build, AE/AWB convergence, live `[DET]`, and `[PUMP] calls= paints=` (pump visits and
+actual HUD repaints per inference frame — the objective form of "does the HUD still feel
+smooth"). Detections will not match `GOLDEN`, hence `--no-golden`.
+
 **Real camera frame → golden** (V185): `make capture` builds `kernel8_capture.img`
 (`-DCAPTURE_FRAME=N`, camera ON, separate `cap_*.o`) and dumps the exact model input of frame
 N over UART as base64 (`[CAP] begin/end`, watchdog kicked during the ~90 s dump);

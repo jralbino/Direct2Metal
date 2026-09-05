@@ -520,6 +520,13 @@ static void  update_tracker();
  * continuously instead of freezing for ~720 ms per inference.
  * ────────────────────────────────────────────────────────────────────── */
 
+/* V199: contadores del pump. La pregunta "¿el HUD sigue igual de fluido con
+ * los 4 cores calculando?" se responde midiendo, no mirando la pantalla: lo
+ * que importa es cuántas veces se repinta durante una inferencia. `calls` son
+ * las visitas al pump y `paints` las que efectivamente refrescaron el HUD
+ * (un frame de cámara nuevo). Se imprimen en `[PUMP]` y se resetean por frame. */
+static int g_pump_calls = 0, g_pump_paints = 0;
+
 #if !defined(USE_INT8_W8A8) && !defined(USE_INT8_WEIGHTS)
 extern void debayer_raw10_to_thumbnail(const uint8_t* raw, uint8_t* fb,
                                        uint32_t pitch, int x_off, int y_off,
@@ -532,7 +539,9 @@ static void display_pump() {
      * conv-done check stays tight. AE is intentionally NOT run here —
      * the outer bsp_frame_acquire (once per inference) owns AE. */
     if (!g_use_camera) return;
+    g_pump_calls++;
     if (!bsp_frame_try_advance()) return;
+    g_pump_paints++;
 
 #if DEBUG
     /* Debug build only: repaint camera thumbnail with the fresh frame. */
@@ -1535,6 +1544,13 @@ void run_yolo_complete() {
     video_flush();
 
     uart_puts("[T] "); uart_dec((t_end-t_start)*1000/f); uart_puts("ms\n");
+
+    if (g_use_camera && do_inference) {
+        uart_puts("[PUMP] calls="); uart_dec(g_pump_calls);
+        uart_puts(" paints=");      uart_dec(g_pump_paints);
+        uart_puts("\n");
+    }
+    g_pump_calls = 0; g_pump_paints = 0;
 
     /* V183: per-layer profile AFTER [P]/[T] so the marks never inflate them.
      * Only meaningful on real HW; hwbench.py parses the "  name: N us" lines. */
