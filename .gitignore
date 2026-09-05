@@ -25,3 +25,16 @@ cap_*.o
 # OS files
 .DS_Store
 Thumbs.db
+# Deliberately tracked despite the broad rules above (real inputs, not artifacts)
+!build/config.txt
+!build/config.serial.txt
+!tools/reference_output.txt
+!tools/requirements.txt
+!yolov5n.pt
+!yolov5nu.pt
+
+# Build / debug noise
+*.d
+*.log
+qemu*.out
+.claude/settings.local.json
