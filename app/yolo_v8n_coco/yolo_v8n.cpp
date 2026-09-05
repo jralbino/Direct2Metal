@@ -605,6 +605,24 @@ static inline void parallel_conv1x1_with_pump(const float* in, int H, int W, int
     parallel_conv1x1_async_start(in, H, W, C_in, w, b, C_out, do_silu, out);
     async_wait_with_pump();
 }
+
+/* V199: bombear una vez y luego la conv bloqueante de 4 cores. En el build de
+ * bench (`SERIAL_BOOT`, sin cámara) `display_pump()` retorna en la primera
+ * línea, así que esto mide el camino síncrono puro. */
+static inline void parallel_conv2d_pump_then(const float* in, int H, int W, int C_in,
+                                             const float* w_rep, const float* bias,
+                                             int C_out, int K, int stride, int pad,
+                                             bool do_silu, float* out) {
+    display_pump();
+    parallel_conv2d(in, H, W, C_in, w_rep, bias, C_out, K, stride, pad, do_silu, out);
+}
+
+static inline void parallel_conv1x1_pump_then(const float* in, int H, int W, int C_in,
+                                              const float* w, const float* b, int C_out,
+                                              bool do_silu, float* out) {
+    display_pump();
+    parallel_conv1x1(in, H, W, C_in, w, b, C_out, do_silu, out);
+}
 #endif  /* !USE_INT8_W8A8 && !USE_INT8_WEIGHTS */
 
 
@@ -702,13 +720,22 @@ static inline LayerHandle fp32_layer_load(WeightStream& ws, int nw, int nb, cons
  * !SIMULATION because QEMU time-shares the 4 emulated cores on one host
  * CPU — core 0 spinning + pumping starves the workers and one frame
  * stretches to 80 s. Sim builds stay on the sync 4-core path. */
-/* `-DD2M_SYNC_CONV` fuerza el camino síncrono de 4 cores también fuera del sim,
- * para medir cuánto cuesta el reparto async 1-3 (V180). */
-#if defined(SIMULATION) || defined(D2M_SYNC_CONV)
+/* V199 — híbrido: los 4 cores calculan y el display se bombea ENTRE convs.
+ *
+ * V180 dejaba el core 0 fuera del reparto (cores 1-3) para que la cámara y el
+ * HUD siguieran vivos durante la inferencia. Medido en V198 eso cuesta
+ * 103 ms/frame (367 vs 264) — más que el 4/3 teórico, por el wfe/sev por conv.
+ * Pero no hace falta elegir: `display_pump()` solo hace trabajo pesado cuando
+ * acaba de aterrizar un frame de la cámara (~cada 19 ms de período FSI); el
+ * resto es una lectura MMIO. Bombeando entre convs —el grafo tiene ~60 por
+ * frame, una cada ~4 ms de media y ~20 ms en la peor conv— la máquina de
+ * estados del ping-pong y el HUD se atienden igual de seguido que antes, y los
+ * 4 cores calculan. `-DD2M_ASYNC_CONV` restaura el reparto 1-3 de V180. */
+#if defined(SIMULATION) || !defined(D2M_ASYNC_CONV)
 #define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
-    parallel_conv2d((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
+    parallel_conv2d_pump_then((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
 #define CONV1X1(in, H, W, ci, L, co, silu, out) \
-    parallel_conv1x1((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
+    parallel_conv1x1_pump_then((in), (H), (W), (ci), (L).w, (L).b, (co), (silu), (out))
 #else
 #define CONV2D(in, H, W, ci, L, co, K, s, p, silu, out) \
     parallel_conv2d_with_pump((in), (H), (W), (ci), (L).w, (L).b, (co), (K), (s), (p), (silu), (out))
